@@ -1,0 +1,135 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Nybl",
+  "scopeName": "source.nybl",
+  "fileTypes": ["nybl"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#keywords" },
+    { "include": "#constants" },
+    { "include": "#types" },
+    { "include": "#functionDeclarations" },
+    { "include": "#functionCalls" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.nybl",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.nybl",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.nybl" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.nybl" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.nybl",
+              "match": "\\\\(?:[nrt\"\\\\]|u\\{[0-9A-Fa-f]+\\})"
+            },
+            {
+              "name": "meta.interpolation.nybl",
+              "begin": "\\{",
+              "beginCaptures": {
+                "0": { "name": "punctuation.section.interpolation.begin.nybl" }
+              },
+              "end": "\\}",
+              "endCaptures": {
+                "0": { "name": "punctuation.section.interpolation.end.nybl" }
+              },
+              "patterns": [
+                { "include": "$self" }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.nybl",
+          "match": "\\b(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|\\d[\\d_]*(?:\\.\\d[\\d_]*)?)\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.nybl",
+          "match": "\\b(?:if|else|for|while|loop|match|return|break|continue|try|use|as|in)\\b"
+        },
+        {
+          "name": "storage.type.function.nybl",
+          "match": "\\bfn\\b"
+        },
+        {
+          "name": "storage.modifier.nybl",
+          "match": "\\b(?:let|const|pub|ref)\\b"
+        },
+        {
+          "name": "keyword.declaration.nybl",
+          "match": "\\b(?:struct|enum)\\b"
+        },
+        {
+          "name": "keyword.operator.word.nybl",
+          "match": "\\b(?:and|or|not)\\b"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "name": "constant.language.nybl",
+          "match": "\\b(?:true|false|none)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.nybl",
+          "match": "\\b(?:int|number|string|bool|array|dict|fn|module|iter|Result|RuntimeError|Iter)\\b"
+        },
+        {
+          "name": "entity.name.type.nybl",
+          "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+        }
+      ]
+    },
+    "functionDeclarations": {
+      "patterns": [
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_.]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.nybl" },
+            "2": { "name": "entity.name.function.nybl" }
+          }
+        }
+      ]
+    },
+    "functionCalls": {
+      "patterns": [
+        {
+          "name": "meta.function-call.nybl",
+          "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+          "captures": {
+            "1": { "name": "support.function.nybl" }
+          }
+        }
+      ]
+    }
+  }
+}

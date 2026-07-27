@@ -18,7 +18,7 @@ Strings are immutable sequences of characters. All string methods return new str
 
 ## Creating strings
 
-```bop
+```nybl
 let s = "hello world"
 let empty = ""
 let escaped = "Line 1\nLine 2"
@@ -28,7 +28,7 @@ Supported escape sequences: `\"`, `\\`, `\n`, `\t`, `\r`, `\{`, `\}`. Any other 
 
 ## Indexing
 
-```bop
+```nybl
 let s = "hello"
 print(s[0])      // "h"
 print(s[-1])     // "o"
@@ -40,7 +40,7 @@ Each index returns a single-character string (there's no separate character type
 
 Insert variable values with `{name}` inside a string:
 
-```bop
+```nybl
 let name = "Alice"
 let count = 5
 print("Hello, {name}! You have {count} items.")
@@ -48,20 +48,20 @@ print("Hello, {name}! You have {count} items.")
 
 Only variable names are allowed inside `{}`. For expressions, use a temporary variable:
 
-```bop
+```nybl
 let total = (count * 2).to_str()
 print("Double: {total}")
 ```
 
 Or use concatenation:
 
-```bop
+```nybl
 print("Double: " + (count * 2).to_str())
 ```
 
 To include a literal `{` or `}` in a string, escape it with `\{` and `\}`:
 
-```bop
+```nybl
 print("Use \{name\} for interpolation")
 // prints: Use {name} for interpolation
 ```
@@ -70,14 +70,14 @@ print("Use \{name\} for interpolation")
 
 Use `+` to join strings:
 
-```bop
+```nybl
 let full = "Hello" + ", " + "world!"
 print(full)    // "Hello, world!"
 ```
 
 Numbers must be converted with `.to_str()` first:
 
-```bop
+```nybl
 let msg = "Score: " + (42).to_str()
 ```
 
@@ -105,7 +105,7 @@ Plus the universal `s.type()`, `s.to_str()`, `s.inspect()`.
 
 ### Parsing CSV data
 
-```bop
+```nybl
 let input = "Alice,95,A"
 let parts = input.split(",")
 print(parts[0])    // "Alice"
@@ -114,7 +114,7 @@ print(parts[1])    // "95"
 
 ### Checking prefixes
 
-```bop
+```nybl
 let filename = "report.csv"
 if filename.ends_with(".csv") {
   print("CSV file detected")
@@ -123,7 +123,7 @@ if filename.ends_with(".csv") {
 
 ### Building a formatted string
 
-```bop
+```nybl
 let items = ["apple", "banana", "cherry"]
 let count = items.len().to_str()
 let list = items.join(", ")

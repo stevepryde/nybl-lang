@@ -2,35 +2,35 @@
 
 ## Boundaries and ownership
 
-- **`bop-lang` / `bop`:** owns lexer, parser, AST, static checks, tree-walker,
+- **`nybl-lang` / `nybl`:** owns lexer, parser, AST, static checks, tree-walker,
   shared `Value`, operators, builtins, methods, memory accounting, bundled
-  source-only standard library, `BopLimits`, `BopHost`, shared entry metadata,
-  and the walker `BopInstance`.
-- **`bop-vm`:** owns AST-to-bytecode compilation, iterative VM execution, and
-  retained VM instance state. It depends on `bop-lang` for syntax, shared entry
+  source-only standard library, `NyblLimits`, `NyblHost`, shared entry metadata,
+  and the walker `NyblInstance`.
+- **`nybl-vm`:** owns AST-to-bytecode compilation, iterative VM execution, and
+  retained VM instance state. It depends on `nybl-lang` for syntax, shared entry
   metadata, values, and runtime semantics.
-- **`bop-compile`:** owns Bop-to-Rust AOT transpilation and generated runtime
-  glue, including the sandboxed generated `BopInstance`. Generated programs
+- **`nybl-compile`:** owns Nybl-to-Rust AOT transpilation and generated runtime
+  glue, including the sandboxed generated `NyblInstance`. Generated programs
   depend on the shared runtime rather than defining a different language.
-- **`bop-sys`:** owns the optional standard OS-backed host, including file,
+- **`nybl-sys`:** owns the optional standard OS-backed host, including file,
   stdio, environment, time, and filesystem module resolution.
-- **`bop-cli`:** owns user-facing run, REPL, and compile flows and composes the
-  engines with `bop-sys`.
+- **`nybl-cli`:** owns user-facing run, REPL, and compile flows and composes the
+  engines with `nybl-sys`.
 
 Dependency direction flows from CLI and engine adapters toward the zero-dep
-core. OS capabilities flow inward only through `BopHost`; `bop-lang` must not
-depend on `bop-sys`.
+core. OS capabilities flow inward only through `NyblHost`; `nybl-lang` must not
+depend on `nybl-sys`.
 
 ## Execution flow
 
-1. Source is lexed and parsed by `bop-lang`.
+1. Source is lexed and parsed by `nybl-lang`.
 2. The walker evaluates the AST directly, the VM compiles it to `Chunk`, or the
    AOT compiler emits Rust linked to the shared runtime.
-3. A one-shot API evaluates and discards its state, or `BopInstance::load`
+3. A one-shot API evaluates and discards its state, or `NyblInstance::load`
    evaluates the top level once and retains the resulting engine state plus its
    final public-entry table.
 4. The selected engine evaluates values and delegates explicit capabilities to
-   the `BopHost` borrowed for that operation.
+   the `NyblHost` borrowed for that operation.
 5. Limits and shared value semantics constrain execution; results, callbacks,
    output, and errors cross the host boundary.
 

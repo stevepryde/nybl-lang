@@ -18,7 +18,7 @@ Arrays are ordered, mutable collections that can hold any mix of types.
 
 ## Creating arrays
 
-```bop
+```nybl
 let items = [1, 2, 3]
 let empty = []
 let mixed = [1, "two", true, none]
@@ -28,7 +28,7 @@ let mixed = [1, "two", true, none]
 
 Arrays are 0-indexed. Negative indices count from the end:
 
-```bop
+```nybl
 let items = [10, 20, 30]
 print(items[0])     // 10
 print(items[2])     // 30
@@ -40,7 +40,7 @@ Out-of-bounds access produces an error.
 
 ## Modifying elements
 
-```bop
+```nybl
 let items = [10, 20, 30]
 items[0] = 99
 print(items)    // [99, 20, 30]
@@ -57,7 +57,7 @@ are not write-back places yet: `dict["items"].push(value)` and
 `holder.items.sort()` raise a runtime error with the workaround rather than
 silently doing nothing. Use an explicit variable and assignment:
 
-```bop
+```nybl
 let items = dict["items"]
 items.push(value)
 dict["items"] = items
@@ -86,7 +86,7 @@ Plus the universal `arr.type()`, `arr.to_str()`, `arr.inspect()`.
 
 ### Building a list
 
-```bop
+```nybl
 let squares = []
 for i in range(1, 6) {
   squares.push(i * i)
@@ -96,7 +96,7 @@ print(squares)    // [1, 4, 9, 16, 25]
 
 ### Filtering values
 
-```bop
+```nybl
 let numbers = [3, 7, 1, 9, 4, 6, 2, 8]
 let big = []
 for n in numbers {
@@ -109,7 +109,7 @@ print(big)    // [7, 9, 6, 8]
 
 ### Checking membership
 
-```bop
+```nybl
 let allowed = ["admin", "editor", "viewer"]
 let role = "editor"
 if allowed.has(role) {
@@ -121,7 +121,7 @@ if allowed.has(role) {
 
 ### Sorting and joining
 
-```bop
+```nybl
 let scores = [42, 17, 85, 3]
 scores.sort()
 print(scores)    // [3, 17, 42, 85]

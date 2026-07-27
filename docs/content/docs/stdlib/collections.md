@@ -18,9 +18,9 @@ path = "/docs/stdlib/string/"
 
 ## Value semantics
 
-Bop's user methods pass `self` by value, so these collections all return a **fresh instance** on mutation and you rebind:
+Nybl's user methods pass `self` by value, so these collections all return a **fresh instance** on mutation and you rebind:
 
-```bop
+```nybl
 let s = stack()
 s = s.push(1)
 s = s.push(2)
@@ -30,7 +30,7 @@ The pattern trades a little boilerplate for predictable semantics: `let a = b` d
 
 ## Import
 
-```bop
+```nybl
 use std.collections                          // glob
 use std.collections.{stack, queue, set}      // selective
 use std.collections as c                     // aliased
@@ -38,7 +38,7 @@ use std.collections as c                     // aliased
 
 ## `Stack` (LIFO)
 
-```bop
+```nybl
 use std.collections.{stack}
 
 let s = stack()
@@ -63,7 +63,7 @@ print(s.top())       // 2
 
 ## `Queue` (FIFO)
 
-```bop
+```nybl
 use std.collections.{queue}
 
 let q = queue()
@@ -89,7 +89,7 @@ Dequeue is O(n) in this naive implementation — good enough for scripting workl
 
 ## `Set` (unique, insertion-ordered)
 
-```bop
+```nybl
 use std.collections.{set, set_of}
 
 let a = set_of([1, 2, 3])

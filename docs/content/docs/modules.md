@@ -1,6 +1,6 @@
 +++
 title = "Modules"
-description = "A Bop program can be split across multiple files — or in-memory source strings, asset bundles, anywhere the embedding host can return Bop source. The `use` statement pulls another module's public surface into the current scope."
+description = "A Nybl program can be split across multiple files — or in-memory source strings, asset bundles, anywhere the embedding host can return Nybl source. The `use` statement pulls another module's public surface into the current scope."
 weight = 14
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,24 +14,24 @@ path = "/docs/errors/"
 
 # Modules
 
-A Bop program can be split across multiple files — or in-memory source strings, asset bundles, anywhere the embedding host can return Bop source. The `use` statement pulls another module's public surface into the current scope.
+A Nybl program can be split across multiple files — or in-memory source strings, asset bundles, anywhere the embedding host can return Nybl source. The `use` statement pulls another module's public surface into the current scope.
 
 ## The four forms of `use`
 
-```bop
+```nybl
 use path                    // glob:        everything public
 use path.{a, b, Type}       // selective:   just the listed items
 use path as m               // aliased:     binds `m` as a Value::Module
 use path.{a, b} as m        // aliased + selective
 ```
 
-Paths are dot-joined identifiers: `std.math`, `game.entity.player`. How the host resolves a path is up to the embedder — `bop-sys`'s `StandardHost::with_module_root` maps `foo.bar` to `<root>/foo/bar.bop`, in-memory hosts can look up a string table, a web host can fetch a URL. See [Embedding](/docs/embedding/#resolve_module-custom-use-resolution).
+Paths are dot-joined identifiers: `std.math`, `game.entity.player`. How the host resolves a path is up to the embedder — `nybl-sys`'s `StandardHost::with_module_root` maps `foo.bar` to `<root>/foo/bar.nybl`, in-memory hosts can look up a string table, a web host can fetch a URL. See [Embedding](/docs/embedding/#resolve_module-custom-use-resolution).
 
 ## Glob `use`
 
 Brings every public export of a module into the current scope as a bare name:
 
-```bop
+```nybl
 use std.math
 print(PI)            // constant from std.math
 print(factorial(5))  // fn from std.math → 120
@@ -39,7 +39,7 @@ print(factorial(5))  // fn from std.math → 120
 
 Names that start with `_` are considered **private by convention** and glob imports skip them:
 
-```bop
+```nybl
 // In module `foo`:
 fn _helper() { return 42 }
 fn public() { return _helper() }
@@ -56,7 +56,7 @@ Glob is idempotent at the injection site — running `use foo` twice in the same
 
 Pick exactly which names you want:
 
-```bop
+```nybl
 use std.math.{PI, factorial}
 print(PI)
 print(factorial(4))
@@ -65,7 +65,7 @@ print(factorial(4))
 
 Selective imports can reach private names explicitly:
 
-```bop
+```nybl
 use foo.{_helper}
 print(_helper())     // ok — explicit opt-in
 ```
@@ -76,7 +76,7 @@ If a listed name doesn't exist in the target module, you get a clear error point
 
 Binds the whole module as a single value under the alias:
 
-```bop
+```nybl
 use std.math as m
 print(m.PI)
 print(m.factorial(5))
@@ -86,7 +86,7 @@ print(m.factorial(5))
 
 Combine with selective to shrink the alias's surface:
 
-```bop
+```nybl
 use std.math.{PI, factorial} as m
 print(m.PI)
 print(m.factorial(5))
@@ -97,8 +97,8 @@ print(m.factorial(5))
 
 User-defined `struct` and `enum` types can be constructed and pattern-matched through the alias:
 
-```bop
-// In `paint.bop`:
+```nybl
+// In `paint.nybl`:
 enum Color { Red, Green, Blue }
 struct Point { x, y }
 
@@ -120,9 +120,9 @@ The namespace is required — bare `Color::Red` inside the main file wouldn't fi
 
 Types carry their declaring module as part of their identity. Two modules can declare a type with the same name; values from them are **distinct types** — equality is always `false` across the module boundary, and patterns only match values from the module the pattern named.
 
-```bop
-// paint.bop: enum Color { Red, Blue }
-// other.bop: enum Color { Red, Green, Yellow }
+```nybl
+// paint.nybl: enum Color { Red, Blue }
+// other.nybl: enum Color { Red, Green, Yellow }
 
 use paint as p
 use other as o
@@ -136,7 +136,7 @@ print(a == a)        // true
 
 A pattern over an aliased module's type only fires for values from that module:
 
-```bop
+```nybl
 fn label(c) {
   return match c {
     p.Color::Red => "paint-red",
@@ -148,7 +148,7 @@ print(label(p.Color::Red))   // "paint-red"
 print(label(o.Color::Red))   // "other-red"
 ```
 
-This is Bop's answer to the "same-named type, different shape, in different modules" problem. No renames required.
+This is Nybl's answer to the "same-named type, different shape, in different modules" problem. No renames required.
 
 ## Re-exports are transitive
 
@@ -166,7 +166,7 @@ Circular imports (`a` uses `b` which uses `a`) are detected at load time and rai
 
 Aliased modules and bare-imported types remain visible inside function bodies declared in the same module:
 
-```bop
+```nybl
 use paint as p
 
 fn describe(c) {

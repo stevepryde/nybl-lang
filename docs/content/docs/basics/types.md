@@ -1,6 +1,6 @@
 +++
 title = "Types"
-description = "Bop is dynamically typed — variables can hold any type, and types are checked at runtime. Every value has a `.type()` method that returns its type name:"
+description = "Nybl is dynamically typed — variables can hold any type, and types are checked at runtime. Every value has a `.type()` method that returns its type name:"
 weight = 3
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,7 +14,7 @@ path = "/docs/basics/variables/"
 
 # Types
 
-Bop is dynamically typed — variables can hold any type, and types are checked at runtime. Every value has a `.type()` method that returns its type name:
+Nybl is dynamically typed — variables can hold any type, and types are checked at runtime. Every value has a `.type()` method that returns its type name:
 
 | `.type()` returns | Description | Literal examples |
 |-------------------|-------------|------------------|
@@ -31,7 +31,7 @@ Bop is dynamically typed — variables can hold any type, and types are checked 
 | `"module"` | Aliased module namespace | result of `use foo as m` |
 | `"iter"` | Lazy iterator | `[1, 2, 3].iter()`, `"abc".iter()` |
 
-```bop
+```nybl
 let x = 42
 print(x.type())      // "int"
 
@@ -46,7 +46,7 @@ print(s.type())      // "string"
 
 Integer literals (`42`, `-7`) produce `int` values; anything with a decimal point (`3.14`, `4.0`) produces `number`. There's no exponent-shaped literal — write the full decimal or build large values by multiplication. The two numeric types coexist: arithmetic widens to `number` on mixed operands, and `==` compares numerically across the split:
 
-```bop
+```nybl
 print(1 + 1)         // 2       (int + int → int)
 print(1 + 1.0)       // 2       (int + number → number, prints as whole)
 print(1 == 1.0)      // true    (cross-type numeric equality)
@@ -56,7 +56,7 @@ Ints cover the full signed 64-bit range, from `-9223372036854775808` through `92
 
 Use `.to_int()` to truncate a number to an integer (toward zero), and `.to_float()` to widen an int to a number:
 
-```bop
+```nybl
 print((3.7).to_int())      // 3
 print((-2.7).to_int())     // -2
 print((5).to_float())      // 5       (now a number internally)
@@ -68,7 +68,7 @@ Number literals need parens before a method call (otherwise `3.7.to_int()` looks
 
 `/` always produces a `number`, even for `int / int`:
 
-```bop
+```nybl
 print(7 / 2)              // 3.5
 print(6 / 2)              // 3        (whole value — still a number)
 print((6 / 2).type())     // "number"
@@ -78,7 +78,7 @@ This sidesteps the classic "1 / 2 == 0" footgun that trips beginners in C / Rust
 
 When you *do* want an integer result (index math, bucketing, etc.), coerce the quotient back with `.to_int()`:
 
-```bop
+```nybl
 print((7 / 2).to_int())           // 3
 print((-7 / 2).to_int())          // -3
 print((7 / 2).to_int().type())    // "int"
@@ -90,14 +90,14 @@ print((7 / 2).to_int().type())    // "int"
 
 Strings use double quotes only. Supported escape sequences: `\"`, `\\`, `\n`, `\t`, `\r`, `\{`, `\}`.
 
-```bop
+```nybl
 let greeting = "Hello, world!"
 let with_newline = "Line 1\nLine 2"
 ```
 
 Strings are indexable and iterable, but immutable — you can read characters but not change them in place:
 
-```bop
+```nybl
 let s = "hello"
 print(s[0])          // "h"
 print(s[-1])         // "o"
@@ -111,7 +111,7 @@ for ch in s {
 
 Use `{variable}` inside a string to insert a variable's value. Only variable names are allowed inside `{}` — not expressions:
 
-```bop
+```nybl
 let name = "Alice"
 let count = 5
 print("Hello, {name}! You have {count} items.")
@@ -119,7 +119,7 @@ print("Hello, {name}! You have {count} items.")
 
 For computed values, store the result in a variable first:
 
-```bop
+```nybl
 let doubled = count * 2
 print("Double: {doubled}")
 
@@ -129,7 +129,7 @@ print("Double: " + (count * 2).to_str())
 
 To include a literal `{` or `}` in a string, escape it with a backslash:
 
-```bop
+```nybl
 print("Use \{name\} for interpolation")
 // prints: Use {name} for interpolation
 ```
@@ -138,7 +138,7 @@ print("Use \{name\} for interpolation")
 
 `+` joins two strings, or a string and a number (the number is converted first):
 
-```bop
+```nybl
 print("Score: " + (42).to_str())    // "Score: 42"
 print("n=" + 7)                      // "n=7"   (int auto-stringified)
 ```
@@ -147,7 +147,7 @@ print("n=" + 7)                      // "n=7"   (int auto-stringified)
 
 `true` and `false`. Used in conditions and comparisons:
 
-```bop
+```nybl
 let found = true
 
 if found {
@@ -159,7 +159,7 @@ if found {
 
 `none` represents the absence of a value. Functions that don't explicitly return a value return `none`. It's also what you get from any operation designed to signal "no value here" (e.g. `first_or_none` helpers, optional return values):
 
-```bop
+```nybl
 fn first_or_none(arr) {
   if arr.len() == 0 { return none }
   return arr[0]
@@ -173,7 +173,7 @@ print(r)           // none
 
 Two equivalent ways:
 
-```bop
+```nybl
 if r.is_none() { print("empty") }
 if r == none    { print("empty") }      // same thing
 
@@ -186,4 +186,4 @@ Don't confuse falsy-ness with none-ness: `false`, `0`, `""`, `[]`, and `{}` are 
 
 ## User-defined types
 
-Bop also lets you declare your own struct and enum types with methods — see [Structs & Enums](/docs/data/structs-and-enums/).
+Nybl also lets you declare your own struct and enum types with methods — see [Structs & Enums](/docs/data/structs-and-enums/).

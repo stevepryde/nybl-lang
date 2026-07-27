@@ -1,6 +1,6 @@
 +++
 title = "Operators"
-description = "All Bop operators, grouped by category. No operator overloading — each operator works on specific types and produces a runtime error on type mismatch."
+description = "All Nybl operators, grouped by category. No operator overloading — each operator works on specific types and produces a runtime error on type mismatch."
 weight = 17
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,7 +14,7 @@ path = "/docs/reference/builtins/"
 
 # Operators
 
-All Bop operators, grouped by category. No operator overloading — each operator works on specific types and produces a runtime error on type mismatch.
+All Nybl operators, grouped by category. No operator overloading — each operator works on specific types and produces a runtime error on type mismatch.
 
 ## Arithmetic
 
@@ -26,7 +26,7 @@ All Bop operators, grouped by category. No operator overloading — each operato
 | `/` | Divide | `int`, `number` | Always returns `number`: `7 / 2` → `3.5`, `6 / 2` → `3` (as number) |
 | `%` | Modulo | `int`, `number` | Same sign as the dividend |
 
-```bop
+```nybl
 print(10 + 3)      // 13
 print(10 - 3)      // 7
 print(10 * 3)      // 30
@@ -42,7 +42,7 @@ print("ha" * 3)                    // "hahaha"
 
 There is no dedicated integer-division operator. `/` always widens to `number`, which avoids the classic "1 / 2 == 0" footgun. When you need an integer result, coerce the quotient with `.to_int()`:
 
-```bop
+```nybl
 let mid = ((low + high) / 2).to_int()
 ```
 
@@ -52,7 +52,7 @@ let mid = ((low + high) / 2).to_int()
 
 - `int + int`, `int - int`, `int * int` use checked arithmetic — overflow is a runtime error, not silent wrap.
 - Division / modulo by zero raises a runtime error.
-- `int / number` or `number / int` widens to `number` (IEEE-754 rules; division by 0.0 is still a runtime error in Bop).
+- `int / number` or `number / int` widens to `number` (IEEE-754 rules; division by 0.0 is still a runtime error in Nybl).
 
 ## Comparison
 
@@ -69,7 +69,7 @@ let mid = ((low + high) / 2).to_int()
 
 Works on every type. Arrays and dicts compare structurally (element-wise, then entry-wise). User-defined struct and enum values compare by full type identity `(declaring module, type name)` plus their payloads — two structs with the same name declared in different modules are *not* equal even with matching field values.
 
-```bop
+```nybl
 print(5 == 5)                   // true
 print(5 == "5")                 // false    (different types)
 print(1 == 1.0)                 // true     (int ↔ number cross-type)
@@ -81,7 +81,7 @@ print({"a": 1} == {"a": 1})     // true
 
 Numeric (`int` + `number`, with cross-type widening) and strings (lexicographic) only. Applying an ordering operator to anything else raises a runtime error.
 
-```bop
+```nybl
 print(3 < 5)                    // true
 print(1 > 0.5)                  // true     (int > number)
 print("abc" < "def")            // true     (lexicographic)
@@ -100,7 +100,7 @@ There are no word-spelled aliases — `and`, `or`, `not` are not keywords.
 
 Short-circuiting means the second operand isn't evaluated if the first determines the result:
 
-```bop
+```nybl
 // && stops at the first false
 if x > 0 && x < 100 {
   print("In range")
@@ -132,7 +132,7 @@ if !found {
 | `/=` | `x = x / ...` |
 | `%=` | `x = x % ...` |
 
-```bop
+```nybl
 let score = 0
 score += 10    // 10
 score -= 3     // 7
@@ -157,7 +157,7 @@ or `CONFIG` is a constant.
 | `.method(...)` | Call a builtin method (on arrays / strings / dicts) or a user-declared method |
 | `[idx]` | Index into an array / string / dict |
 
-```bop
+```nybl
 let p = Point { x: 3, y: 4 }
 print(p.x)               // 3
 print(p.sum())           // calls user method `fn Point.sum`
@@ -169,7 +169,7 @@ print("hello".upper())   // "HELLO"
 
 `try expr` is a unary prefix that unwraps `Result::Ok(v)` to `v` or propagates `Err(e)` to the enclosing function's caller. See [Error Handling](/docs/errors/).
 
-```bop
+```nybl
 fn parse_and_double(s) {
   let n = try string_to_int(s)    // returns Err early on failure
   return Result::Ok(n * 2)
@@ -178,9 +178,9 @@ fn parse_and_double(s) {
 
 ## Conditional expressions
 
-Bop has no ternary operator (`?:`). Use `if/else` as an expression:
+Nybl has no ternary operator (`?:`). Use `if/else` as an expression:
 
-```bop
+```nybl
 let label = if count > 3 { "lots" } else { "few" }
 ```
 
@@ -204,6 +204,6 @@ From highest (evaluated first) to lowest:
 
 Parentheses override precedence:
 
-```bop
+```nybl
 let result = (1 + 2) * 3    // 9, not 7
 ```

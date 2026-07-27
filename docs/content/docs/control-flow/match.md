@@ -16,7 +16,7 @@ path = "/docs/data/arrays/"
 
 `match` is an expression: it evaluates a value and runs the first arm whose pattern matches, binding any captured names along the way.
 
-```bop
+```nybl
 let shape = Shape::Circle(3)
 
 let label = match shape {
@@ -35,7 +35,7 @@ Arms are tried top to bottom; the first matching arm wins. A match with no match
 
 Matches a specific value:
 
-```bop
+```nybl
 match n {
   0    => "zero",
   1    => "one",
@@ -54,7 +54,7 @@ Matches anything, binds nothing. Typical "default" arm.
 
 A lowercase identifier captures the scrutinee value under that name for the arm's guard and body:
 
-```bop
+```nybl
 match request {
   request => handle(request),   // `request` is bound here
 }
@@ -62,7 +62,7 @@ match request {
 
 Inside nested patterns, bindings capture the piece they sit at:
 
-```bop
+```nybl
 match pair {
   [first, second] => first + second,
 }
@@ -72,7 +72,7 @@ match pair {
 
 Match a user struct with an exact type identity. Each field pattern runs against the corresponding field's value:
 
-```bop
+```nybl
 struct Point { x, y }
 let p = Point { x: 3, y: 4 }
 
@@ -86,7 +86,7 @@ Field patterns can be bindings (`x`), literals (`x: 0`), or any nested pattern.
 
 ### Enum variant patterns
 
-```bop
+```nybl
 match shape {
   Shape::Circle(r)              => r * r,
   Shape::Rectangle { w, h }     => w * h,
@@ -100,7 +100,7 @@ Unit, tuple, and struct variants all work. Like struct patterns, field / tuple e
 
 Types imported through an aliased `use` must be matched through the same namespace:
 
-```bop
+```nybl
 use paint as p
 
 match c {
@@ -114,7 +114,7 @@ The matcher compares the value's full `(module_path, type_name)` identity agains
 
 ### Array patterns
 
-```bop
+```nybl
 match items {
   []           => "empty",
   [only]       => "one: {only}",
@@ -132,7 +132,7 @@ match items {
 
 `p1 | p2 | p3` — matches if *any* of the alternatives matches. Each alternative must bind the same set of names so the arm body has a consistent view:
 
-```bop
+```nybl
 match day {
   "Sat" | "Sun" => "weekend",
   _             => "weekday",
@@ -143,7 +143,7 @@ match day {
 
 An arm can add a boolean guard after `if`. The arm only fires when the pattern matches **and** the guard is true:
 
-```bop
+```nybl
 match n {
   x if x < 0  => "negative",
   0           => "zero",
@@ -158,7 +158,7 @@ Guards can see any names the pattern bound.
 
 `match` is an expression — every arm's body is an expression, and the whole thing evaluates to the winning arm's body:
 
-```bop
+```nybl
 let grade = match score {
   s if s >= 90 => "A",
   s if s >= 80 => "B",
@@ -167,13 +167,13 @@ let grade = match score {
 }
 ```
 
-All arms should produce compatible types if you rely on the result — Bop is dynamically typed, so heterogeneous arms aren't a parse error, but they usually signal a bug.
+All arms should produce compatible types if you rely on the result — Nybl is dynamically typed, so heterogeneous arms aren't a parse error, but they usually signal a bug.
 
 ## Exhaustiveness
 
-Bop's static checker warns when a `match` over an enum misses variants:
+Nybl's static checker warns when a `match` over an enum misses variants:
 
-```bop
+```nybl
 enum Color { Red, Green, Blue }
 
 let _ = match Color::Red {

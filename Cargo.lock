@@ -9,56 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
-name = "bop-cli"
-version = "0.4.0"
-dependencies = [
- "bop-compile",
- "bop-lang",
- "bop-sys",
- "bop-vm",
- "rustyline",
- "same-file",
-]
-
-[[package]]
-name = "bop-compile"
-version = "0.4.0"
-dependencies = [
- "bop-lang",
- "bop-vm",
-]
-
-[[package]]
-name = "bop-lang"
-version = "0.4.0"
-dependencies = [
- "libm",
-]
-
-[[package]]
-name = "bop-rust-embedding-examples"
-version = "0.0.0"
-dependencies = [
- "bop-compile",
- "bop-lang",
- "bop-vm",
-]
-
-[[package]]
-name = "bop-sys"
-version = "0.4.0"
-dependencies = [
- "bop-lang",
-]
-
-[[package]]
-name = "bop-vm"
-version = "0.4.0"
-dependencies = [
- "bop-lang",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -170,6 +120,56 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nybl-cli"
+version = "0.4.0"
+dependencies = [
+ "nybl-compile",
+ "nybl-lang",
+ "nybl-sys",
+ "nybl-vm",
+ "rustyline",
+ "same-file",
+]
+
+[[package]]
+name = "nybl-compile"
+version = "0.4.0"
+dependencies = [
+ "nybl-lang",
+ "nybl-vm",
+]
+
+[[package]]
+name = "nybl-lang"
+version = "0.4.0"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "nybl-rust-embedding-examples"
+version = "0.0.0"
+dependencies = [
+ "nybl-compile",
+ "nybl-lang",
+ "nybl-vm",
+]
+
+[[package]]
+name = "nybl-sys"
+version = "0.4.0"
+dependencies = [
+ "nybl-lang",
+]
+
+[[package]]
+name = "nybl-vm"
+version = "0.4.0"
+dependencies = [
+ "nybl-lang",
 ]
 
 [[package]]

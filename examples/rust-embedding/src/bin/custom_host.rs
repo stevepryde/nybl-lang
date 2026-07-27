@@ -1,20 +1,20 @@
-use bop::{BopError, BopHost, BopLimits, Value};
+use nybl::{NyblError, NyblHost, NyblLimits, Value};
 
 #[derive(Default)]
 struct Host {
     output: Vec<String>,
 }
 
-impl BopHost for Host {
-    fn call(&mut self, name: &str, args: &[Value], line: u32) -> Option<Result<Value, BopError>> {
+impl NyblHost for Host {
+    fn call(&mut self, name: &str, args: &[Value], line: u32) -> Option<Result<Value, NyblError>> {
         match (name, args) {
             ("double", [Value::Int(value)]) => Some(
                 value
                     .checked_mul(2)
                     .map(Value::Int)
-                    .ok_or_else(|| BopError::runtime("double(value) overflowed", line)),
+                    .ok_or_else(|| NyblError::runtime("double(value) overflowed", line)),
             ),
-            ("double", _) => Some(Err(BopError::runtime(
+            ("double", _) => Some(Err(NyblError::runtime(
                 "double(value) expects one Int",
                 line,
             ))),
@@ -31,13 +31,13 @@ impl BopHost for Host {
     }
 }
 
-fn run_example() -> Result<(), BopError> {
+fn run_example() -> Result<(), NyblError> {
     let source = "print(double(21))";
-    let limits = BopLimits::standard();
+    let limits = NyblLimits::standard();
     let mut host = Host::default();
 
-    bop::run(source, &mut host, &limits)?;
-    bop_vm::run(source, &mut host, &limits)?;
+    nybl::run(source, &mut host, &limits)?;
+    nybl_vm::run(source, &mut host, &limits)?;
 
     assert_eq!(host.output, ["42", "42"]);
     Ok(())
@@ -57,10 +57,10 @@ mod tests {
     #[test]
     fn host_arithmetic_reports_overflow_without_panicking() {
         let mut host = super::Host::default();
-        let error = bop::run(
+        let error = nybl::run(
             "double(9223372036854775807)",
             &mut host,
-            &bop::BopLimits::standard(),
+            &nybl::NyblLimits::standard(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("overflowed"));

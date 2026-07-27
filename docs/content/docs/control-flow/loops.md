@@ -1,6 +1,6 @@
 +++
 title = "Loops"
-description = "Loops let you repeat actions. Bop has three kinds: `repeat`, `while`, and `for...in`."
+description = "Loops let you repeat actions. Nybl has three kinds: `repeat`, `while`, and `for...in`."
 weight = 6
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,13 +14,13 @@ path = "/docs/control-flow/break-continue/"
 
 # Loops
 
-Loops let you repeat actions. Bop has three kinds: `repeat`, `while`, and `for...in`.
+Loops let you repeat actions. Nybl has three kinds: `repeat`, `while`, and `for...in`.
 
 ## repeat
 
 The simplest loop — just "do this N times." No loop variable, no fuss:
 
-```bop
+```nybl
 repeat 4 {
   print("Hello!")
 }
@@ -28,7 +28,7 @@ repeat 4 {
 
 The count can be any expression:
 
-```bop
+```nybl
 let times = 3
 repeat times {
   print("Again!")
@@ -41,7 +41,7 @@ repeat times {
 
 Loops as long as a condition is true:
 
-```bop
+```nybl
 let n = 1
 while n <= 100 {
   n *= 2
@@ -51,7 +51,7 @@ print(n)    // 128
 
 A `while true` loop runs forever (until you `break` out of it or hit the step limit):
 
-```bop
+```nybl
 let total = 0
 let i = 1
 while true {
@@ -66,7 +66,7 @@ print("Sum exceeded 100 at i=" + i.to_str())
 
 ### Counting example
 
-```bop
+```nybl
 // Count how many numbers under 50 are divisible by 7
 let count = 0
 let n = 1
@@ -85,7 +85,7 @@ Iterates over ranges, arrays, or dictionary keys.
 
 ### Ranges
 
-```bop
+```nybl
 for i in range(5) {
   print(i.to_str())     // 0, 1, 2, 3, 4
 }
@@ -93,7 +93,7 @@ for i in range(5) {
 
 With a start value:
 
-```bop
+```nybl
 for i in range(2, 8) {
   print(i.to_str())     // 2, 3, 4, 5, 6, 7
 }
@@ -101,7 +101,7 @@ for i in range(2, 8) {
 
 ### Arrays
 
-```bop
+```nybl
 let fruits = ["apple", "banana", "cherry"]
 for fruit in fruits {
   print(fruit)
@@ -110,7 +110,7 @@ for fruit in fruits {
 
 ### Dictionary keys
 
-```bop
+```nybl
 let scores = {"Alice": 95, "Bob": 87, "Charlie": 92}
 for name in scores {
   let s = scores[name].to_str()
@@ -122,7 +122,7 @@ for name in scores {
 
 `for x in v` works on anything that participates in the [iterator protocol](/docs/reference/methods/#iter-methods-iter): arrays, strings, dicts, explicit iterators (`arr.iter()`), and user types that implement `.iter()`:
 
-```bop
+```nybl
 struct Bag { items }
 fn bag_of(arr) { return Bag { items: arr } }
 fn Bag.iter(self) { return self.items.iter() }
@@ -137,7 +137,7 @@ That's the structural-typing story: no trait declaration, no ceremony — if `v.
 
 You can iterate over the characters of a string:
 
-```bop
+```nybl
 let word = "hello"
 for ch in word {
   print(ch)    // "h", "e", "l", "l", "o"
@@ -148,7 +148,7 @@ for ch in word {
 
 Loops can be nested. This is useful for working with grids or combinations:
 
-```bop
+```nybl
 for row in range(3) {
   for col in range(4) {
     print("(" + row.to_str() + ", " + col.to_str() + ")")

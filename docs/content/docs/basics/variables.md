@@ -20,7 +20,7 @@ Variables store values that you can use and change throughout your program.
 
 Use `let` to create a new variable:
 
-```bop
+```nybl
 let x = 5
 let name = "Alice"
 let found = true
@@ -30,7 +30,7 @@ let config = {"width": 10, "height": 5}
 
 `let` is required the first time — using an undeclared variable is an error. This catches typos early:
 
-```bop
+```nybl
 let count = 5
 conut = 10    // Error: I don't know what 'conut' is — did you mean 'count'?
 ```
@@ -39,14 +39,14 @@ conut = 10    // Error: I don't know what 'conut' is — did you mean 'count'?
 
 Use `const` for values that won't change:
 
-```bop
+```nybl
 const PI = 3.14
 const MAX_SIZE = 100
 ```
 
 Reassigning a constant is rejected at parse time — the compiler sees that the left-hand side is an all-caps identifier and refuses:
 
-```bop
+```nybl
 const MAX_SIZE = 100
 MAX_SIZE = 200      // Error: can't reassign a constant
 ```
@@ -54,7 +54,7 @@ MAX_SIZE = 200      // Error: can't reassign a constant
 Index and field assignments respect the same rule. An assignment cannot reach
 through a constant array, dict, or struct binding to change part of its value:
 
-```bop
+```nybl
 const ORIGIN = [0, 0]
 ORIGIN[0] = 10      // Error: can't reassign `ORIGIN` — it's a constant
 
@@ -65,7 +65,7 @@ OPTIONS["retries"] += 1   // Same error
 Built-in mutating array methods are assignments through their receiver, so
 they cannot change a constant either:
 
-```bop
+```nybl
 const SCORES = [3, 1, 2]
 SCORES.sort()       // Error: can't reassign `SCORES` — it's a constant
 ```
@@ -79,7 +79,7 @@ Constants must be **all-caps** (with digits / underscores allowed). `const Pi = 
 
 After declaration, reassign with just `=`:
 
-```bop
+```nybl
 let score = 0
 score = 10
 score += 5     // score is now 15
@@ -87,7 +87,7 @@ score += 5     // score is now 15
 
 Compound assignment operators: `+=`, `-=`, `*=`, `/=`, `%=`.
 
-```bop
+```nybl
 let x = 10
 x += 3    // x = x + 3 → 13
 x -= 1    // x = x - 1 → 12
@@ -96,7 +96,7 @@ x *= 2    // x = x * 2 → 24
 
 ## Name shapes are checked
 
-Bop enforces case conventions at declaration sites so intent is visible at a glance:
+Nybl enforces case conventions at declaration sites so intent is visible at a glance:
 
 | Declaration | Required shape |
 |-------------|----------------|
@@ -106,7 +106,7 @@ Bop enforces case conventions at declaration sites so intent is visible at a gla
 
 Mis-shaped declarations parse-error with a suggestion:
 
-```bop
+```nybl
 let Count = 5        // Error: names bound by `let` start with a lowercase letter. Try `count`?
 const pi = 3.14      // Error: `const` names are SCREAMING_SNAKE_CASE. Try `PI`?
 struct point {}      // Error: type names start with an uppercase letter. Try `Point`?
@@ -118,7 +118,7 @@ A leading underscore marks a name as "private by convention." It doesn't change 
 
 Variables are block-scoped — a variable declared inside `{ }` is not visible outside:
 
-```bop
+```nybl
 let x = 1
 if true {
   let y = 2       // y only exists inside this block
@@ -131,7 +131,7 @@ if true {
 
 You can re-declare a variable with `let` in an inner block. The inner variable "shadows" the outer one:
 
-```bop
+```nybl
 let x = 1
 if true {
   let x = 2     // shadows outer x
@@ -145,11 +145,11 @@ print(x)         // 1 — outer x is unchanged
 
 Arrays, dicts, structs, and enum variants have **value semantics**. When you assign one, pass it to a function, or return it, the destination behaves like an independent copy. Changing either value never affects the other.
 
-Bop implements these copies with copy-on-write storage: the operation itself is constant-time and shares the existing container safely. The backing storage is copied only if one of the values is later mutated. This is an implementation detail — programs observe the same independent values without paying for an eager deep copy.
+Nybl implements these copies with copy-on-write storage: the operation itself is constant-time and shares the existing container safely. The backing storage is copied only if one of the values is later mutated. This is an implementation detail — programs observe the same independent values without paying for an eager deep copy.
 
 ### Assignment copies
 
-```bop
+```nybl
 let a = [1, 2, 3]
 let b = a           // b is a separate copy
 b.push(4)
@@ -161,7 +161,7 @@ print(b)            // [1, 2, 3, 4]
 
 When you pass a value to a function, the function gets its own copy. Modifying it inside the function has no effect on the caller's variable:
 
-```bop
+```nybl
 fn try_to_modify(items) {
   items.push(99)
   print(items)       // [1, 2, 3, 99]
@@ -174,7 +174,7 @@ print(original)      // [1, 2, 3] — unchanged
 
 To get a modified value out of a function, `return` it:
 
-```bop
+```nybl
 fn add_item(items, val) {
   items.push(val)
   return items
@@ -197,7 +197,7 @@ semantics described above.
 
 Variables can hold any type. You can even change the type of a variable by reassigning it:
 
-```bop
+```nybl
 let val = 42
 print(val.type())   // "int"
 

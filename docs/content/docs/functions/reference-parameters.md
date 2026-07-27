@@ -14,13 +14,13 @@ path = "/docs/modules/"
 
 # Reference Parameters
 
-Bop normally passes values independently: changing a function parameter does
+Nybl normally passes values independently: changing a function parameter does
 not change the caller's variable. Use a `ref` parameter when the function is
 specifically designed to replace a mutable variable in its caller.
 
 `ref` is required in both the function declaration and the call:
 
-```bop
+```nybl
 fn grow(ref items, count) {
   repeat count {
     items.push(0)
@@ -41,13 +41,13 @@ is an error with a hint that identifies the argument.
 A reference parameter is a staged local value, not an observable alias into
 the caller's scope:
 
-1. Bop snapshots the caller variable when the call begins.
+1. Nybl snapshots the caller variable when the call begins.
 2. The function reads and changes its staged parameter.
 3. A normal return writes every staged reference parameter back to its caller
    variable.
 4. An error discards every staged change.
 
-This is also called **copy-in/copy-out** or **call by value-result**. Bop's
+This is also called **copy-in/copy-out** or **call by value-result**. Nybl's
 copy-on-write containers keep the initial snapshot cheap while preserving
 ordinary value semantics.
 
@@ -55,7 +55,7 @@ Reaching the end of the function and an explicit `return` are both normal
 returns. A language-level `Result::Err` is also an ordinary returned value, so
 it commits:
 
-```bop
+```nybl
 fn validate(ref attempts) {
   attempts += 1
   return Err("not accepted")
@@ -70,7 +70,7 @@ By contrast, `panic`, another runtime error, or a fatal step/memory/call-depth
 limit failure rolls the call back. Rollback happens before `try_call` catches a
 non-fatal error:
 
-```bop
+```nybl
 fn update_then_fail(ref items) {
   items.push(2)
   panic("not committed")
@@ -89,7 +89,7 @@ print(result.is_err(), items)    // true [1]
 
 An explicit `ref` argument must name one mutable plain-variable binding:
 
-```bop
+```nybl
 let value = 1
 set(ref value)       // valid
 set(ref (value))     // also valid; grouping is transparent
@@ -97,7 +97,7 @@ set(ref (value))     // also valid; grouping is transparent
 
 These are not valid targets:
 
-```bop
+```nybl
 const FIXED = 1
 // set(ref FIXED)          // constant
 // set(ref 1)              // literal or other expression
@@ -111,7 +111,7 @@ cannot be captured by a nested function or lambda.
 
 The same binding cannot fill two reference positions in one call:
 
-```bop
+```nybl
 fn pair(ref left, ref right) {}
 
 let value = 1
@@ -126,7 +126,7 @@ targets commit as one transaction.
 All reference parameters in one call commit together. If the function fails
 after changing any of them, none are written back:
 
-```bop
+```nybl
 fn replace(ref left, ref right, should_fail) {
   left = 10
   right = 20
@@ -138,7 +138,7 @@ fn replace(ref left, ref right, should_fail) {
 
 A function can forward its reference parameter into another reference call:
 
-```bop
+```nybl
 fn inner(ref value) {
   value += 1
 }
@@ -185,7 +185,7 @@ silent mutation of a discarded copy.
 
 Declare `ref self` when a method should update its caller:
 
-```bop
+```nybl
 struct Counter { amount }
 
 fn Counter.add(ref self, amount) {
@@ -204,7 +204,7 @@ bindings are rejected before ordinary argument side effects.
 
 A method may also declare explicit reference parameters after the receiver:
 
-```bop
+```nybl
 fn Counter.transfer(ref self, ref total) {
   total += self.amount
   self.amount = 0
@@ -224,12 +224,12 @@ back.
 Built-in mutating array methods use the same transaction model implicitly for
 a mutable plain-variable receiver. You do not write `ref` before the receiver:
 
-```bop
+```nybl
 let items = [1]
 items.push(2)
 ```
 
-Method arguments run before Bop snapshots the receiver. A true temporary may
+Method arguments run before Nybl snapshots the receiver. A true temporary may
 be mutated, but its mutation is discarded after the method returns:
 `([1, 2]).pop()` returns `2`, while `[1, 2].push(3)` returns `none`.
 Mutating through an index or field receiver is rejected with an
@@ -240,16 +240,16 @@ for the built-in behavior.
 
 ## Built-ins, host functions, and instances
 
-Explicit reference parameters belong to user-defined Bop functions. Built-in
-functions, built-in method arguments, and functions supplied by `BopHost`
+Explicit reference parameters belong to user-defined Nybl functions. Built-in
+functions, built-in method arguments, and functions supplied by `NyblHost`
 accept value arguments only.
 
-Rust's `BopInstance::call` and `call_value` APIs also accept owned `Value`
-arguments rather than Bop binding locations. They reject a ref-bearing entry
+Rust's `NyblInstance::call` and `call_value` APIs also accept owned `Value`
+arguments rather than Nybl binding locations. They reject a ref-bearing entry
 or callback before its body executes. Keep host-facing `pub fn` entries
-value-only and call reference-based helpers from inside Bop:
+value-only and call reference-based helpers from inside Nybl:
 
-```bop
+```nybl
 fn increment(ref value) {
   value += 1
 }

@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://bop-lang.com/sitemap.xml
+Sitemap: https://nybl-lang.com/sitemap.xml

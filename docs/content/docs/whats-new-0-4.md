@@ -1,6 +1,6 @@
 +++
-title = "What's new in Bop 0.4"
-description = "Bop 0.4 adds persistent instances, typed Rust value conversions, a complete module system, Result and lazy iterator protocols, a stateful REPL, richer diagnostics, and full walker/VM/AOT parity."
+title = "What's new in Nybl 0.4"
+description = "Nybl 0.4 adds persistent instances, typed Rust value conversions, a complete module system, Result and lazy iterator protocols, a stateful REPL, richer diagnostics, and full walker/VM/AOT parity."
 weight = 2
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -12,20 +12,20 @@ title = "Syntax"
 path = "/docs/basics/syntax/"
 +++
 
-# What's new in Bop 0.4
+# What's new in Nybl 0.4
 
-Bop 0.4 is the first coordinated release after 0.3. All five crates move
+Nybl 0.4 is the first coordinated release after 0.3. All five crates move
 together to `0.4.0`:
 
 ```toml
 [dependencies]
-bop = { package = "bop-lang", version = "0.4" }
-bop-vm = "0.4"       # optional bytecode engine
-bop-compile = "0.4"  # optional AOT transpiler
-bop-sys = "0.4"      # optional OS-backed host
+nybl = { package = "nybl-lang", version = "0.4" }
+nybl-vm = "0.4"       # optional bytecode engine
+nybl-compile = "0.4"  # optional AOT transpiler
+nybl-sys = "0.4"      # optional OS-backed host
 ```
 
-The release makes Bop substantially more useful as an embedded plugin
+The release makes Nybl substantially more useful as an embedded plugin
 language: programs can stay alive across host calls, modules have explicit
 namespaces and type identities, Rust values cross the host boundary through
 checked conversions, and the walker, VM, and AOT engines expose the same
@@ -33,11 +33,11 @@ language.
 
 ## Persistent programs
 
-The walker and VM now expose `BopInstance`. Load a program once, inspect its
+The walker and VM now expose `NyblInstance`. Load a program once, inspect its
 direct root-level `pub fn` entries, then call those entries without resetting
 program state:
 
-```bop
+```nybl
 let total = 0
 
 pub fn add(value) {
@@ -63,11 +63,11 @@ borrowed and owned strings, `Vec<T>`, `Option<T>`, `Result<T, E>`, and
 deterministic `BTreeMap<String, T>` dictionaries. Conversion errors report the
 nested path that failed, such as `$[0]["stats"]["hp"]`.
 
-The fallible `bop_value!` macro builds JSON-like arrays and dictionaries while
-preserving Bop's maximum value-depth invariant:
+The fallible `nybl_value!` macro builds JSON-like arrays and dictionaries while
+preserving Nybl's maximum value-depth invariant:
 
 ```rust
-let request = bop::bop_value!({
+let request = nybl::nybl_value!({
     "name": "Ada",
     "scores": [10, 20, 30],
     "nickname": none,
@@ -80,7 +80,7 @@ See [Typed `Value` conversions](/docs/embedding/#typed-value-conversions).
 
 `use` replaces the old `import` keyword and has four forms:
 
-```bop
+```nybl
 use app.config
 use app.config.{HOST, port}
 use app.config as config
@@ -103,7 +103,7 @@ identity, re-exports, and cycles.
 `const` creates a binding that cannot be reassigned or mutated through a
 container:
 
-```bop
+```nybl
 const MAX_RETRIES = 3
 const DEFAULTS = ["safe", "fast"]
 ```
@@ -124,7 +124,7 @@ Diagnostics suggest the corrected spelling. See
 User-defined functions can explicitly update mutable caller variables. The
 `ref` marker is required in both the parameter declaration and the call:
 
-```bop
+```nybl
 fn swap(ref left, ref right) {
   let old = left
   left = right
@@ -147,7 +147,7 @@ and fatal sandbox errors roll the call back, including errors caught by
 Reference parameters work through first-class function aliases, may be
 forwarded into another ref call, and are supported by the walker, VM, and AOT
 engines. Built-in and host functions remain value-only, as do Rust
-`BopInstance::call` and `call_value` arguments. User-defined methods can declare
+`NyblInstance::call` and `call_value` arguments. User-defined methods can declare
 `ref self` to update a mutable plain-variable receiver and can place explicit
 refs after it. Ordinary `self` receivers are read-only, so attempting to mutate
 one is a parse error rather than a silently discarded change. Built-in array
@@ -161,7 +161,7 @@ boundaries.
 
 Operations that belong to a value now use method syntax:
 
-```bop
+```nybl
 value.type()
 value.to_str()
 text.to_int()
@@ -195,7 +195,7 @@ now returns `none`, so optional data can be queried without raising.
 
 Arrays, strings, dictionaries, and iterators implement a lazy protocol:
 
-```bop
+```nybl
 let it = [10, 20, 30].iter()
 print(it.next()) // Iter::Next(10)
 print(it.next()) // Iter::Next(20)
@@ -236,8 +236,8 @@ and persists command history. `:vars`, `:reset`, `:help`, and `:quit` manage
 the session. Piped input uses the same submission model and keeps processing
 after a recoverable error.
 
-`bop run` uses the VM by default (`--novm` selects the walker), while
-`bop compile` builds a native executable or emits Rust source. See
+`nybl run` uses the VM by default (`--novm` selects the walker), while
+`nybl compile` builds a native executable or emits Rust source. See
 [REPL](/docs/repl/) and [Command-line interface](/docs/cli/).
 
 ## Engine parity, diagnostics, and safety
@@ -266,7 +266,7 @@ Make these mechanical changes:
 | `int(x)` / `float(x)` | `x.to_int()` / `x.to_float()` |
 | `len(x)` | `x.len()` |
 | `a // b` | `(a / b).to_int()` |
-| standalone `bop-std` dependency | `bop-lang`'s default `bop-std` feature |
+| standalone `nybl-std` dependency | `nybl-lang`'s default `nybl-std` feature |
 
 The repository's `CHANGELOG.md` also lists runtime hardening and the
 crates.io publishing order.

@@ -1,6 +1,6 @@
-# Bop specifications
+# Nybl specifications
 
-This directory is the canonical index for Bop's stable product and system
+This directory is the canonical index for Nybl's stable product and system
 contracts. It consolidates intent that was previously spread across the root
 README, crate READMEs, and `plans/` without replacing their user guides or
 historical delivery detail.

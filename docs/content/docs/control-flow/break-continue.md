@@ -20,7 +20,7 @@ path = "/docs/control-flow/match/"
 
 Exits the loop immediately. Execution continues after the loop:
 
-```bop
+```nybl
 let i = 0
 while true {
   if i >= 10 {
@@ -33,7 +33,7 @@ print("Stopped at " + i.to_str())
 
 ### Searching for something
 
-```bop
+```nybl
 let numbers = [4, 8, 15, 16, 23, 42]
 let found = false
 for n in numbers {
@@ -54,7 +54,7 @@ if found {
 
 Skips the rest of the current iteration and jumps to the next one:
 
-```bop
+```nybl
 for i in range(10) {
   if i % 2 == 0 {
     continue
@@ -65,8 +65,8 @@ for i in range(10) {
 
 ### Filter and process
 
-```bop
-let words = ["hello", "", "world", "", "bop"]
+```nybl
+let words = ["hello", "", "world", "", "nybl"]
 for word in words {
   if word == "" {
     continue
@@ -79,7 +79,7 @@ for word in words {
 
 All three loop types — `while`, `for...in`, and `repeat` — support both `break` and `continue`.
 
-```bop
+```nybl
 repeat 10 {
   let n = rand(100)
   if n < 10 {

@@ -13,10 +13,10 @@
   <meta property="og:title" content="{% block og_title %}{{ config.title }}{% endblock og_title %}">
   <meta property="og:description" content="{{ config.description }}">
   <meta property="og:url" content="{{ current_url | default(value=config.base_url) | safe }}">
-  <meta property="og:site_name" content="Bop">
+  <meta property="og:site_name" content="Nybl">
   <meta name="twitter:card" content="summary">
   <link rel="canonical" href="{{ current_url | default(value=config.base_url) | safe }}">
-  <link rel="alternate" type="text/plain" href="{{ config.base_url }}/llms.txt" title="Bop LLM documentation index">
+  <link rel="alternate" type="text/plain" href="{{ config.base_url }}/llms.txt" title="Nybl LLM documentation index">
   {% if site_current_path is starting_with("/docs/") %}
   <link rel="alternate" type="text/markdown" href="{{ current_url | safe }}index.html.md" title="Markdown version">
   {% endif %}
@@ -26,7 +26,7 @@
   <link rel="stylesheet" href="{{ get_url(path='site.css', cachebust=true) | safe }}">
   <script>
     (() => {
-      const saved = localStorage.getItem("bop-theme");
+      const saved = localStorage.getItem("nybl-theme");
       document.documentElement.dataset.theme = saved || "dark";
     })();
   </script>
@@ -36,9 +36,9 @@
 
   <header class="site-header" data-site-header>
     <div class="site-header-inner">
-      <a class="brand" href="/" aria-label="Bop home">
+      <a class="brand" href="/" aria-label="Nybl home">
         <span class="brand-mark" aria-hidden="true">b</span>
-        <span class="brand-word">bop</span>
+        <span class="brand-word">nybl</span>
       </a>
 
       <nav class="desktop-nav" aria-label="Primary navigation">
@@ -75,7 +75,7 @@
 
   <footer class="site-footer">
     <div class="footer-compact">
-      <span>Bop</span>
+      <span>Nybl</span>
       <span>MIT or Apache-2.0</span>
       <a href="{{ config.extra.github_url }}" target="_blank" rel="noreferrer">GitHub</a>
     </div>
@@ -85,14 +85,14 @@
     <div class="search-dialog-header">
       <div>
         <span class="eyebrow">Documentation</span>
-        <h2 id="search-title">Search Bop</h2>
+        <h2 id="search-title">Search Nybl</h2>
       </div>
       <button class="icon-button" type="button" data-search-close aria-label="Close search">{{ ui::icon(name="close") }}</button>
     </div>
     <label class="search-field">
       <span class="sr-only">Search documentation</span>
       {{ ui::icon(name="search") }}
-      <input type="search" placeholder="Try “pattern matching” or “BopHost”…" autocomplete="off" data-search-input>
+      <input type="search" placeholder="Try “pattern matching” or “NyblHost”…" autocomplete="off" data-search-input>
       <kbd>Esc</kbd>
     </label>
     <div class="search-status" role="status" aria-live="polite" data-search-status>Start typing to search the guide and reference.</div>

@@ -1,11 +1,11 @@
 # Changelog
 
-All notable changes to Bop are documented here. Versions apply to the
+All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
 ## 0.4.0 - Unreleased
 
-`0.4.0` is the first coordinated release after `0.3.0`. It expands Bop from a
+`0.4.0` is the first coordinated release after `0.3.0`. It expands Nybl from a
 small one-shot scripting runtime into a module-aware language with persistent
 embedding APIs across all three execution engines.
 
@@ -39,22 +39,22 @@ embedding APIs across all three execution engines.
 
 ### Embedding and Rust APIs
 
-- Add `bop::BopInstance` and `bop_vm::BopInstance`. A program is loaded once,
+- Add `nybl::NyblInstance` and `nybl_vm::NyblInstance`. A program is loaded once,
   then direct root-level `pub fn` entries can be called while globals,
   modules, callbacks, types, methods, and RNG state remain live.
-- Add the equivalent generated `BopInstance` API to sandboxed AOT library
+- Add the equivalent generated `NyblInstance` API to sandboxed AOT library
   output.
 - Add strict, path-aware Rust ↔ `Value` conversion through `IntoValue`,
-  `FromValue`, `Value::to_rust`, and `bop_value!`.
-- Add in-memory module helpers in `bop::host`.
-- Move the Bop standard library into `bop-lang` behind the default `bop-std`
-  feature. The old standalone `bop-std` crate is no longer needed.
+  `FromValue`, `Value::to_rust`, and `nybl_value!`.
+- Add in-memory module helpers in `nybl::host`.
+- Move the Nybl standard library into `nybl-lang` behind the default `nybl-std`
+  feature. The old standalone `nybl-std` crate is no longer needed.
 - Make Rust standard-library integration an additive-safe default `std`
   feature. Genuine no_std builds use `default-features = false` with
   `features = ["no_std"]`; if Cargo unifies both features, `std` wins.
 - Replace ambient engine memory accounting with an explicit per-instance
   context across the walker, VM, modules, and generated sandbox runtime.
-  Legacy `bop_memory_*` hooks are now std-only; custom no_std integrations
+  Legacy `nybl_memory_*` hooks are now std-only; custom no_std integrations
   must use the context-aware internal runtime APIs. Host-created `Value`s are
   untracked until an engine mutation adopts their backing allocation.
 - Improve imported-module diagnostics so parse and runtime failures render
@@ -65,14 +65,14 @@ embedding APIs across all three execution engines.
 - Bring the bytecode VM and AOT transpiler to language parity with the
   tree-walker, covered by an expanded three-engine differential suite.
 - Set Rust 1.88 as the minimum supported Rust version for the complete
-  workspace, including `bop-cli`.
-- Add public bytecode validation through `bop_vm::validate_chunk`.
+  workspace, including `nybl-cli`.
+- Add public bytecode validation through `nybl_vm::validate_chunk`.
 - Add copy-on-write runtime containers, in-place VM mutation paths, compact
   instruction pools, safe superinstructions, and allocation reductions.
 - Add a persistent, multiline REPL with expression echo, tab completion,
   history, `:vars`, `:reset`, and non-TTY transcript support.
-- Keep `bop run` on the VM by default, with `--novm` for the tree-walker, and
-  support native builds or Rust-source emission through `bop compile`.
+- Keep `nybl run` on the VM by default, with `--novm` for the tree-walker, and
+  support native builds or Rust-source emission through `nybl compile`.
 
 ### Safety and diagnostics
 
@@ -92,7 +92,7 @@ embedding APIs across all three execution engines.
 - Replace removed global helpers such as `type(x)`, `str(x)`, `int(x)`,
   `float(x)`, and `len(x)` with methods on the value.
 - Replace `a // b` integer division with `(a / b).to_int()`.
-- Remove a standalone `bop-std` dependency; enable `bop-lang`'s `bop-std`
+- Remove a standalone `nybl-std` dependency; enable `nybl-lang`'s `nybl-std`
   feature instead (it is enabled by default).
 
 ### Publishing order
@@ -100,11 +100,11 @@ embedding APIs across all three execution engines.
 The crates use `0.4.0` requirements for workspace dependencies and should be
 published in dependency order:
 
-1. `bop-lang`
-2. `bop-sys`
-3. `bop-vm`
-4. `bop-compile`
-5. `bop-cli`
+1. `nybl-lang`
+2. `nybl-sys`
+3. `nybl-vm`
+4. `nybl-compile`
+5. `nybl-cli`
 
 Wait for each package to become available in the crates.io index before
 publishing a dependent package.

@@ -1,6 +1,6 @@
 +++
 title = "std.json"
-description = "RFC-8259 JSON `parse` and `stringify`, implemented in pure Bop."
+description = "RFC-8259 JSON `parse` and `stringify`, implemented in pure Nybl."
 weight = 26
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,13 +14,13 @@ path = "/docs/stdlib/test/"
 
 # std.json
 
-RFC-8259 JSON `parse` and `stringify`, implemented in pure Bop.
+RFC-8259 JSON `parse` and `stringify`, implemented in pure Nybl.
 
-Performance is reasonable for scripting workloads (config files, API payloads up to a few MB). A C-backed parser would be faster but would pull `bop-std` out of its zero-Rust-dep contract.
+Performance is reasonable for scripting workloads (config files, API payloads up to a few MB). A C-backed parser would be faster but would pull `nybl-std` out of its zero-Rust-dep contract.
 
 ## Import
 
-```bop
+```nybl
 use std.json                       // glob
 use std.json.{parse, stringify}    // selective
 use std.json as j                  // aliased
@@ -28,9 +28,9 @@ use std.json as j                  // aliased
 
 ## `stringify(value)`
 
-Emit `value` as JSON text. Bop values that have no JSON analogue (`fn`, `struct`, `enum`) raise a runtime error — strip them out before calling.
+Emit `value` as JSON text. Nybl values that have no JSON analogue (`fn`, `struct`, `enum`) raise a runtime error — strip them out before calling.
 
-```bop
+```nybl
 use std.json.{stringify}
 
 print(stringify(42))                           // "42"
@@ -45,9 +45,9 @@ Strings are escaped for the five characters JSON requires (`"`, `\`, `\n`, `\r`,
 
 ## `parse(text)`
 
-Parse JSON text into a Bop value. Parse errors raise a runtime error with a position marker.
+Parse JSON text into a Nybl value. Parse errors raise a runtime error with a position marker.
 
-```bop
+```nybl
 use std.json.{parse}
 
 print(parse("42"))                       // 42
@@ -59,7 +59,7 @@ print(parse("null"))                     // none
 
 ### Mapping
 
-JSON type | Bop type
+JSON type | Nybl type
 --- | ---
 number (integer) | `int`
 number (decimal / exponent) | `number`
@@ -73,7 +73,7 @@ object | `dict` (keys must be strings, which JSON already requires)
 
 `parse` raises on malformed input. Wrap in `try_call` if you want a `Result`-shaped outcome:
 
-```bop
+```nybl
 use std.json.{parse}
 
 let r = try_call(fn() { return parse("\{broken") })
@@ -84,11 +84,11 @@ match r {
 // parse failed: ...
 ```
 
-(The leading `\{` escapes the `{` so Bop doesn't mistake it for a string-interpolation marker.)
+(The leading `\{` escapes the `{` so Nybl doesn't mistake it for a string-interpolation marker.)
 
 ### Known gaps
 
 - `\b` / `\f` escapes are rejected. Rare in real payloads.
-- `\uXXXX` escapes are rejected — they'd need 4-hex parsing plus code-point-to-UTF-8 conversion, which is nontrivial in pure Bop.
+- `\uXXXX` escapes are rejected — they'd need 4-hex parsing plus code-point-to-UTF-8 conversion, which is nontrivial in pure Nybl.
 
 Both raise a clear "unsupported escape" error so you know what happened.

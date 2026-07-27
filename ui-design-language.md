@@ -1,10 +1,10 @@
-# Bop website design language
+# Nybl website design language
 
 ## Product tone
 
 | Item | Decision | Notes |
 | --- | --- | --- |
-| Product / area | Bop language website and documentation | One visual system for marketing, teaching, and reference content |
+| Product / area | Nybl language website and documentation | One visual system for marketing, teaching, and reference content |
 | Primary user | Rust embedders, educators, learners, and tooling authors | Technical readers should reach code or reference material quickly |
 | Interface tone | Precise, readable, technical, and quietly warm | It should feel like a programming-language manual with a welcoming front door—not a SaaS launch page |
 | Density | Single-screen, code-first homepage; readable documentation | The homepage contains only identity, factual description, code, primary links, and a compact footer |

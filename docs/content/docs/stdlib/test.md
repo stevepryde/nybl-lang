@@ -1,6 +1,6 @@
 +++
 title = "std.test"
-description = "Minimal assertion toolkit for sanity checks in Bop scripts."
+description = "Minimal assertion toolkit for sanity checks in Nybl scripts."
 weight = 27
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -8,19 +8,19 @@ page_template = "docs/page.html"
 title = "std.json"
 path = "/docs/stdlib/json/"
 [extra.next]
-title = "Embedding Bop"
+title = "Embedding Nybl"
 path = "/docs/embedding/"
 +++
 
 # std.test
 
-Minimal assertion toolkit for sanity checks in Bop scripts.
+Minimal assertion toolkit for sanity checks in Nybl scripts.
 
 This isn't an xUnit clone — just the assertion primitives you'll reach for when writing quick tests. Assertions fail by routing through the [`panic`](/docs/reference/builtins/#panicmessage) builtin, so the failure detail is surfaced verbatim in `Err(e).message` when caught by `try_call`. Print-based reporting is intentionally out of scope — wrap the assertion in `try_call` if you need "report and continue".
 
 ## Import
 
-```bop
+```nybl
 use std.test                                // glob
 use std.test.{assert_eq, assert_near}       // selective
 use std.test as t                           // aliased
@@ -32,7 +32,7 @@ use std.test as t                           // aliased
 
 Assert that `cond` is truthy. On failure, raises a runtime error — `message` is surfaced in the crash trace.
 
-```bop
+```nybl
 use std.test.{assert}
 assert(1 + 1 == 2, "arithmetic still works")
 ```
@@ -41,7 +41,7 @@ assert(1 + 1 == 2, "arithmetic still works")
 
 Assert two values are structurally equal (same as `==`). On failure the error includes an `assert_eq failed:` prefix and the `.inspect()` of both sides.
 
-```bop
+```nybl
 use std.test.{assert_eq}
 assert_eq([1, 2, 3].len(), 3)
 assert_eq("hi".upper(), "HI")
@@ -51,7 +51,7 @@ assert_eq("hi".upper(), "HI")
 
 Assert two floats are within `tolerance` of each other. Use this instead of `assert_eq` when comparing `number` values subject to rounding.
 
-```bop
+```nybl
 use std.test.{assert_near}
 assert_near((2).sqrt() * (2).sqrt(), 2, 0.0000001)
 ```
@@ -60,7 +60,7 @@ assert_near((2).sqrt() * (2).sqrt(), 2, 0.0000001)
 
 Assert that `body` — a zero-arg closure — raises a runtime error. On success (no raise), the assertion itself fails. Useful for negative tests.
 
-```bop
+```nybl
 use std.test.{assert_raises}
 
 assert_raises(fn() {
@@ -76,7 +76,7 @@ Under the hood, `assert_raises` uses `try_call` to observe whether `body` raised
 
 ## Putting it together
 
-```bop
+```nybl
 use std.test.{assert_eq, assert_raises}
 
 fn normalize(arr) {

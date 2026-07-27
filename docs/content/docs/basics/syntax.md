@@ -1,6 +1,6 @@
 +++
 title = "Syntax"
-description = "Bop's syntax is deliberately simple. If you've seen Python or a C-family language, most of it will look familiar — curly braces for blocks, `//` for comments, newlines (rather than semicolons) terminating statements."
+description = "Nybl's syntax is deliberately simple. If you've seen Python or a C-family language, most of it will look familiar — curly braces for blocks, `//` for comments, newlines (rather than semicolons) terminating statements."
 weight = 2
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,21 +14,21 @@ path = "/docs/basics/types/"
 
 # Syntax
 
-Bop's syntax is deliberately simple. If you've seen Python or a C-family language, most of it will look familiar — curly braces for blocks, `//` for comments, newlines (rather than semicolons) terminating statements.
+Nybl's syntax is deliberately simple. If you've seen Python or a C-family language, most of it will look familiar — curly braces for blocks, `//` for comments, newlines (rather than semicolons) terminating statements.
 
 ## Blocks
 
 Code blocks use curly braces `{ }` and only appear after control-flow or declaration keywords (`if`, `else`, `while`, `for`, `repeat`, `fn`, `struct`, `enum`, `match`):
 
-```bop
+```nybl
 if count > 3 {
   print("That's a lot!")
 }
 ```
 
-> **Important:** The opening `{` must be on the same line as its keyword. Bop automatically inserts semicolons at the end of lines, so putting `{` on the next line would cause a parse error.
+> **Important:** The opening `{` must be on the same line as its keyword. Nybl automatically inserts semicolons at the end of lines, so putting `{` on the next line would cause a parse error.
 
-```bop
+```nybl
 // Good
 if count > 3 {
   print("Nice!")
@@ -43,7 +43,7 @@ if count > 3
 
 ## Statements
 
-Statements end with a newline. Bop automatically inserts semicolons after lines ending in:
+Statements end with a newline. Nybl automatically inserts semicolons after lines ending in:
 
 - An identifier or literal
 - `true`, `false`, `none`
@@ -52,7 +52,7 @@ Statements end with a newline. Bop automatically inserts semicolons after lines 
 
 You can put multiple statements on one line with an explicit semicolon:
 
-```bop
+```nybl
 let x = 1; let y = 2
 ```
 
@@ -60,7 +60,7 @@ let x = 1; let y = 2
 
 Line comments start with `//`. Everything after `//` on that line is ignored:
 
-```bop
+```nybl
 // This is a comment
 let x = 5   // So is this
 ```
@@ -71,7 +71,7 @@ There is no block-comment syntax. `#` is **not** a comment leader — a stray `#
 
 Variable and function names start with a letter or underscore and can contain letters, digits, and underscores:
 
-```bop
+```nybl
 let my_var = 5
 let _count = 0
 let item3 = "hello"
@@ -79,7 +79,7 @@ let item3 = "hello"
 
 ### Case conventions are enforced
 
-Bop checks the *shape* of every declared name at parse time and rejects mismatches with a suggestion:
+Nybl checks the *shape* of every declared name at parse time and rejects mismatches with a suggestion:
 
 | Declaration | Required shape | Examples |
 |-------------|----------------|----------|

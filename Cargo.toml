@@ -1,10 +1,10 @@
 [workspace]
 members = [
-    "bop",
-    "bop-cli",
-    "bop-compile",
-    "bop-sys",
-    "bop-vm",
+    "nybl",
+    "nybl-cli",
+    "nybl-compile",
+    "nybl-sys",
+    "nybl-vm",
     "examples/rust-embedding",
 ]
 resolver = "2"
@@ -17,6 +17,6 @@ edition = "2024"
 # release check documented in CHANGELOG.md and specs/stack.md.
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/stevepryde/bop-lang"
-homepage = "https://github.com/stevepryde/bop-lang"
+repository = "https://github.com/stevepryde/nybl-lang"
+homepage = "https://github.com/stevepryde/nybl-lang"
 authors = ["Steve Pryde"]

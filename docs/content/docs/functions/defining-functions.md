@@ -1,6 +1,6 @@
 +++
 title = "Defining Functions"
-description = "Functions let you name a sequence of actions and reuse it. Bop has first-class functions — you can store them in variables, pass them to other functions, return them from other functions, and stash them in arrays."
+description = "Functions let you name a sequence of actions and reuse it. Nybl has first-class functions — you can store them in variables, pass them to other functions, return them from other functions, and stash them in arrays."
 weight = 13
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,11 +14,11 @@ path = "/docs/functions/reference-parameters/"
 
 # Defining Functions
 
-Functions let you name a sequence of actions and reuse it. Bop has first-class functions — you can store them in variables, pass them to other functions, return them from other functions, and stash them in arrays.
+Functions let you name a sequence of actions and reuse it. Nybl has first-class functions — you can store them in variables, pass them to other functions, return them from other functions, and stash them in arrays.
 
 ## Declaring a function
 
-```bop
+```nybl
 fn greet() {
   print("Hello!")
 }
@@ -30,9 +30,9 @@ greet()    // "Hello!"
 ### Public host entry points
 
 At the direct root of a program, `pub fn` marks a function as callable through
-a stateful embedder's `BopInstance` ABI:
+a stateful embedder's `NyblInstance` ABI:
 
-```bop
+```nybl
 let visits = 0
 
 pub fn visit(name) {
@@ -41,15 +41,15 @@ pub fn visit(name) {
 }
 ```
 
-`pub` does not change how Bop code resolves or calls the function. It is
+`pub` does not change how Nybl code resolves or calls the function. It is
 metadata for the host API, and is rejected on nested functions, methods, and
 function expressions. Only declarations that execute during instance loading
 are exposed; see [Stateful instances](/docs/embedding/instances/#declaring-host-entry-points)
 for redeclaration and entry-order rules.
 
-The host API passes owned values, not Bop variable bindings. A public function
-with a `ref` parameter can still be called normally from Bop source, but
-`BopInstance::call` rejects it because the host cannot supply a referenceable
+The host API passes owned values, not Nybl variable bindings. A public function
+with a `ref` parameter can still be called normally from Nybl source, but
+`NyblInstance::call` rejects it because the host cannot supply a referenceable
 target. The same value-only rule applies when the host invokes a returned
 function through `call_value`.
 
@@ -57,7 +57,7 @@ function through `call_value`.
 
 Functions can take parameters — values you pass in when calling:
 
-```bop
+```nybl
 fn repeat_string(text, times) {
   let result = ""
   repeat times {
@@ -77,7 +77,7 @@ Use a `ref` parameter when a function should replace one of the caller's
 variables. The marker is required in both the declaration and the call, so the
 mutation is visible at each site:
 
-```bop
+```nybl
 fn grow(ref items, count) {
   repeat count {
     items.push(0)
@@ -98,7 +98,7 @@ method rules, diagnostics, and the value-only Rust host boundary.
 
 Use `return` to send a value back from the function:
 
-```bop
+```nybl
 fn double(x) {
   return x * 2
 }
@@ -109,7 +109,7 @@ print(result)    // 10
 
 `return` with no value (or reaching the end of the function) returns `none`:
 
-```bop
+```nybl
 fn do_something() {
   print("Working...")
   // no return — returns none
@@ -123,7 +123,7 @@ print(result)    // none
 
 `return` exits the function immediately, even from inside loops or conditionals:
 
-```bop
+```nybl
 fn find_first_big(numbers, threshold) {
   for n in numbers {
     if n > threshold {
@@ -141,14 +141,14 @@ print(result)    // 15
 
 Parentheses are always required, even with no arguments:
 
-```bop
+```nybl
 greet()          // correct
 // greet         // error — 'greet' is a function, call it with greet()
 ```
 
 ## Practical example: sum of squares
 
-```bop
+```nybl
 fn sum_of_squares(n) {
   let total = 0
   for i in range(1, n + 1) {
@@ -163,9 +163,9 @@ print("Sum of squares: {result}")    // Sum of squares: 55
 
 ## Recursion
 
-Functions can call themselves. Bop caps recursion depth to prevent runaway stacks (also bounded by the step limit):
+Functions can call themselves. Nybl caps recursion depth to prevent runaway stacks (also bounded by the step limit):
 
-```bop
+```nybl
 fn factorial(n) {
   if n <= 1 {
     return 1
@@ -180,7 +180,7 @@ print(factorial(5))    // 120
 
 A named `fn` is a value just like anything else — you can assign it to a variable, pass it as an argument, return it from another function, or store it in a collection:
 
-```bop
+```nybl
 fn double(x) { return x * 2 }
 let f = double
 print(f(7))          // 14
@@ -193,7 +193,7 @@ print(apply(double, 21))    // 42
 
 `fn(...) { ... }` — without a name — is an expression that produces a function value. Use it when you want a one-off function inline:
 
-```bop
+```nybl
 let square = fn(x) { return x * x }
 print(square(6))     // 36
 
@@ -207,7 +207,7 @@ Function expressions capture lexical locals from the enclosing scope. Those
 local captures are a **snapshot** taken when the closure is built — mutating a
 captured local afterwards doesn't change what the closure sees:
 
-```bop
+```nybl
 let n = 5
 let add_n = fn(x) { return x + n }
 n = 100
@@ -216,7 +216,7 @@ print(add_n(3))      // 8, not 103
 
 The classic "factory returning a specialised function" pattern works:
 
-```bop
+```nybl
 fn make_adder(n) {
   return fn(x) { return x + n }
 }
@@ -231,10 +231,10 @@ A function expression created directly at the program root also snapshots the
 root bindings it uses. There is one important stateful-embedding distinction:
 a callback created while a named function is running keeps snapshot-captured
 locals, but names resolved from that function's defining module remain live.
-That lets a callback returned from `BopInstance::call` observe later updates to
+That lets a callback returned from `NyblInstance::call` observe later updates to
 the same instance's module globals:
 
-```bop
+```nybl
 let count = 0
 
 pub fn make_counter(step) {
@@ -252,7 +252,7 @@ state. The callback must be invoked through the same instance that created it.
 
 An anonymous `fn(...)` can't see itself by name. If a lambda needs to recurse, assign it to a named `fn` instead — named fns are visible inside their own body:
 
-```bop
+```nybl
 fn fib(n) {
   if n < 2 { return n }
   return fib(n - 1) + fib(n - 2)

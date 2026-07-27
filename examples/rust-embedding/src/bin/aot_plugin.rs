@@ -1,23 +1,23 @@
-use bop::{BopError, BopHost, BopLimits, Value};
+use nybl::{NyblError, NyblHost, NyblLimits, Value};
 
 include!(concat!(env!("OUT_DIR"), "/plugin.rs"));
 
 struct Host;
 
-impl BopHost for Host {
+impl NyblHost for Host {
     fn call(
         &mut self,
         _name: &str,
         _args: &[Value],
         _line: u32,
-    ) -> Option<Result<Value, BopError>> {
+    ) -> Option<Result<Value, NyblError>> {
         None
     }
 }
 
-fn run_example() -> Result<(), BopError> {
+fn run_example() -> Result<(), NyblError> {
     let mut host = Host;
-    let mut instance = plugin::BopInstance::load(&mut host, &BopLimits::standard())?;
+    let mut instance = plugin::NyblInstance::load(&mut host, &NyblLimits::standard())?;
 
     assert_eq!(
         instance

@@ -18,7 +18,7 @@ The `if` statement lets your program make decisions based on conditions.
 
 ## Basic if
 
-```bop
+```nybl
 if count > 3 {
   print("That's a lot!")
 }
@@ -28,7 +28,7 @@ The condition does **not** need parentheses, but they're allowed: `if (x > 3) { 
 
 ## if / else
 
-```bop
+```nybl
 if temperature > 30 {
   print("It's hot!")
 } else {
@@ -40,7 +40,7 @@ if temperature > 30 {
 
 Chain multiple conditions with `else if`:
 
-```bop
+```nybl
 if score > 90 {
   print("Excellent!")
 } else if score > 70 {
@@ -58,14 +58,14 @@ Only the first matching branch runs. If none match and there's an `else`, that b
 
 `if/else` can produce a value when used in expression position (e.g., after `=`):
 
-```bop
+```nybl
 let label = if count > 3 { "lots" } else { "few" }
 print("You have {label} of items")
 ```
 
 When used as an expression, both `if` and `else` branches are required. The last expression in each branch is the value.
 
-```bop
+```nybl
 let message = if x > 0 {
   "positive"
 } else {
@@ -78,7 +78,7 @@ print(message)
 
 ### Guard clause
 
-```bop
+```nybl
 fn process(value) {
   if value == none {
     return
@@ -89,7 +89,7 @@ fn process(value) {
 
 ### Classify a value
 
-```bop
+```nybl
 fn classify(n) {
   if n > 0 {
     return "positive"
@@ -103,7 +103,7 @@ fn classify(n) {
 
 ### Combine conditions with `&&` and `||`
 
-```bop
+```nybl
 if age >= 18 && has_ticket {
   print("Welcome in!")
 }

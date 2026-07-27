@@ -20,7 +20,7 @@ Formatting and character-level helpers that don't fit the method-on-string patte
 
 ## Import
 
-```bop
+```nybl
 use std.string
 use std.string.{pad_left, center}
 use std.string as str
@@ -32,7 +32,7 @@ use std.string as str
 
 Pad `s` on the left (or right) with `ch` until it reaches `width` total characters. Already-long strings are returned unchanged. `ch` should be a single-character string.
 
-```bop
+```nybl
 use std.string.{pad_left, pad_right}
 print(pad_left("42", 5, "0"))      // "00042"
 print(pad_right("hi", 6, "."))     // "hi...."
@@ -42,7 +42,7 @@ print(pad_right("hi", 6, "."))     // "hi...."
 
 Centre `s` inside `width` chars using `ch` as filler. Odd leftover space goes on the right (matches Python's `str.center`).
 
-```bop
+```nybl
 use std.string.{center}
 print(center("OK", 6, "-"))     // "--OK--"
 print(center("OK", 7, "-"))     // "--OK---"
@@ -54,7 +54,7 @@ print(center("OK", 7, "-"))     // "--OK---"
 
 Split `s` into an array of single-character strings, preserving order.
 
-```bop
+```nybl
 use std.string.{chars}
 print(chars("abc"))    // ["a", "b", "c"]
 ```
@@ -63,7 +63,7 @@ print(chars("abc"))    // ["a", "b", "c"]
 
 Reverse the character sequence. Works on ASCII and UTF-8 (iterates by code point).
 
-```bop
+```nybl
 use std.string.{reverse}
 print(reverse("hello"))    // "olleh"
 ```
@@ -72,7 +72,7 @@ print(reverse("hello"))    // "olleh"
 
 `true` when `s` reads the same forwards and backwards. Case-sensitive — lowercase the input first if you need case-insensitive comparison.
 
-```bop
+```nybl
 use std.string.{is_palindrome}
 print(is_palindrome("racecar"))    // true
 print(is_palindrome("Racecar"))    // false
@@ -84,7 +84,7 @@ print(is_palindrome("Racecar"))    // false
 
 Count non-overlapping occurrences of `needle` in `s`. An empty `needle` returns `0` (avoids the "infinite matches at every position" ambiguity).
 
-```bop
+```nybl
 use std.string.{count}
 print(count("banana", "a"))      // 3
 print(count("aaaa", "aa"))       // 2  (non-overlapping)
@@ -94,7 +94,7 @@ print(count("aaaa", "aa"))       // 2  (non-overlapping)
 
 Join an array of strings with `sep`. This is a thin wrapper around the built-in `arr.join(sep)` [array method](/docs/reference/methods/#array-methods-array) — it's here so users starting from `std.string` don't have to look elsewhere.
 
-```bop
+```nybl
 use std.string.{join}
 print(join(["a", "b", "c"], "-"))    // "a-b-c"
 ```

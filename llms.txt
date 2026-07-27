@@ -1,65 +1,65 @@
-# Bop
+# Nybl
 
-> Bop is a small, dynamically typed scripting language for Rust applications. Its zero-dependency core exposes no ambient capabilities; the walker and VM enforce resource limits, while AOT sandboxing is opt-in.
+> Nybl is a small, dynamically typed scripting language for Rust applications. Its zero-dependency core exposes no ambient capabilities; the walker and VM enforce resource limits, while AOT sandboxing is opt-in.
 
-The documentation below describes Bop 0.4 and requires Rust 1.88 or newer.
+The documentation below describes Nybl 0.4 and requires Rust 1.88 or newer.
 
 Important integration rules:
 
-- The Cargo package is `bop-lang`, but its Rust crate name is `bop`.
-- Use `bop::run` for simple one-shot execution, `bop_vm::run` for faster runtime execution, and `BopInstance` for state that must survive host calls.
-- `BopHost` is the capability boundary. The core runtime has no ambient filesystem, network, environment, clock, or I/O access.
-- `bop-sys::StandardHost` intentionally exposes process capabilities and is not a sandbox for untrusted code.
-- Always apply explicit `BopLimits` to untrusted code. For AOT, enable `Options::sandbox`; default AOT output and `bop compile` are unsandboxed. Keep host-facing `pub fn` instance entries value-only; Bop `ref` arguments work only between Bop functions.
+- The Cargo package is `nybl-lang`, but its Rust crate name is `nybl`.
+- Use `nybl::run` for simple one-shot execution, `nybl_vm::run` for faster runtime execution, and `NyblInstance` for state that must survive host calls.
+- `NyblHost` is the capability boundary. The core runtime has no ambient filesystem, network, environment, clock, or I/O access.
+- `nybl-sys::StandardHost` intentionally exposes process capabilities and is not a sandbox for untrusted code.
+- Always apply explicit `NyblLimits` to untrusted code. For AOT, enable `Options::sandbox`; default AOT output and `nybl compile` are unsandboxed. Keep host-facing `pub fn` instance entries value-only; Nybl `ref` arguments work only between Nybl functions.
 - Prefer the linked Markdown pages when supplying context to a coding model. They omit site navigation and presentation markup.
 
 ## Start here
 
-- [Introduction](https://bop-lang.com/docs/index.html.md): Project model, execution engines, sandbox properties, and routes into the documentation.
-- [Bop syntax](https://bop-lang.com/docs/basics/syntax/index.html.md): Lexical rules, comments, blocks, calls, and string interpolation.
-- [Defining functions](https://bop-lang.com/docs/functions/defining-functions/index.html.md): Functions, closures, parameters, returns, and scope.
-- [Grammar](https://bop-lang.com/docs/reference/grammar/index.html.md): Compact grammar reference for generating and parsing Bop source.
+- [Introduction](https://nybl-lang.com/docs/index.html.md): Project model, execution engines, sandbox properties, and routes into the documentation.
+- [Nybl syntax](https://nybl-lang.com/docs/basics/syntax/index.html.md): Lexical rules, comments, blocks, calls, and string interpolation.
+- [Defining functions](https://nybl-lang.com/docs/functions/defining-functions/index.html.md): Functions, closures, parameters, returns, and scope.
+- [Grammar](https://nybl-lang.com/docs/reference/grammar/index.html.md): Compact grammar reference for generating and parsing Nybl source.
 
 ## Rust embedding
 
-- [Embedding Bop](https://bop-lang.com/docs/embedding/index.html.md): Cargo dependencies, engine selection, custom `BopHost` implementations, typed `Value` conversion, limits, modules, warnings, no_std, and WASM.
-- [Stateful instances](https://bop-lang.com/docs/embedding/instances/index.html.md): Persistent walker, VM, and sandboxed AOT programs with host-callable `pub fn` entries.
-- [Compile-tested Rust example guide](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/README.md): Dependency manifest and standalone custom-host, persistent-instance, and build-script AOT integrations exercised by the workspace tests.
-- [Custom host example](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/src/bin/custom_host.rs): Complete narrow host that runs unchanged on the walker and VM.
-- [Persistent instance example](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/src/bin/persistent_instance.rs): Complete stateful walker and VM plugin example.
-- [Sandboxed AOT example](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/src/bin/aot_plugin.rs): Complete host code for Bop source transpiled and included by build.rs.
-- [AOT build script](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/build.rs): Build-time transpilation with sandboxing and generated-module isolation.
-- [AOT Bop source](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/src/plugin.bop): Stateful Bop plugin compiled by the AOT build-script example.
-- [Example Cargo manifest](https://raw.githubusercontent.com/stevepryde/bop-lang/main/examples/rust-embedding/Cargo.toml): Complete dependency split for runtime and build-time integration.
-- [Modules](https://bop-lang.com/docs/modules/index.html.md): Module syntax, host resolution, caching, and standard-library resolution.
-- [Error handling](https://bop-lang.com/docs/errors/index.html.md): Bop errors, fatal resource failures, rendering, and host error propagation.
-- [bop-lang Rust API](https://docs.rs/bop-lang): Core parser, tree-walker, `BopHost`, `BopLimits`, `BopInstance`, and `Value` API.
-- [bop-vm Rust API](https://docs.rs/bop-vm): Bytecode compiler, validator, VM, and persistent VM instance.
-- [bop-compile Rust API](https://docs.rs/bop-compile): Bop-to-Rust AOT transpiler and generation options.
-- [bop-sys Rust API](https://docs.rs/bop-sys): Optional OS-backed standard host.
+- [Embedding Nybl](https://nybl-lang.com/docs/embedding/index.html.md): Cargo dependencies, engine selection, custom `NyblHost` implementations, typed `Value` conversion, limits, modules, warnings, no_std, and WASM.
+- [Stateful instances](https://nybl-lang.com/docs/embedding/instances/index.html.md): Persistent walker, VM, and sandboxed AOT programs with host-callable `pub fn` entries.
+- [Compile-tested Rust example guide](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/README.md): Dependency manifest and standalone custom-host, persistent-instance, and build-script AOT integrations exercised by the workspace tests.
+- [Custom host example](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/src/bin/custom_host.rs): Complete narrow host that runs unchanged on the walker and VM.
+- [Persistent instance example](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/src/bin/persistent_instance.rs): Complete stateful walker and VM plugin example.
+- [Sandboxed AOT example](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/src/bin/aot_plugin.rs): Complete host code for Nybl source transpiled and included by build.rs.
+- [AOT build script](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/build.rs): Build-time transpilation with sandboxing and generated-module isolation.
+- [AOT Nybl source](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/src/plugin.nybl): Stateful Nybl plugin compiled by the AOT build-script example.
+- [Example Cargo manifest](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/Cargo.toml): Complete dependency split for runtime and build-time integration.
+- [Modules](https://nybl-lang.com/docs/modules/index.html.md): Module syntax, host resolution, caching, and standard-library resolution.
+- [Error handling](https://nybl-lang.com/docs/errors/index.html.md): Nybl errors, fatal resource failures, rendering, and host error propagation.
+- [nybl-lang Rust API](https://docs.rs/nybl-lang): Core parser, tree-walker, `NyblHost`, `NyblLimits`, `NyblInstance`, and `Value` API.
+- [nybl-vm Rust API](https://docs.rs/nybl-vm): Bytecode compiler, validator, VM, and persistent VM instance.
+- [nybl-compile Rust API](https://docs.rs/nybl-compile): Nybl-to-Rust AOT transpiler and generation options.
+- [nybl-sys Rust API](https://docs.rs/nybl-sys): Optional OS-backed standard host.
 
 ## Language reference
 
-- [Types](https://bop-lang.com/docs/basics/types/index.html.md): Runtime types, truthiness, equality, and conversion behavior.
-- [Reference parameters](https://bop-lang.com/docs/functions/reference-parameters/index.html.md): Explicit transactional caller mutation with `ref` and `ref self`.
-- [Pattern matching](https://bop-lang.com/docs/control-flow/match/index.html.md): Match expressions, patterns, guards, and exhaustiveness.
-- [Built-in functions](https://bop-lang.com/docs/reference/builtins/index.html.md): Complete built-in function reference.
-- [Methods](https://bop-lang.com/docs/reference/methods/index.html.md): Complete method reference by value type.
-- [Operators](https://bop-lang.com/docs/reference/operators/index.html.md): Precedence, arithmetic, comparison, logical, and assignment operators.
+- [Types](https://nybl-lang.com/docs/basics/types/index.html.md): Runtime types, truthiness, equality, and conversion behavior.
+- [Reference parameters](https://nybl-lang.com/docs/functions/reference-parameters/index.html.md): Explicit transactional caller mutation with `ref` and `ref self`.
+- [Pattern matching](https://nybl-lang.com/docs/control-flow/match/index.html.md): Match expressions, patterns, guards, and exhaustiveness.
+- [Built-in functions](https://nybl-lang.com/docs/reference/builtins/index.html.md): Complete built-in function reference.
+- [Methods](https://nybl-lang.com/docs/reference/methods/index.html.md): Complete method reference by value type.
+- [Operators](https://nybl-lang.com/docs/reference/operators/index.html.md): Precedence, arithmetic, comparison, logical, and assignment operators.
 
 ## Standard library
 
-- [Standard library overview](https://bop-lang.com/docs/stdlib/index.html.md): Bundled `std.*` modules and import patterns.
-- [std.math](https://bop-lang.com/docs/stdlib/math/index.html.md): Math constants and functions.
-- [std.iter](https://bop-lang.com/docs/stdlib/iter/index.html.md): Iterator construction and transformation.
-- [std.collections](https://bop-lang.com/docs/stdlib/collections/index.html.md): Collection helpers.
-- [std.string](https://bop-lang.com/docs/stdlib/string/index.html.md): String utilities.
-- [std.json](https://bop-lang.com/docs/stdlib/json/index.html.md): JSON encoding and decoding.
-- [std.test](https://bop-lang.com/docs/stdlib/test/index.html.md): Assertions and test helpers.
+- [Standard library overview](https://nybl-lang.com/docs/stdlib/index.html.md): Bundled `std.*` modules and import patterns.
+- [std.math](https://nybl-lang.com/docs/stdlib/math/index.html.md): Math constants and functions.
+- [std.iter](https://nybl-lang.com/docs/stdlib/iter/index.html.md): Iterator construction and transformation.
+- [std.collections](https://nybl-lang.com/docs/stdlib/collections/index.html.md): Collection helpers.
+- [std.string](https://nybl-lang.com/docs/stdlib/string/index.html.md): String utilities.
+- [std.json](https://nybl-lang.com/docs/stdlib/json/index.html.md): JSON encoding and decoding.
+- [std.test](https://nybl-lang.com/docs/stdlib/test/index.html.md): Assertions and test helpers.
 
 ## Optional
 
-- [Complete Bop documentation](https://bop-lang.com/llms-full.txt): All curated language, reference, standard-library, tooling, and Rust embedding pages in one Markdown document.
-- [Source repository](https://github.com/stevepryde/bop-lang): Workspace source, crate READMEs, tests, specifications, and changelog.
-- [Architecture specification](https://github.com/stevepryde/bop-lang/blob/main/specs/architecture.md): Crate ownership, dependency direction, execution flow, and runtime invariants.
-- [Bop 0.4 release guide](https://bop-lang.com/docs/whats-new-0-4/index.html.md): Current release behavior and migration notes.
+- [Complete Nybl documentation](https://nybl-lang.com/llms-full.txt): All curated language, reference, standard-library, tooling, and Rust embedding pages in one Markdown document.
+- [Source repository](https://github.com/stevepryde/nybl-lang): Workspace source, crate READMEs, tests, specifications, and changelog.
+- [Architecture specification](https://github.com/stevepryde/nybl-lang/blob/main/specs/architecture.md): Crate ownership, dependency direction, execution flow, and runtime invariants.
+- [Nybl 0.4 release guide](https://nybl-lang.com/docs/whats-new-0-4/index.html.md): Current release behavior and migration notes.

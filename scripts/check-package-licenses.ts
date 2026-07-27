@@ -3,11 +3,11 @@ import { resolve } from "node:path";
 const workspaceRoot = resolve(import.meta.dir, "..");
 const licenseFiles = ["LICENSE-MIT", "LICENSE-APACHE"] as const;
 const packages = [
-  { name: "bop-lang", directory: "bop" },
-  { name: "bop-sys", directory: "bop-sys" },
-  { name: "bop-vm", directory: "bop-vm" },
-  { name: "bop-compile", directory: "bop-compile" },
-  { name: "bop-cli", directory: "bop-cli" },
+  { name: "nybl-lang", directory: "nybl" },
+  { name: "nybl-sys", directory: "nybl-sys" },
+  { name: "nybl-vm", directory: "nybl-vm" },
+  { name: "nybl-compile", directory: "nybl-compile" },
+  { name: "nybl-cli", directory: "nybl-cli" },
 ] as const;
 
 const canonicalLicenses = new Map(

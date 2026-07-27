@@ -1,0 +1,36 @@
+[package]
+name = "nybl-sys"
+description = "Standard host integration for the Nybl programming language"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/nybl-sys"
+readme = "README.md"
+keywords = ["language", "interpreter", "scripting", "host"]
+categories = ["compilers"]
+
+[lib]
+name = "nybl_sys"
+
+[dependencies]
+# `nybl-sys` is an OS-backed host — it only makes sense on a
+# std target. `default-features = false` here just opts out of
+# bundling the `nybl-std` blob at this layer; we forward the
+# feature explicitly below so embedders still get it when they
+# want it. Rust `std` itself is required by this host crate.
+nybl = { version = "0.4.0", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std"] }
+
+[features]
+default = ["nybl-std"]
+# Forwards to nybl-lang's `nybl-std` feature. On by default
+# because `StdHost` — the whole point of this crate — is a
+# "batteries included" host and its `resolve_module` impl
+# wants to route `import std.*` through the bundled stdlib.
+# Turn off with `default-features = false` if you only need
+# the filesystem / stdio / env / time hooks without the
+# bundled stdlib blob.
+nybl-std = ["nybl/nybl-std"]

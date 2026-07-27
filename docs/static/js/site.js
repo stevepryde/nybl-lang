@@ -14,7 +14,7 @@
         theme === "dark" ? "Switch to light theme" : "Switch to dark theme",
       );
     });
-    if (persist) localStorage.setItem("bop-theme", theme);
+    if (persist) localStorage.setItem("nybl-theme", theme);
   }
 
   setTheme(root.dataset.theme || "dark", false);

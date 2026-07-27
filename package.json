@@ -1,5 +1,5 @@
 {
-  "name": "bop-lang-site",
+  "name": "nybl-lang-site",
   "private": true,
   "scripts": {
     "release:check-licenses": "bun run scripts/check-package-licenses.ts",
@@ -9,7 +9,7 @@
     "site:check": "bun run site:css && zola --root docs check",
     "site:build": "bun run site:css && zola --root docs build",
     "site:serve": "bun run site:css && zola --root docs serve",
-    "site:deploy": "bun run site:build && wrangler pages deploy docs/public --project-name=bop-docs --branch=main"
+    "site:deploy": "bun run site:build && wrangler pages deploy docs/public --project-name=nybl-docs --branch=main"
   },
   "devDependencies": {
     "@fontsource-variable/jetbrains-mono": "5.3.0",

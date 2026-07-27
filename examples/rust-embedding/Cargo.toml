@@ -1,5 +1,5 @@
 [package]
-name = "bop-rust-embedding-examples"
+name = "nybl-rust-embedding-examples"
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -7,8 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
-bop = { package = "bop-lang", path = "../../bop" }
-bop-vm = { path = "../../bop-vm" }
+nybl = { package = "nybl-lang", path = "../../nybl" }
+nybl-vm = { path = "../../nybl-vm" }
 
 [build-dependencies]
-bop-compile = { path = "../../bop-compile" }
+nybl-compile = { path = "../../nybl-compile" }

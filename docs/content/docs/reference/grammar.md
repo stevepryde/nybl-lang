@@ -1,6 +1,6 @@
 +++
 title = "Grammar"
-description = "An informal grammar for the Bop language, plus the complete list of reserved words."
+description = "An informal grammar for the Nybl language, plus the complete list of reserved words."
 weight = 20
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,7 +14,7 @@ path = "/docs/stdlib/"
 
 # Grammar
 
-An informal grammar for the Bop language, plus the complete list of reserved words.
+An informal grammar for the Nybl language, plus the complete list of reserved words.
 
 ## Reserved words
 
@@ -158,7 +158,7 @@ declarations parse-error with a "did you mean?" suggestion — see
 
 ## Automatic semicolons
 
-Bop automatically inserts a semicolon at the end of a line if the last token is one of:
+Nybl automatically inserts a semicolon at the end of a line if the last token is one of:
 
 - An identifier or literal (`int`, `number`, `string`)
 - `true`, `false`, `none`
@@ -169,7 +169,7 @@ Newlines do not insert semicolons while the innermost open delimiter is `(` or `
 
 Braces remain statement-capable even when their block is nested inside parentheses or brackets. Newlines between statements in a function or control-flow block still insert semicolons:
 
-```bop
+```nybl
 let callbacks = [
   fn() {
     let x = 1
@@ -180,7 +180,7 @@ let callbacks = [
 
 A line starting with `.` continues a preceding value, including across blank lines or comments:
 
-```bop
+```nybl
 let size = values
   // Continue the same expression.
   .len()
@@ -189,7 +189,7 @@ let size = values
 
 `return` itself remains a semicolon trigger. A newline immediately after it therefore means a bare `return` whose value is `none`; put the value on the same line, or open a parenthesized expression on that line when it needs multiline layout:
 
-```bop
+```nybl
 return (
   left +
   right
@@ -198,7 +198,7 @@ return (
 
 This means the opening `{` of a block must be on the same line as its keyword:
 
-```bop
+```nybl
 // Correct
 if x > 3 {
   print("yes")
@@ -213,7 +213,7 @@ if x > 3
 
 You can also separate statements on the same line with an explicit `;`:
 
-```bop
+```nybl
 let x = 1; let y = 2
 ```
 
@@ -221,7 +221,7 @@ let x = 1; let y = 2
 
 `//` starts a line comment — everything to the end of line is ignored:
 
-```bop
+```nybl
 // Whole-line comment
 let x = 5   // Inline trailing comment
 ```
@@ -232,7 +232,7 @@ There's no block-comment syntax.
 
 Inside double-quoted strings, `{identifier}` inserts the value of a variable. Only plain variable names are allowed — no expressions, operators, or function calls:
 
-```bop
+```nybl
 let name = "Alice"
 print("Hello, {name}!")     // works
 // print("Hello, {1 + 2}!")  // error — expressions not allowed

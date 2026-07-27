@@ -1,6 +1,6 @@
 +++
 title = "Methods"
-description = "Bop dispatches methods with `.name(args...)`. Every built-in method on primitives, arrays, strings, and dicts is listed here. User-defined methods on structs use the same syntax — see [Structs & Enums](/docs/data/structs-and-enums/) for the `fn Type.method(self, ...)` form."
+description = "Nybl dispatches methods with `.name(args...)`. Every built-in method on primitives, arrays, strings, and dicts is listed here. User-defined methods on structs use the same syntax — see [Structs & Enums](/docs/data/structs-and-enums/) for the `fn Type.method(self, ...)` form."
 weight = 19
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,7 +14,7 @@ path = "/docs/reference/grammar/"
 
 # Methods
 
-Bop dispatches methods with `.name(args...)`. Every built-in method on primitives, arrays, strings, and dicts is listed here. User-defined methods on structs use the same syntax — see [Structs & Enums](/docs/data/structs-and-enums/) for the `fn Type.method(self, ...)` form.
+Nybl dispatches methods with `.name(args...)`. Every built-in method on primitives, arrays, strings, and dicts is listed here. User-defined methods on structs use the same syntax — see [Structs & Enums](/docs/data/structs-and-enums/) for the `fn Type.method(self, ...)` form.
 
 ## Mutating receivers
 
@@ -22,7 +22,7 @@ Array methods such as `push`, `pop`, `insert`, `remove`, `reverse`, and `sort`
 mutate a mutable plain-variable receiver using the same transactional
 copy-in/copy-out model as a [`ref`
 parameter](/docs/functions/reference-parameters/). Method
-arguments run first, then Bop snapshots the receiver, and a normal return writes
+arguments run first, then Nybl snapshots the receiver, and a normal return writes
 the updated value back.
 
 A genuine temporary is allowed and its ordinary result is preserved, but its
@@ -37,7 +37,7 @@ User-defined methods choose their receiver mode explicitly. An ordinary `self`
 is a read-only value snapshot; assigning through it is a parse error. Declare
 `ref self` when the method should update the caller's binding:
 
-```bop
+```nybl
 struct Counter { amount }
 
 fn Counter.add(ref self, amount) {
@@ -68,7 +68,7 @@ Three methods work on any value — introspection + stringification. They're dis
 | `x.is_none()` | bool | `true` iff `x` is the `none` value. Equivalent to `x == none`. |
 | `x.is_some()` | bool | Inverse of `.is_none()` — `true` for every value except `none`. |
 
-```bop
+```nybl
 print((42).type())                 // "int"
 print("hi".to_str())               // "hi"
 print("hi".inspect())              // "hi"   (quoted)
@@ -79,13 +79,13 @@ print((0).is_none())               // false — `0` is falsy but not `none`
 print(first_result().is_some())    // check an optional return without `== none`
 ```
 
-> `.is_none()` / `.is_some()` cover Bop's "any variable can be `none`" story — they work on every receiver, not just `Option`-shaped ones (Bop doesn't have `Option`). Equivalent to `x == none` / `x != none`, but reads better in method chains.
+> `.is_none()` / `.is_some()` cover Nybl's "any variable can be `none`" story — they work on every receiver, not just `Option`-shaped ones (Nybl doesn't have `Option`). Equivalent to `x == none` / `x != none`, but reads better in method chains.
 
 ### Parens around numeric literals
 
 Number literals need parens before a method call because `.` is otherwise a decimal point:
 
-```bop
+```nybl
 // print(42.type())   // parse error — `42.t…` looks like a decimal
 print((42).type())     // "int"
 print((-5).abs())      // 5
@@ -110,7 +110,7 @@ All of these work on both `int` and `number` receivers. Return type is noted per
 | `x.to_int()` | int | Truncates toward zero. `(3.7).to_int()` → `3`, `(-2.7).to_int()` → `-2`. |
 | `x.to_float()` | number | Widens `int` → `number`; `number` passes through. |
 
-```bop
+```nybl
 print((9).sqrt())                   // 3
 print((0).cos())                    // 1
 print((2).pow(10))                  // 1024
@@ -203,7 +203,7 @@ See [Dictionaries](/docs/data/dictionaries/) for worked examples.
 | `r.map_err(f)` | Result | `Err(e)` → `Err(f(e))`; `Ok(v)` passes through. |
 | `r.and_then(f)` | Result | `Ok(v)` → `f(v)` (expected to return a Result); `Err(e)` passes through. |
 
-```bop
+```nybl
 print(Ok(5).is_ok())                           // true
 print(Err("bad").unwrap_or(0))                 // 0
 print(Ok(5).map(fn(v) { return v * 2 }))       // Result::Ok(10)
@@ -218,7 +218,7 @@ print(Ok(8).and_then(halve).and_then(halve))   // Result::Ok(2)
 
 ## Iter methods — `iter`
 
-An `iter` is Bop's lazy iterator. Values you can iterate over — arrays, strings, dicts, built-in iterators, and user-defined containers — all participate in the same protocol:
+An `iter` is Nybl's lazy iterator. Values you can iterate over — arrays, strings, dicts, built-in iterators, and user-defined containers — all participate in the same protocol:
 
 1. `v.iter()` returns an iterator.
 2. `it.next()` advances it, returning `Iter::Next(value)` or `Iter::Done`.
@@ -230,7 +230,7 @@ An `iter` is Bop's lazy iterator. Values you can iterate over — arrays, string
 | `it.next()` | `Iter::Next(v)` / `Iter::Done` | Advance by one. Cloning an iterator shares its cursor (like Python / Rust / JS) — two names pointing at the same iterator advance together. |
 | `it.iter()` | iter | Returns the same iterator. Makes `for x in it` work whether `it` is already an iterator or a fresh iterable. |
 
-```bop
+```nybl
 let it = [10, 20, 30].iter()
 print(it.type())                // "iter"
 print(it.next())                // Iter::Next(10)
@@ -243,7 +243,7 @@ for x in it { print(x) }        // 30  (picks up from the current cursor)
 
 A struct can participate in the iterator protocol by implementing `.iter()` (and, if it's its own iterator, `.next()`):
 
-```bop
+```nybl
 struct Bag { items }
 fn bag_of(arr) { return Bag { items: arr } }
 fn Bag.iter(self) { return self.items.iter() }   // delegate to the backing array
@@ -267,7 +267,7 @@ enum Iter {
 
 Pattern-match directly:
 
-```bop
+```nybl
 let it = [1, 2].iter()
 let r = it.next()
 print(match r {
@@ -287,7 +287,7 @@ User-declared. See [Structs & Enums](/docs/data/structs-and-enums/). Method disp
 
 If you `use path as m`, `m` is a `Value::Module`. `m.type()` → `"module"`, `m.inspect()` → `"<module path>"`. Otherwise `.` on a module accesses its exports:
 
-```bop
+```nybl
 use std.math as m
 print(m.PI)             // exported constant
 print(m.type())         // "module"   (universal method, not an export)

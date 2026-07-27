@@ -6,17 +6,17 @@
 > documentation under `docs/content/docs/` own the public syntax and teaching
 > material.
 
-Tracking issue: [#40](https://github.com/stevepryde/bop-lang/issues/40).
+Tracking issue: [#40](https://github.com/stevepryde/nybl-lang/issues/40).
 
 ## Purpose
 
 This proposal defines explicit, second-class `ref` parameters for callers that
 want a function to replace a mutable variable's value. The model is
 copy-in/copy-out (call-by-value-result), not observable aliasing. It preserves
-Bop's value semantics while making mutation intent visible at both sides of a
+Nybl's value semantics while making mutation intent visible at both sides of a
 call.
 
-```bop
+```nybl
 fn grow(ref items, n) {
   repeat n { items.push(0) }
 }
@@ -45,18 +45,18 @@ behaviour.
   back to its own target, and any ref position marks the shared binding as a
   ref parameter for the closure-capture fence.
 - **REF-003 — Transactional return.** A call must commit all of its staged
-  `ref` values to their caller targets only after a normal Bop return, including
+  `ref` values to their caller targets only after a normal Nybl return, including
   implicit return at the end of a function, and after all pending resource-limit
   checks have passed. A final operation that crosses a step, memory, or other
-  sandbox limit turns the return into a `BopError` before commit. Commit is
+  sandbox limit turns the return into a `NyblError` before commit. Commit is
   all-target: no target may become observably updated unless every target can be
   committed.
 - **REF-004 — Error rollback.** A call that exits with a runtime or fatal
-  `BopError` must discard every staged `ref` value. This rollback must happen
+  `NyblError` must discard every staged `ref` value. This rollback must happen
   before a non-fatal error is converted to `Result::Err` by `try_call`; fatal
   errors continue to propagate after rollback. A language-level `Result::Err`
   returned as a value is a normal return and therefore commits. The same is true
-  when Bop's `try` operator normally returns an `Err` value from the function.
+  when Nybl's `try` operator normally returns an `Err` value from the function.
 - **REF-005 — Deterministic call entry.** A call must use this sequence:
 
   1. evaluate the callee expression exactly once;
@@ -109,7 +109,7 @@ behaviour.
   `Assign the value to a variable, mutate that variable, then assign it back.`
   Grouped forms such as `(items[0]).push(value)` and
   `(record.items).push(value)` produce the same error. Tracking issue
-  [#43](https://github.com/stevepryde/bop-lang/issues/43) records delivery; this
+  [#43](https://github.com/stevepryde/nybl-lang/issues/43) records delivery; this
   proposal owns the behavior. A future extension may admit those places for
   both explicit `ref` arguments and implicit-ref method receivers as one
   coherent feature.
@@ -176,7 +176,7 @@ behaviour.
 ## Engine and representation constraints
 
 The implementation must follow the copy-on-write container work in
-[#39](https://github.com/stevepryde/bop-lang/issues/39). CoW makes snapshotting
+[#39](https://github.com/stevepryde/nybl-lang/issues/39). CoW makes snapshotting
 cheap, while #5's direct-binding mutation discipline remains necessary to avoid
 creating a second `Rc` handle immediately before an in-place mutation.
 

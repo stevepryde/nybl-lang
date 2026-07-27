@@ -1,0 +1,50 @@
+[package]
+name = "nybl-lang"
+description = "A small, embeddable, dynamically-typed programming language with zero dependencies"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/nybl-lang"
+readme = "README.md"
+keywords = ["language", "interpreter", "scripting", "embedded"]
+categories = ["compilers"]
+
+[lib]
+name = "nybl"
+
+[features]
+default = ["std", "nybl-std"]
+# Keeps the Rust standard-library integration enabled. This is separate from
+# `nybl-std`, which controls whether Nybl's own bundled `std.*` modules are
+# included. When Cargo unifies `std` and `no_std`, `std` wins so enabling an
+# additional dependency cannot silently remove host diagnostics or thread-local
+# runtime state.
+std = []
+# Bundle the Nybl standard library (`use std.math`, `std.json`,
+# `std.collections`, `std.iter`, `std.string`, `std.test`) as
+# `&'static str` constants the engine can resolve at runtime
+# via `nybl::stdlib::resolve`. On by default; turn off with
+# `default-features = false` for a truly minimal core with no
+# bundled modules. The feature name matches the old standalone
+# `nybl-std` crate — consumers who used to depend on that flip
+# `features = ["nybl-std"]` on `nybl-lang`.
+nybl-std = []
+# Opt in, with default features disabled, when building for bare-metal /
+# embedded / edge wasm
+# targets where Rust's `std` crate isn't available. Pulls in
+# the tiny pure-Rust `libm` crate internally so the math
+# builtins (`sqrt`, `sin`, `cos`, …) still work — those `f64`
+# methods live in `std`, not `core`. Named `no_std` rather
+# than `libm` because the *intent* is "I'm targeting a no_std
+# environment"; the libm dep is an implementation detail the user shouldn't
+# have to know about. If both `std` and `no_std` are selected through Cargo
+# feature unification, the crate keeps its std behavior.
+no_std = ["dep:libm"]
+
+[dependencies]
+# Only used for no_std, required for f64 math.
+libm = { version = "0.2", default-features = false, optional = true }

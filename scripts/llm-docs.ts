@@ -45,9 +45,9 @@ const exampleGuidePath = join(
   "rust-embedding",
   "README.md",
 );
-const baseUrl = "https://bop-lang.com";
+const baseUrl = "https://nybl-lang.com";
 const rawRepositoryUrl =
-  "https://raw.githubusercontent.com/stevepryde/bop-lang/main/";
+  "https://raw.githubusercontent.com/stevepryde/nybl-lang/main/";
 
 function assertWithin(root: string, candidate: string, label: string): void {
   const relativePath = relative(root, candidate);
@@ -222,7 +222,7 @@ function validateLlmsIndex(
     }
   }
 
-  const metadata = `describes Bop ${releaseLine} and requires Rust ${rustVersion} or newer`;
+  const metadata = `describes Nybl ${releaseLine} and requires Rust ${rustVersion} or newer`;
   if (!llmsIndex.includes(metadata)) {
     throw new Error(`llms.txt release metadata must include: ${metadata}`);
   }
@@ -250,10 +250,10 @@ function workspaceMetadata(manifest: string): {
 
 function validateExampleGuide(guide: string, releaseLine: string): void {
   const requiredSnippets = [
-    `Bop ${releaseLine} crates`,
-    `bop = { package = "bop-lang", version = "${releaseLine}" }`,
-    `bop-vm = "${releaseLine}"`,
-    `bop-compile = "${releaseLine}"`,
+    `Nybl ${releaseLine} crates`,
+    `nybl = { package = "nybl-lang", version = "${releaseLine}" }`,
+    `nybl-vm = "${releaseLine}"`,
+    `nybl-compile = "${releaseLine}"`,
   ];
   for (const snippet of requiredSnippets) {
     if (!guide.includes(snippet)) {
@@ -313,11 +313,11 @@ validateLlmsIndex(llmsIndex, generatedUrls, releaseLine, rustVersion);
 await validateRepositoryLinks(llmsIndex);
 
 const llmsFull = [
-  "# Bop complete documentation",
+  "# Nybl complete documentation",
   "",
-  `> LLM-oriented Markdown export of the Bop ${releaseLine} language, standard library, tools, and Rust embedding documentation.`,
+  `> LLM-oriented Markdown export of the Nybl ${releaseLine} language, standard library, tools, and Rust embedding documentation.`,
   "",
-  "This file is generated from the documentation sources selected by `docs/data/navigation.json`. For the concise index and integration rules, see https://bop-lang.com/llms.txt.",
+  "This file is generated from the documentation sources selected by `docs/data/navigation.json`. For the concise index and integration rules, see https://nybl-lang.com/llms.txt.",
   "",
   ...renderedPages.flatMap((page) => [
     "---",

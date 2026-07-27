@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: cloudflare-pages
-      url: https://bop-lang.com
+      url: https://nybl-lang.com
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +51,7 @@ jobs:
       - name: Deploy to Cloudflare Pages
         run: >
           bunx wrangler pages deploy docs/public
-          --project-name=bop-docs
+          --project-name=nybl-docs
           --branch=main
           --commit-hash=${{ github.sha }}
         env:

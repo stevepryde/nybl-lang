@@ -1,6 +1,6 @@
 +++
 title = "std.iter"
-description = "Eager functional helpers over arrays: map, filter, reduce, slicing, combining, and reductions. Bop's separate `.iter()` protocol remains lazy."
+description = "Eager functional helpers over arrays: map, filter, reduce, slicing, combining, and reductions. Nybl's separate `.iter()` protocol remains lazy."
 weight = 23
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -18,7 +18,7 @@ path = "/docs/stdlib/collections/"
 array-out helpers such as `map` and `filter` allocate their result; a
 hand-written `for` loop can avoid that work when allocation matters.
 
-This module is separate from Bop's built-in lazy
+This module is separate from Nybl's built-in lazy
 [`.iter()` / `.next()` protocol](/docs/reference/methods/#iter-methods-iter).
 You do not need `use std.iter` to write `for value in collection`, and the
 built-in protocol does not make these array helpers lazy.
@@ -27,7 +27,7 @@ Every helper handles empty arrays gracefully and preserves relative order.
 
 ## Import
 
-```bop
+```nybl
 use std.iter                                // glob
 use std.iter.{map, filter, reduce}          // selective
 use std.iter as i                           // aliased
@@ -39,7 +39,7 @@ use std.iter as i                           // aliased
 
 Apply `f` to each element; return a new array of results.
 
-```bop
+```nybl
 use std.iter.{map}
 print(map([1, 2, 3], fn(x) { return x * 2 }))     // [2, 4, 6]
 ```
@@ -48,7 +48,7 @@ print(map([1, 2, 3], fn(x) { return x * 2 }))     // [2, 4, 6]
 
 Keep only the elements for which `pred(x)` is truthy.
 
-```bop
+```nybl
 use std.iter.{filter}
 let evens = filter([1, 2, 3, 4, 5], fn(n) { return n % 2 == 0 })
 print(evens)    // [2, 4]
@@ -58,7 +58,7 @@ print(evens)    // [2, 4]
 
 Fold over the array left-to-right with a two-arg combiner.
 
-```bop
+```nybl
 use std.iter.{reduce}
 let sum = reduce([1, 2, 3, 4], 0, fn(acc, x) { return acc + x })
 print(sum)    // 10
@@ -68,7 +68,7 @@ print(sum)    // 10
 
 `all` returns `true` when every element passes (vacuously true for empty). `any` returns `true` when at least one element passes.
 
-```bop
+```nybl
 use std.iter.{all, any}
 print(all([2, 4, 6], fn(n) { return n % 2 == 0 }))    // true
 print(any([1, 3, 4], fn(n) { return n % 2 == 0 }))    // true
@@ -78,7 +78,7 @@ print(any([1, 3, 4], fn(n) { return n % 2 == 0 }))    // true
 
 Count elements for which `pred(x)` is truthy.
 
-```bop
+```nybl
 use std.iter.{count}
 print(count([1, 2, 3, 4, 5], fn(n) { return n > 2 }))   // 3
 ```
@@ -87,7 +87,7 @@ print(count([1, 2, 3, 4, 5], fn(n) { return n > 2 }))   // 3
 
 `find` returns the first matching element, or `none` if no match. `find_index` returns the 0-based index, or `-1`.
 
-```bop
+```nybl
 use std.iter.{find, find_index}
 print(find([1, 2, 3, 4], fn(n) { return n > 2 }))          // 3
 print(find_index([1, 2, 3, 4], fn(n) { return n > 2 }))    // 2
@@ -99,7 +99,7 @@ print(find_index([1, 2, 3, 4], fn(n) { return n > 2 }))    // 2
 
 First `n` elements (or the whole array if it's shorter). Negative `n` yields an empty array.
 
-```bop
+```nybl
 use std.iter.{take}
 print(take([1, 2, 3, 4, 5], 3))    // [1, 2, 3]
 print(take([1, 2], 10))            // [1, 2]
@@ -109,7 +109,7 @@ print(take([1, 2], 10))            // [1, 2]
 
 Drop the first `n` elements. Negative `n` yields a full copy; `n >= arr.len()` yields `[]`.
 
-```bop
+```nybl
 use std.iter.{drop}
 print(drop([1, 2, 3, 4, 5], 2))    // [3, 4, 5]
 ```
@@ -120,7 +120,7 @@ print(drop([1, 2, 3, 4, 5], 2))    // [3, 4, 5]
 
 Pair elements from two arrays. Stops at the shorter array's length.
 
-```bop
+```nybl
 use std.iter.{zip}
 print(zip([1, 2, 3], ["a", "b", "c"]))    // [[1, "a"], [2, "b"], [3, "c"]]
 ```
@@ -129,7 +129,7 @@ print(zip([1, 2, 3], ["a", "b", "c"]))    // [[1, "a"], [2, "b"], [3, "c"]]
 
 Pair each element with its 0-based index.
 
-```bop
+```nybl
 use std.iter.{enumerate}
 print(enumerate(["a", "b"]))    // [[0, "a"], [1, "b"]]
 ```
@@ -138,7 +138,7 @@ print(enumerate(["a", "b"]))    // [[0, "a"], [1, "b"]]
 
 Flatten an array of arrays one level down.
 
-```bop
+```nybl
 use std.iter.{flatten}
 print(flatten([[1, 2], [3, 4], [5]]))    // [1, 2, 3, 4, 5]
 ```
@@ -149,7 +149,7 @@ print(flatten([[1, 2], [3, 4], [5]]))    // [1, 2, 3, 4, 5]
 
 Sum of a numeric array. Empty → `0`.
 
-```bop
+```nybl
 use std.iter.{sum}
 print(sum([1, 2, 3, 4]))     // 10
 print(sum([]))               // 0
@@ -159,7 +159,7 @@ print(sum([]))               // 0
 
 Product of a numeric array. Empty → `1` (multiplicative identity, matching NumPy / Python's `math.prod`).
 
-```bop
+```nybl
 use std.iter.{product}
 print(product([2, 3, 4]))    // 24
 print(product([]))           // 1
@@ -169,7 +169,7 @@ print(product([]))           // 1
 
 Minimum / maximum of a numeric array. Raises on empty input so callers notice.
 
-```bop
+```nybl
 use std.iter.{min_array, max_array}
 print(min_array([3, 1, 4, 1, 5]))    // 1
 print(max_array([3, 1, 4, 1, 5]))    // 5

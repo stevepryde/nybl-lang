@@ -1,14 +1,14 @@
-use bop::{BopError, BopHost, BopLimits, Value};
+use nybl::{NyblError, NyblHost, NyblLimits, Value};
 
 struct Host;
 
-impl BopHost for Host {
+impl NyblHost for Host {
     fn call(
         &mut self,
         _name: &str,
         _args: &[Value],
         _line: u32,
-    ) -> Option<Result<Value, BopError>> {
+    ) -> Option<Result<Value, NyblError>> {
         None
     }
 }
@@ -22,8 +22,8 @@ pub fn add(amount) {
 }
 "#;
 
-fn call_walker(host: &mut Host, limits: &BopLimits) -> Result<(), BopError> {
-    let mut instance = bop::BopInstance::load(SOURCE, host, limits)?;
+fn call_walker(host: &mut Host, limits: &NyblLimits) -> Result<(), NyblError> {
+    let mut instance = nybl::NyblInstance::load(SOURCE, host, limits)?;
     assert_eq!(instance.entry_points()[0].name(), "add");
     assert_eq!(instance.entry_points()[0].arity(), 1);
     assert_eq!(
@@ -43,8 +43,8 @@ fn call_walker(host: &mut Host, limits: &BopLimits) -> Result<(), BopError> {
     Ok(())
 }
 
-fn call_vm(host: &mut Host, limits: &BopLimits) -> Result<(), BopError> {
-    let mut instance = bop_vm::BopInstance::load(SOURCE, host, limits)?;
+fn call_vm(host: &mut Host, limits: &NyblLimits) -> Result<(), NyblError> {
+    let mut instance = nybl_vm::NyblInstance::load(SOURCE, host, limits)?;
     assert_eq!(
         instance
             .call("add", &[Value::Int(4)], host)?
@@ -62,8 +62,8 @@ fn call_vm(host: &mut Host, limits: &BopLimits) -> Result<(), BopError> {
     Ok(())
 }
 
-fn run_example() -> Result<(), BopError> {
-    let limits = BopLimits::standard();
+fn run_example() -> Result<(), NyblError> {
+    let limits = NyblLimits::standard();
     let mut host = Host;
     call_walker(&mut host, &limits)?;
     call_vm(&mut host, &limits)

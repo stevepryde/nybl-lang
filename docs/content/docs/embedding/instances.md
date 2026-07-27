@@ -1,19 +1,19 @@
 +++
 title = "Stateful instances"
-description = "`BopInstance` loads a program once and lets the host call its public entry"
+description = "`NyblInstance` loads a program once and lets the host call its public entry"
 weight = 29
 template = "docs/page.html"
 page_template = "docs/page.html"
 [extra.previous]
-title = "Embedding Bop"
+title = "Embedding Nybl"
 path = "/docs/embedding/"
 +++
 
 # Stateful instances
 
-`BopInstance` loads a program once and lets the host call its public entry
+`NyblInstance` loads a program once and lets the host call its public entry
 points repeatedly. It is the plugin-style counterpart to the one-shot
-`bop::run` and `bop_vm::run` functions.
+`nybl::run` and `nybl_vm::run` functions.
 
 The instance retains the state produced while loading and by later calls:
 
@@ -30,7 +30,7 @@ equivalent API with the source already compiled into it.
 
 Mark a direct root function with `pub` to include it in the instance ABI:
 
-```bop
+```nybl
 let count = 0
 
 pub fn increment(by) {
@@ -48,7 +48,7 @@ fn private_helper() {
 ```
 
 `pub fn` is only valid at the direct program root. It does not make a function
-globally visible to ordinary Bop code, and `pub` declarations inside imported
+globally visible to ordinary Nybl code, and `pub` declarations inside imported
 modules are not root instance entries. It only opts the final executed root
 declaration into the host-callable ABI.
 
@@ -59,33 +59,33 @@ Loading executes top-level code before the entry list is collected. Therefore:
 - a later private `fn` with the same name removes it from the ABI;
 - `entry_points()` reports the final surviving entries in declaration order.
 
-Ordinary Bop calls continue to use normal lexical name lookup. Host
-`BopInstance::call` uses the dedicated public-entry table, so assigning another
+Ordinary Nybl calls continue to use normal lexical name lookup. Host
+`NyblInstance::call` uses the dedicated public-entry table, so assigning another
 value to an ordinary name cannot redirect the host ABI.
 
 Instance calls accept owned `Value` arguments and therefore cannot identify a
-mutable Bop binding for a [`ref`
+mutable Nybl binding for a [`ref`
 parameter](/docs/functions/reference-parameters/).
 `call` and `call_value` reject ref-bearing functions before execution. Keep
 host-facing entries value-only and put ref-based mutation behind an ordinary
-Bop wrapper when needed.
+Nybl wrapper when needed.
 
 ## Tree-walker instance
 
 ```rust
-use bop::{BopError, BopHost, BopInstance, BopLimits, Value};
+use nybl::{NyblError, NyblHost, NyblInstance, NyblLimits, Value};
 
 struct Host;
 
-impl BopHost for Host {
+impl NyblHost for Host {
     fn call(&mut self, _: &str, _: &[Value], _: u32)
-        -> Option<Result<Value, BopError>>
+        -> Option<Result<Value, NyblError>>
     {
         None
     }
 }
 
-fn main() -> Result<(), BopError> {
+fn main() -> Result<(), NyblError> {
     let source = r#"
         let count = 0
         pub fn increment(by) {
@@ -98,8 +98,8 @@ fn main() -> Result<(), BopError> {
     "#;
 
     let mut host = Host;
-    let limits = BopLimits::standard();
-    let mut instance = BopInstance::load(source, &mut host, &limits)?;
+    let limits = NyblLimits::standard();
+    let mut instance = NyblInstance::load(source, &mut host, &limits)?;
 
     for entry in instance.entry_points() {
         println!("{}/{}", entry.name(), entry.arity());
@@ -125,25 +125,25 @@ call.
 The VM is a drop-in replacement at this API boundary:
 
 ```rust
-use bop::{BopError, BopHost, BopLimits, Value};
-use bop_vm::BopInstance;
+use nybl::{NyblError, NyblHost, NyblLimits, Value};
+use nybl_vm::NyblInstance;
 
 struct Host;
 
-impl BopHost for Host {
+impl NyblHost for Host {
     fn call(&mut self, _: &str, _: &[Value], _: u32)
-        -> Option<Result<Value, BopError>>
+        -> Option<Result<Value, NyblError>>
     {
         None
     }
 }
 
-fn main() -> Result<(), BopError> {
+fn main() -> Result<(), NyblError> {
     let mut host = Host;
-    let mut instance = BopInstance::load(
+    let mut instance = NyblInstance::load(
         "let total = 0\npub fn add(n) { total += n; return total }",
         &mut host,
-        &BopLimits::standard(),
+        &NyblLimits::standard(),
     )?;
 
     assert_eq!(
@@ -159,23 +159,23 @@ fn main() -> Result<(), BopError> {
 ```
 
 Use `compile` plus `execute` when you want to reuse bytecode but intentionally
-start with fresh program state on every execution. Use `BopInstance` when the
+start with fresh program state on every execution. Use `NyblInstance` when the
 state itself must persist.
 
 ## Sandboxed AOT instances
 
-The AOT transpiler emits a persistent `BopInstance` only when
+The AOT transpiler emits a persistent `NyblInstance` only when
 `Options::sandbox` is enabled. Generate library-shaped Rust and compile it into
 the host application:
 
 ```rust
-use bop_compile::{Options, transpile};
+use nybl_compile::{Options, transpile};
 
 let generated = transpile(
     "let count = 0\npub fn next() { count += 1; return count }",
     &Options {
         emit_main: false,
-        use_bop_sys: false,
+        use_nybl_sys: false,
         sandbox: true,
         ..Options::default()
     },
@@ -185,14 +185,14 @@ let generated = transpile(
 The generated module provides:
 
 ```rust,ignore
-let mut instance = BopInstance::load(&mut host, &limits)?;
+let mut instance = NyblInstance::load(&mut host, &limits)?;
 let entries = instance.entry_points();
 let value = instance.call("next", &[], &mut host)?;
 let value = instance.call_value(&callback, &[], &mut host)?;
 ```
 
-Because the Bop source is already compiled into the generated Rust,
-`BopInstance::load` takes only `host` and `limits`, not a source string.
+Because the Nybl source is already compiled into the generated Rust,
+`NyblInstance::load` takes only `host` and `limits`, not a source string.
 Unsandboxed output remains a one-shot `run` API and does not emit the
 persistent instance surface.
 
@@ -203,7 +203,7 @@ replaces a declaration.
 
 ## Hosts and re-entry
 
-An instance borrows a `BopHost` only for `load` or one call; it never stores the
+An instance borrows a `NyblHost` only for `load` or one call; it never stores the
 host. Later operations may use a different compatible host. This also keeps
 host-owned allocations outside the instance's memory account.
 
@@ -237,5 +237,5 @@ persistent global, the instance can remain unusable.
 ## Instances versus REPL sessions
 
 Use [`ReplSession`](/docs/embedding/#stateful-repl-sessions) when each interaction
-introduces more source, as in a REPL or notebook. Use `BopInstance` when the
+introduces more source, as in a REPL or notebook. Use `NyblInstance` when the
 program is loaded once and exposes a deliberate host ABI through `pub fn`.

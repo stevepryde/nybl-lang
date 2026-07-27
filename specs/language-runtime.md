@@ -2,16 +2,16 @@
 
 ## Purpose
 
-This specification owns the observable contract shared by Bop's tree-walker,
+This specification owns the observable contract shared by Nybl's tree-walker,
 bytecode VM, AOT compiler, CLI, and embedding APIs.
 
 ## Requirements
 
-- **RUN-001 — Embeddable core.** `bop-lang` must provide an embeddable,
+- **RUN-001 — Embeddable core.** `nybl-lang` must provide an embeddable,
   dynamically typed language whose ambient capabilities are limited to those
-  explicitly exposed by `BopHost`.
+  explicitly exposed by `NyblHost`.
 - **RUN-002 — Sandbox termination.** A script that exceeds a runtime resource
-  boundary or exercises adversarial input must halt with a Bop diagnostic; it
+  boundary or exercises adversarial input must halt with a Nybl diagnostic; it
   must not hang, panic, overflow the native stack, or abort the host process.
 - **RUN-003 — Resource accounting.** Walker and VM execution, plus AOT output
   emitted with sandboxing enabled, must enforce their applicable step,
@@ -28,10 +28,10 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **RUN-005 — Core isolation.** Core language execution must not perform
   filesystem, network, clock, environment, or other OS I/O except through a
   host capability.
-- **RUN-006 — Portable core.** `bop-lang` and `bop-vm` must remain usable in
+- **RUN-006 — Portable core.** `nybl-lang` and `nybl-vm` must remain usable in
   supported `no_std` and `wasm32-unknown-unknown` embeddings.
 - **RUN-007 — Stable diagnostics.** Invalid syntax and runtime failures must
-  produce actionable Bop errors with source context when available; equivalent
+  produce actionable Nybl errors with source context when available; equivalent
   engine failures should retain the same error shape and helpful hints.
   Diagnostics originating in imported modules must identify the deepest owning
   module and render only that module's source; if its source is unavailable,
@@ -69,7 +69,7 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **RUN-014 — Typed embedding conversions.** The public Rust API must support
   documented, `no_std`-compatible conversions between `Value` and common Rust
   scalar and collection types. Fallible conversions must preserve integer
-  range and Bop type distinctions, enforce tracked-constructor depth limits,
+  range and Nybl type distinctions, enforce tracked-constructor depth limits,
   recognize only the canonical built-in `Result` shape, and identify a nested
   failure with expected/actual descriptions plus a root-to-leaf path.
 - **RUN-015 — Stateful embedding.** Walker, VM, and sandboxed AOT embeddings
@@ -114,9 +114,9 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   positional values rebind it in source order, every ref position reads its
   final value for commit, and any ref position makes that binding ineligible
   for closure capture. A normally returned language `Result::Err` is still a
-  successful return and commits. Host-to-script `BopInstance::call` and
+  successful return and commits. Host-to-script `NyblInstance::call` and
   `call_value` remain value-only and reject ref-bearing callables before
-  execution because host values do not identify Bop bindings.
+  execution because host values do not identify Nybl bindings.
 - **RUN-021 — Unified mutating receivers.** A built-in mutating method on a
   mutable plain-variable receiver uses the same snapshot/commit model
   implicitly, with method arguments evaluated before the receiver snapshot.
@@ -133,9 +133,9 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 ## Acceptance criteria
 
 - **AC-RUN-001:** A custom host exposing no functions cannot access ambient OS
-  facilities, while a host-provided function is callable through `BopHost`.
+  facilities, while a host-provided function is callable through `NyblHost`.
 - **AC-RUN-002:** Programs that exceed step, memory, call, parse, or safe value
-  processing boundaries return `Err(BopError)` or another documented clean
+  processing boundaries return `Err(NyblError)` or another documented clean
   termination without terminating the embedding process.
 - **AC-RUN-003:** The differential suites cover representative successful and
   failing programs and report no walker/VM/AOT semantic, output, or diagnostic
@@ -170,7 +170,7 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **AC-RUN-010:** Public conversion tests cover scalar boundaries, borrowed and
   owned extraction, recursive arrays/options/results/deterministic maps,
   canonical built-in `Result` identity, nested error paths, macro hygiene,
-  depth-limit failure, and a real `BopHost` call. Standard, `no_std`, and WASM
+  depth-limit failure, and a real `NyblHost` call. Standard, `no_std`, and WASM
   checks compile the same conversion surface.
 - **AC-RUN-011:** Walker, VM, and sandboxed native AOT tests load the same
   public-entry program, report identical entry names/arities, preserve state
@@ -198,7 +198,7 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   deterministic preflight/evaluation order, mutable/grouped target acceptance,
   const/index/field/captured/duplicate target rejection, forwarding and
   no-capture rules, multi-target commit, and rollback on ordinary/fatal
-  `BopError` paths including errors caught by `try_call`. The engines also
+  `NyblError` paths including errors caught by `try_call`. The engines also
   agree that a normally returned `Result::Err` commits and that pending
   resource-limit failures happen before commit. Walker, VM, and sandboxed AOT
   instance APIs reject ref-bearing entries and callback values consistently
@@ -216,6 +216,6 @@ The grammar reference and user documentation under `docs/content/docs/` remain t
 canonical teaching material. This file owns cross-engine guarantees rather
 than duplicating syntax documentation.
 
-An inert or custom `BopHost` is capability-sandboxed by default. `bop-sys` and
+An inert or custom `NyblHost` is capability-sandboxed by default. `nybl-sys` and
 the CLI deliberately grant selected OS capabilities and therefore are not an
 ambient-authority sandbox, even when language resource limits are enabled.

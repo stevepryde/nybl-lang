@@ -1,14 +1,14 @@
-# Bop → General-Purpose Language Roadmap
+# Nybl → General-Purpose Language Roadmap
 
-Status: design / roadmap. `plans/execution-modes.md` covers how Bop
-programs are *executed*; this document covers how Bop becomes rich
+Status: design / roadmap. `plans/execution-modes.md` covers how Nybl
+programs are *executed*; this document covers how Nybl becomes rich
 enough to *write non-trivial programs in*. The execution-modes
 roadmap is essentially complete (three engines, shared differential
 harness); this one is the next multi-phase effort.
 
 ## Goal
 
-Take Bop from "well-engineered embedded scripting language" to
+Take Nybl from "well-engineered embedded scripting language" to
 "general-purpose language you could actually build an app in" —
 without breaking the thing that makes it worth embedding.
 
@@ -25,12 +25,12 @@ By the end of this roadmap a user should be able to write:
 
 ## The non-negotiable invariant
 
-> **`bop-lang` (the `bop` crate) stays zero-dep and embeddable.**
+> **`nybl-lang` (the `nybl` crate) stays zero-dep and embeddable.**
 
 Every phase below is gated by that constraint. Anything that needs
 filesystem access, network, a package registry, OS time, FFI, or a
 Rust dependency beyond `core`/`alloc` goes into a separate crate
-(`bop-sys`, `bop-std`, `bop-pkg`, …) or behind a `BopHost` hook
+(`nybl-sys`, `nybl-std`, `nybl-pkg`, …) or behind a `NyblHost` hook
 that the embedder supplies.
 
 If a proposed feature genuinely cannot be implemented without
@@ -43,15 +43,15 @@ This is a hard line, not a soft preference.
 - Core never pulls in a Rust crate outside the workspace (no
   `serde`, no `regex`, no `indexmap`). `alloc` only; 
 - Language features that need I/O (imports, stdlib with OS access)
-  are implemented as `BopHost` trait methods, with OS-backed
-  default impls living in `bop-sys`.
-- Standard library content that can be written in Bop itself
-  (iterator helpers, math, assertions) lives in `bop-std` as
+  are implemented as `NyblHost` trait methods, with OS-backed
+  default impls living in `nybl-sys`.
+- Standard library content that can be written in Nybl itself
+  (iterator helpers, math, assertions) lives in `nybl-std` as
   bundled source strings, loaded through the module system —
   not compiled into core.
 
 Practical test when adding a phase: *could a `no_std` embedder
-pull just `bop` and a tiny custom host and still use this
+pull just `nybl` and a tiny custom host and still use this
 feature?* If not, the feature needs to sit outside core.
 
 ## Target crate landscape
@@ -59,23 +59,23 @@ feature?* If not, the feature needs to sit outside core.
 Current:
 
 ```
-bop         core language: lexer, parser, AST, tree-walker, Value,
-            ops, builtins, methods, memory tracking, BopHost trait.
+nybl         core language: lexer, parser, AST, tree-walker, Value,
+            ops, builtins, methods, memory tracking, NyblHost trait.
             Zero deps, no_std-capable.
-bop-vm      bytecode compiler + stack VM (depends on bop)
-bop-sys     standard host: stdio, fs, env, time (std-only)
-bop-compile AOT Bop → Rust transpiler (depends on bop)
-bop-cli     CLI driver (run, repl; build coming with bop-compile CLI)
+nybl-vm      bytecode compiler + stack VM (depends on nybl)
+nybl-sys     standard host: stdio, fs, env, time (std-only)
+nybl-compile AOT Nybl → Rust transpiler (depends on nybl)
+nybl-cli     CLI driver (run, repl; build coming with nybl-compile CLI)
 ```
 
 Additions this roadmap calls for:
 
 ```
-bop-std     standard library written in Bop source; bundled as
+nybl-std     standard library written in Nybl source; bundled as
             string assets, loaded through the module system.
             Zero OS dependencies — the embedder chooses whether
-            to load it via BopHost::resolve_module.
-bop-pkg     (far future) package manager CLI + registry client.
+            to load it via NyblHost::resolve_module.
+nybl-pkg     (far future) package manager CLI + registry client.
             Separate plan doc when it lands.
 ```
 
@@ -89,13 +89,13 @@ once it lands.
 A useful mental split:
 
 - **Phases 1–7** constitute the "MVP general-purpose" set. After
-  phase 7 lands, Bop is a small-but-real general-purpose language.
+  phase 7 lands, Nybl is a small-but-real general-purpose language.
 - **Phases 8–9** are ecosystem (package manager) and continuous
   polish (docs, REPL, performance).
 
 ### Phase 1 — Closures and first-class functions
 
-*Status: done. Value gains an `Rc<BopFn>` variant with an
+*Status: done. Value gains an `Rc<NyblFn>` variant with an
 engine-opaque `FnBody` (`Ast` for the walker; `Compiled(Rc<dyn
 Any>)` for the VM and AOT). Lambdas parse as `fn(params) {
 body }` at expression position; the walker snapshots visible
@@ -104,9 +104,9 @@ does the same at runtime while carrying a pre-compiled chunk,
 and the AOT emits Rust `move` closures with compile-time
 free-variable analysis. First-class named fns work in all three
 via synthesised wrappers / `LoadVar` fallback / module-scope
-`__bop_fn_value_<name>` helpers. Non-Ident callees (`funcs[0](x)`,
+`__nybl_fn_value_<name>` helpers. Non-Ident callees (`funcs[0](x)`,
 `make_adder(5)(3)`) go through a `CallValue` opcode in the VM
-and a `__bop_call_value` helper in AOT. 12 walker tests + 10
+and a `__nybl_call_value` helper in AOT. 12 walker tests + 10
 differential tests + 6 AOT e2e tests + 8 three-way corpus
 entries all green.*
 
@@ -134,16 +134,16 @@ single biggest reason the current language feels toy-like.
 - Lexical capture: a function captures the variables it references
   from the enclosing scope at the moment it's constructed, by
   value (clone). Mutations to captured vars inside the closure
-  don't propagate back out — same call-by-value model Bop already
+  don't propagate back out — same call-by-value model Nybl already
   uses for function parameters.
 - Call dispatch is extended: the `Call { callee, args }` path now
   accepts any expression that evaluates to `Value::Fn`, not just a
   named identifier. Host and builtin dispatch still resolve by
   name as today.
 
-**Where it lives.** `bop-lang` core. `bop-vm` needs a new opcode
-(`MakeClosure(fn_idx)`) plus a call-indirect dispatch. `bop-compile`
-emits a Rust closure (`Box<dyn Fn(...) -> Result<Value, BopError>>`
+**Where it lives.** `nybl-lang` core. `nybl-vm` needs a new opcode
+(`MakeClosure(fn_idx)`) plus a call-indirect dispatch. `nybl-compile`
+emits a Rust closure (`Box<dyn Fn(...) -> Result<Value, NyblError>>`
 or a generated fn per lambda).
 
 **Non-goals.** No currying, no partial application, no rest
@@ -156,9 +156,9 @@ must be cheap (envs use `Rc` internally).
 
 ### Phase 2 — Modules and imports
 
-*Status: done across all three engines + bop-sys.
-`BopHost::resolve_module(name) -> Option<Result<String,
-BopError>>` added to the core trait with a `None`-returning
+*Status: done across all three engines + nybl-sys.
+`NyblHost::resolve_module(name) -> Option<Result<String,
+NyblError>>` added to the core trait with a `None`-returning
 default. `import foo.bar.baz` is now a statement; the walker and
 VM each run the module in a sub-engine that inherits the parent's
 import cache, memory ceiling, and step budget but runs with a
@@ -168,18 +168,18 @@ no-ops at the injection site. Circular imports surface as a clean
 error via a `Loading` sentinel in the cache. Named fns imported
 from a module come back as engine-compatible `Value::Fn`s —
 walker gets `FnBody::Ast`, VM gets `FnBody::Compiled(Rc<Chunk>)`.
-bop-sys's `StandardHost::with_module_root(path)` maps
-`foo.bar.baz` to `<root>/foo/bar/baz.bop` with path-traversal
+nybl-sys's `StandardHost::with_module_root(path)` maps
+`foo.bar.baz` to `<root>/foo/bar/baz.nybl` with path-traversal
 guards. The AOT transpiler takes a compile-time
 `Options::module_resolver` callback, pre-resolves the entire
 module graph with DFS cycle detection, and emits each module as a
 `__mod_<slug>__load` fn + `__mod_<slug>__Exports` struct + a
 shared `Ctx::module_cache` that memoises loaded modules and
 detects cycles at runtime via a `__ModuleLoading` sentinel. Cross-
-module refs unpack the exports struct into local Bop bindings at
+module refs unpack the exports struct into local Nybl bindings at
 each import site, matching the walker's flat-injection semantics
 (with transitive re-exports). 9 walker tests + 8 differential
-tests + 3 bop-sys tests + 5 AOT e2e tests + 5 three-way corpus
+tests + 3 nybl-sys tests + 5 AOT e2e tests + 5 three-way corpus
 entries. All green.*
 
 **Why second.** Multi-file programs are table stakes. Closures
@@ -188,28 +188,28 @@ files.
 
 **Scope.**
 
-- Extension to `BopHost`:
+- Extension to `NyblHost`:
   ```rust
-  fn resolve_module(&mut self, name: &str) -> Option<Result<String, BopError>>;
+  fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>>;
   ```
   Default impl returns `None`. Embedders supply their own — file
   system, embedded string assets, network fetch, whatever fits.
 - Core parser: `import foo` / `import foo.bar` / `from foo import x`.
   Names are identifier-dotted strings.
 - Module caching: repeated imports of the same name resolve once.
-- Modules are Bop source files; loading one parses it, evaluates
+- Modules are Nybl source files; loading one parses it, evaluates
   its top-level statements in a fresh module scope, and exposes
   its public bindings under the module name.
 - What "public" means: start simple — every top-level `let` and
   `fn` in a module is public. Add a `pub` / `priv` distinction
   later if we need it (probably we will).
-- `bop-sys` adds a filesystem resolver that maps `foo.bar` →
-  `./foo/bar.bop` relative to a configurable root.
+- `nybl-sys` adds a filesystem resolver that maps `foo.bar` →
+  `./foo/bar.nybl` relative to a configurable root.
 
-**Where it lives.** Parser + evaluator changes go in `bop-lang`.
-The `BopHost` trait (also in `bop-lang`) gains the new method —
+**Where it lives.** Parser + evaluator changes go in `nybl-lang`.
+The `NyblHost` trait (also in `nybl-lang`) gains the new method —
 core stays zero-dep because it doesn't *implement* resolution, it
-just declares the hook. `bop-sys` gets the filesystem impl.
+just declares the hook. `nybl-sys` gets the filesystem impl.
 
 **Non-goals.** No circular import magic (error out); no version
 selection (that's the package manager); no re-exports (can add
@@ -240,8 +240,8 @@ idiomatic mutation is `c = c.bump()`, not in-place.
 Walker, VM, and AOT all implement the same semantics:
 
 - Walker: `struct_defs`, `enum_defs`, `methods` BTreeMaps on
-  `Evaluator`; `Value::Struct(BopStruct)` and
-  `Value::EnumVariant(BopEnumVariant)` use compact `Rc`-backed
+  `Evaluator`; `Value::Struct(NyblStruct)` and
+  `Value::EnumVariant(NyblEnumVariant)` use compact `Rc`-backed
   copy-on-write payloads, keeping the enum small while making
   pass/assign/return constant-time.
 - VM: new `DefineStruct` / `DefineEnum` / `DefineMethod` /
@@ -251,10 +251,10 @@ Walker, VM, and AOT all implement the same semantics:
   before the built-in dispatch.
 - AOT: compile-time `TypeRegistry` collected across the root +
   every transitively-imported module; each user method emits as
-  a mangled Rust fn (`bop_fn_<prefix>method_<Type>__<name>`); a
-  generated `__bop_try_user_method` dispatcher runtime-matches
+  a mangled Rust fn (`nybl_fn_<prefix>method_<Type>__<name>`); a
+  generated `__nybl_try_user_method` dispatcher runtime-matches
   `(type_name, method_name)` and returns `Some(Value)` or falls
-  through to the builtin. `self` is remapped to `bop_self`
+  through to the builtin. `self` is remapped to `nybl_self`
   because Rust reserves `self` for inherent methods on trait
   impls.
 
@@ -383,7 +383,7 @@ pattern, and `try_call`'s output is pattern-matched.
   destructure with `..`, array destructure with `..rest`/`..`,
   or-patterns, guard clauses).
 - Walker adds `eval_match` plus a shared `pattern_matches`
-  helper (re-exported as `bop::pattern_matches`) so every engine
+  helper (re-exported as `nybl::pattern_matches`) so every engine
   runs the same structural matcher.
 - VM adds a `patterns: Vec<Pattern>` pool on `Chunk` plus two
   new instructions: `MatchFail { pattern, on_fail }` (pops the
@@ -392,8 +392,8 @@ pattern, and `try_call`'s output is pattern-matched.
   compiles to a `PushScope` / `Dup` / `MatchFail` / guard /
   body / `PopScope` sequence with explicit fall-through.
 - AOT emits a Rust block expression that constructs each
-  `bop::parser::Pattern` inline and dispatches through
-  `bop::pattern_matches`, extracting bindings into Rust locals
+  `nybl::parser::Pattern` inline and dispatches through
+  `nybl::pattern_matches`, extracting bindings into Rust locals
   before the guard and body.
 - **Tests**: 20 walker tests, 16 VM differential tests, 14
   three-way corpus programs exercising every pattern kind plus
@@ -406,7 +406,7 @@ pattern, and `try_call`'s output is pattern-matched.
 **Why fifth.** Programs past a few hundred lines need a way for
 libraries to signal recoverable failures without either aborting
 the whole program or forcing every caller to pre-check every
-input. Bop rejects exception machinery in favour of a Result-based
+input. Nybl rejects exception machinery in favour of a Result-based
 model built on the enum type from phase 3 and the pattern matcher
 from phase 4 — a lighter touch that maps cleanly onto all three
 engines.
@@ -414,13 +414,13 @@ engines.
 **Two-tier semantics.** The model splits runtime failure into two
 distinct categories that don't get confused at the language level:
 
-1. **Unwinding errors** — the existing `BopError` mechanism. Raised
+1. **Unwinding errors** — the existing `NyblError` mechanism. Raised
    by the runtime for type mismatches, division by zero, index
    out of bounds, "function not found", and — crucially — resource-
    limit violations (`too many steps`, `Memory limit`). These
    unwind to the engine boundary and halt the program. **User
    code cannot catch them at the statement level.** This is the
-   load-bearing property that makes `BopLimits` a real sandbox:
+   load-bearing property that makes `NyblLimits` a real sandbox:
    a script can't swallow a step-limit error and loop anyway.
 2. **Result values** — ordinary `enum Result { Ok(value),
    Err(error) }` instances. Libraries that can fail in a
@@ -432,8 +432,8 @@ distinct categories that don't get confused at the language level:
 
 - `Result` ships in the stdlib as `enum Result { Ok(value),
   Err(error) }` with helper functions (`is_ok`, `is_err`,
-  `unwrap`, `unwrap_or`, `map`, `and_then`). Written in Bop;
-  lives in `bop-std` (phase 7). Core stays agnostic about
+  `unwrap`, `unwrap_or`, `map`, `and_then`). Written in Nybl;
+  lives in `nybl-std` (phase 7). Core stays agnostic about
   error representation.
 - **`try <expr>` operator** — parses as a prefix expression. Pure
   sugar for a specific `match`:
@@ -451,13 +451,13 @@ distinct categories that don't get confused at the language level:
   runtime error. Same rule as Rust's `?`.
 - **`try_call(f)` builtin** — Lua's `pcall`, renamed. Calls `f`
   (a zero-arg closure) and catches any *non-fatal* unwinding
-  `BopError`, returning
+  `NyblError`, returning
   `Result::Ok(return_value)` on success or
   `Result::Err(RuntimeError { message, line })` on unwind.
   Resource-limit errors — flagged with `is_fatal = true` on
-  `BopError` — bypass `try_call` entirely so the sandbox
+  `NyblError` — bypass `try_call` entirely so the sandbox
   invariant can't be undone by a wrapping `fn` { ... }`.
-- **`RuntimeError` struct** lives in `bop-std` alongside `Result`
+- **`RuntimeError` struct** lives in `nybl-std` alongside `Result`
   so pattern-matching the payload is idiomatic:
   ```
   match try_call(fn() { return risky(input) }) {
@@ -470,17 +470,17 @@ distinct categories that don't get confused at the language level:
   ```
 
 **Where it lives.** `try` is a parser + codegen change in
-`bop-lang`; the three engines each lower it to their existing
+`nybl-lang`; the three engines each lower it to their existing
 match / branching machinery (walker: `Signal::Return`-style
 propagation on `Err`; VM: a new `TryUnwrap` opcode that inspects
 the top-of-stack Result variant; AOT: emits a Rust `match` with
 `return Err(e)` in the `Err` arm). `try_call` is a builtin in
-`bop-lang` that wraps a runtime call in its engine's
-error-trapping primitive. `BopError` gains an `is_fatal: bool`
+`nybl-lang` that wraps a runtime call in its engine's
+error-trapping primitive. `NyblError` gains an `is_fatal: bool`
 field.
 
-`Result` and `RuntimeError` live in `bop-std` — core stays
-zero-dep, and nothing forces embedders to load `bop-std` if
+`Result` and `RuntimeError` live in `nybl-std` — core stays
+zero-dep, and nothing forces embedders to load `nybl-std` if
 they have their own error conventions.
 
 **Non-goals.**
@@ -502,14 +502,14 @@ they have their own error conventions.
   user converts to a value with `match` or they put it in a
   function.
 - `try_call` in the AOT must not swallow resource-limit errors.
-  The emitted Rust inspects `BopError::is_fatal` before
+  The emitted Rust inspects `NyblError::is_fatal` before
   wrapping.
-- Naming of Result's variants inside `bop-std`. Rust-style
+- Naming of Result's variants inside `nybl-std`. Rust-style
   `Result::Ok` / `Result::Err` is one option; making `Ok` and
   `Err` top-level names (imported by default) saves typing at
   the cost of polluting the global namespace. Lean
   default-imported like Rust's prelude; embedders who want it
-  strict can skip loading `bop-std`.
+  strict can skip loading `nybl-std`.
 
 **Delivered.**
 
@@ -519,14 +519,14 @@ they have their own error conventions.
   (mirrors Rust's `?`).
 - **Shape-based recognition**: `try` accepts any enum value
   whose variant is named `Ok` or `Err`. `Result` itself will
-  live in `bop-std` (phase 7); until then user code declares
+  live in `nybl-std` (phase 7); until then user code declares
   its own `enum Result { Ok(v), Err(e) }` (or any two-variant
   enum with the same naming) and `try` works on it.
 - Walker: `eval_try` unwraps `Ok(v)` to `v`, raises for
   malformed `Ok`/`Err`-on-non-Result values, and uses a
-  sentinel `BopError` + `pending_try_return` field on the
+  sentinel `NyblError` + `pending_try_return` field on the
   evaluator to carry the `Err` variant back up to the
-  enclosing `call_bop_fn`, which converts it to a regular
+  enclosing `call_nybl_fn`, which converts it to a regular
   `Signal::Return`. Top-level `try` on `Err`
   (`call_depth == 0`) surfaces as a real runtime error with a
   friendly hint.
@@ -538,9 +538,9 @@ they have their own error conventions.
   `EnumVariant` / `EnumPayload`. An emitter-state flag
   (`in_top_level`) picks between `return Ok(err_value)`
   (inside user fns / lambdas, which return
-  `Result<Value, BopError>`) and `return Err(BopError::…)`
-  (inside `run_program`, which returns `Result<(), BopError>`).
-- **`BopError::is_fatal: bool`** added. Resource-limit paths
+  `Result<Value, NyblError>`) and `return Err(NyblError::…)`
+  (inside `run_program`, which returns `Result<(), NyblError>`).
+- **`NyblError::is_fatal: bool`** added. Resource-limit paths
   (`too many steps`, `Memory limit exceeded`) now go through
   `error_fatal_with_hint`; every other error stays non-fatal.
   Fatal errors bypass `try_call`'s catch — the sandbox
@@ -548,15 +548,15 @@ they have their own error conventions.
 - **`try_call(f)` builtin** in all three engines. Invokes a
   zero-arg callable and wraps the outcome:
   - normal return → `Result::Ok(value)`
-  - non-fatal `BopError` → `Result::Err(RuntimeError
+  - non-fatal `NyblError` → `Result::Err(RuntimeError
     { message, line })`
-  - fatal `BopError` → re-raise unchanged
+  - fatal `NyblError` → re-raise unchanged
   Both `Result::Ok/Err` and `RuntimeError` are constructed by
-  shared helpers (`bop::builtins::make_try_call_ok` / `_err`)
+  shared helpers (`nybl::builtins::make_try_call_ok` / `_err`)
   so they produce the same shape regardless of whether the
   program declared the types itself — pattern matching still
   works because the matcher compares type-name strings.
-  - Walker: synchronous call through `call_bop_fn`, wraps the
+  - Walker: synchronous call through `call_nybl_fn`, wraps the
     result directly.
   - VM: a new `try_call_wrapper` field on `Frame` plus an
     `unwind_to_try_call` helper in the main dispatch loop.
@@ -564,24 +564,24 @@ they have their own error conventions.
     in `Ok`; a non-fatal error propagates through frames until
     it hits the wrapper, which wraps in `Err` and pushes for
     the caller. Fatal errors bypass the wrapper entirely.
-  - AOT: a `__bop_try_call` runtime helper in both (sandbox
+  - AOT: a `__nybl_try_call` runtime helper in both (sandbox
     and non-sandbox) preambles. The call site at `try_call(f)`
     emits a direct call into the helper. Compiled closures
     downcast through the `AotClosure` body and the helper
-    inspects `BopError::is_fatal` before wrapping.
+    inspects `NyblError::is_fatal` before wrapping.
 - **Tests**: 19 walker tests (10 on `try`, 9 on `try_call`),
   16 VM differential tests (8 + 8), and 15 three-way corpus
   programs. All three engines agree on every case, including
   the fatal-step-limit-is-uncatchable invariant that protects
-  `BopLimits`.
+  `NyblLimits`.
 
-**Still pending (deferred to phase 7 — `bop-std`).**
+**Still pending (deferred to phase 7 — `nybl-std`).**
 
 - `Result` enum + helper fns (`is_ok`, `is_err`, `unwrap`,
-  `unwrap_or`, `map`, `map_err`, `and_then`) — written in Bop,
+  `unwrap_or`, `map`, `map_err`, `and_then`) — written in Nybl,
   shipped with the standard library. The structural
   recognition means `try_call` already produces values that
-  match this shape; declaring the type in `bop-std` just makes
+  match this shape; declaring the type in `nybl-std` just makes
   it available without the user writing it themselves.
 - `RuntimeError` struct — likewise. The fields
   (`message: Str`, `line: Number`) are already set by
@@ -603,7 +603,7 @@ semantic surface stabilises so we only refit `ops` / `methods` /
 - Numeric literals: `42` → `Int`, `42.0` → `Number`.
 - Ops:
   - `Int op Int` → `Int` (overflow → wrapping? panic? error? —
-    pick one and document; lean toward `BopError`).
+    pick one and document; lean toward `NyblError`).
   - `Int op Number` and `Number op Int` → `Number` (Int widens).
   - Integer division: new `//` operator, or have `/` split
     (`/` always returns Number, `//` returns Int). Pick the
@@ -641,12 +641,12 @@ architectural risk.
   negation is checked so `-i64::MIN` as a literal errors
   rather than wraps).
 - Ops: Int/Int arithmetic with `checked_add`/`sub`/`mul`/`rem`
-  — overflow → `BopError`. Cross-type Int/Number widens to
+  — overflow → `NyblError`. Cross-type Int/Number widens to
   Number. `/` is always Number (Python rule); `//` is always
   Int, truncating toward zero. `%` follows the same widening
   rule. Comparisons are exact for Int/Int (sidestepping
   f64 precision loss past 2^53) and widen for mixed pairs.
-  `neg(i64::MIN)` → `BopError`.
+  `neg(i64::MIN)` → `NyblError`.
 - Indexing: both `arr[0]` (Int) and `arr[0.0]` (Number-via-
   cast) keep working, so legacy code composes unchanged.
 - Builtins: `int()` returns Int (direct for Int input, `as
@@ -664,7 +664,7 @@ architectural risk.
 - VM: new `Constant::Int(i64)`, `Instr::IntDiv`. Disasm
   renders them. `MakeRepeatCount` accepts Int.
 - AOT: emits `Value::Int(42i64)` for Int literals,
-  `::bop::ops::int_div` for `//`. The `repeat` lowering
+  `::nybl::ops::int_div` for `//`. The `repeat` lowering
   accepts both variants. `float` wired into the builtin
   dispatcher.
 - **Tests**: 16 walker tests, 13 VM differential tests, 12
@@ -674,15 +674,15 @@ architectural risk.
   existing `comments_in_code` / `builtin_type` / snapshot
   tests were updated to match the new token + type names.
 
-### Phase 7 — Standard library (`bop-std`) ✅
+### Phase 7 — Standard library (`nybl-std`) ✅
 
 **Why seventh.** Everything above enables it, and it's the thing
-that turns "Bop can do it" into "Bop ships with it". Phases 1–6
+that turns "Nybl can do it" into "Nybl ships with it". Phases 1–6
 produce the language; phase 7 produces the library.
 
 **Scope.**
 
-- New crate `bop-std`. Contents are Bop source files bundled as
+- New crate `nybl-std`. Contents are Nybl source files bundled as
   `&'static str` constants (or loaded via `include_str!`).
 - The crate exposes one function: roughly
   ```rust
@@ -690,9 +690,9 @@ produce the language; phase 7 produces the library.
   ```
   which maps module names (`"std.iter"`, `"std.math"`, …) back
   to the bundled source.
-- Embedders opt in by chaining `bop-std::resolve` into their
-  `BopHost::resolve_module` impl. `bop-sys`'s default host adds
-  this chain so `bop-cli` users get stdlib imports for free.
+- Embedders opt in by chaining `nybl-std::resolve` into their
+  `NyblHost::resolve_module` impl. `nybl-sys`'s default host adds
+  this chain so `nybl-cli` users get stdlib imports for free.
 - Proposed modules for v1:
   - `std.math` — `sqrt`, `sin`, `cos`, `abs`, `pi`, `e`, `floor`,
     `ceil`, `round`, `pow`. (Some delegate to built-ins that
@@ -706,26 +706,26 @@ produce the language; phase 7 produces the library.
   - `std.collections` — `Set`, `Queue`, `Stack` as struct types
     wrapping arrays/dicts.
   - `std.test` — `assert`, `assert_eq`, `assert_near`, and a
-    tiny `test("name") { ... }` runner. Enables Bop programs to
+    tiny `test("name") { ... }` runner. Enables Nybl programs to
     self-test.
   - `std.json` — `parse(str)` and `stringify(value)`. Needs
     thought once structs land.
 
-**Where it lives.** `bop-std` crate. Zero Rust deps beyond
-`bop-lang` (and only for the resolver signature — no runtime
+**Where it lives.** `nybl-std` crate. Zero Rust deps beyond
+`nybl-lang` (and only for the resolver signature — no runtime
 dep). Core stays untouched.
 
-**Non-goals.** No I/O in `bop-std` (goes through bop-sys hooks).
-No date/time (bop-sys or a new bop-time crate). No regex (probably
+**Non-goals.** No I/O in `nybl-std` (goes through nybl-sys hooks).
+No date/time (nybl-sys or a new nybl-time crate). No regex (probably
 its own crate — regex engines are non-trivial).
 
 **Risks.** None to core. The main risk is bikeshedding naming and
-APIs; enforce "write idiomatic Bop first, Rust library influence
+APIs; enforce "write idiomatic Nybl first, Rust library influence
 second".
 
 **Delivered.**
 
-- New `bop-std` crate — zero runtime dependencies, modules
+- New `nybl-std` crate — zero runtime dependencies, modules
   bundled via `include_str!`. Exposes `pub fn resolve(name:
   &str) -> Option<&'static str>` plus a `MODULES` listing.
 - **Cross-engine import-type-transfer.** Before this phase,
@@ -766,13 +766,13 @@ second".
     `union`, `intersect`, `difference`. Factory fns `stack()`,
     `queue()`, `set()`, `set_of(arr)`.
   - **`std.json`** — `stringify(value)` and `parse(text)` in
-    pure Bop. Parse errors raise a runtime error that
+    pure Nybl. Parse errors raise a runtime error that
     `try_call` surfaces; design documented in the module
     header. Known gaps: `\b`, `\f`, `\uXXXX` escapes not
     supported (documented).
-- **bop-sys integration** — `StandardHost::resolve_module`
-  now tries `bop_std::resolve` first, then falls back to
-  filesystem resolution. `bop-cli` users get `import
+- **nybl-sys integration** — `StandardHost::resolve_module`
+  now tries `nybl_std::resolve` first, then falls back to
+  filesystem resolution. `nybl-cli` users get `import
   std.math` working with no extra config.
 - **Tests**: 24 in-crate stdlib smoke tests (walker) + 8 for
   `std.collections` + 14 for `std.json`, 13 VM differential
@@ -791,15 +791,15 @@ second".
 
 ### — Checkpoint: "MVP general purpose" reached —
 
-After phase 7 Bop has: closures, modules, structs + enums,
+After phase 7 Nybl has: closures, modules, structs + enums,
 pattern matching, Result-based error handling, an integer type,
 and a standard library. A competent developer can write a
 non-trivial program in it. The core crate is still zero-dep
 embeddable. The remaining phases are tooling and polish.
 
-### Phase 8 — Package manager (`bop-pkg`) — parked
+### Phase 8 — Package manager (`nybl-pkg`) — parked
 
-*Explicitly deferred; no active work.* The `bop-std`
+*Explicitly deferred; no active work.* The `nybl-std`
 bundled-source approach (phase 7) already covers the stdlib
 story without a package manager, and external-dependency
 management is a separate product concern.
@@ -807,11 +807,11 @@ management is a separate product concern.
 Left here as a future-work sketch. Its own plan doc when the
 time comes. Rough shape:
 
-- `bop-pkg` CLI: `bop install foo`, `bop publish`.
-- `bop.toml` manifest at the root of a project: name, version,
+- `nybl-pkg` CLI: `nybl install foo`, `nybl publish`.
+- `nybl.toml` manifest at the root of a project: name, version,
   dependencies.
 - Start with a single git-based registry, no central index.
-- Install puts sources in `./.bop/modules/`; `bop-sys`'s fs
+- Install puts sources in `./.nybl/modules/`; `nybl-sys`'s fs
   resolver checks there first, then the project root.
 
 None of this touches core. It's tooling plus convention.
@@ -820,7 +820,7 @@ None of this touches core. It's tooling plus convention.
 
 Ongoing, not a discrete phase:
 
-- Documentation — tutorial, reference, `bop-std` API docs, a
+- Documentation — tutorial, reference, `nybl-std` API docs, a
   landing page. Without docs, none of the above matters to
   anyone who isn't already in the codebase.
 - Better parse / runtime errors (line spans, source pointers).
@@ -834,12 +834,12 @@ Ongoing, not a discrete phase:
 **Landed.**
 
 - ✅ **Source-pointer error rendering.** Lexer tracks column;
-  `SpannedToken` carries it; `BopError::render(source)` prints
+  `SpannedToken` carries it; `NyblError::render(source)` prints
   an `error:` header, `--> line N[:col]` location, source
   snippet with gutter, a carat under the column (when known),
   and a trailing `hint:` line. Tab-aware carat padding.
-  `bop-cli` uses it for both file runs and REPL.
-- ✅ **"Did you mean?" suggestions.** New `bop::suggest`
+  `nybl-cli` uses it for both file runs and REPL.
+- ✅ **"Did you mean?" suggestions.** New `nybl::suggest`
   module (Wagner–Fischer Levenshtein + length prune +
   per-target edit budget). Walker, VM, and AOT all populate
   hints on `Variable X not found`, `Function X not found`,
@@ -847,11 +847,11 @@ Ongoing, not a discrete phase:
   `Enum X has no variant Y`. Shared
   `suggest::CORE_CALLABLE_BUILTINS` list keeps builtin
   suggestions consistent across engines.
-- ✅ **Match exhaustiveness warnings.** New `bop::check`
-  module + `BopWarning` type + `bop::parse_with_warnings`
+- ✅ **Match exhaustiveness warnings.** New `nybl::check`
+  module + `NyblWarning` type + `nybl::parse_with_warnings`
   entry point. Flags enum matches that miss variants when
   there's no catch-all; conservative (guards don't count;
-  imported enums are opaque). `bop-cli` prints warnings
+  imported enums are opaque). `nybl-cli` prints warnings
   before running.
 
 **Still open.**
@@ -861,9 +861,9 @@ Ongoing, not a discrete phase:
   The renderer falls back cleanly and parse errors (where
   the carat matters most) already have column info.
 - **REPL multi-line input, history, tab completion.** Needs
-  a line-editor dep (rustyline or similar) in `bop-cli`.
+  a line-editor dep (rustyline or similar) in `nybl-cli`.
 - **Exhaustiveness check doesn't follow `import`s.** Imported
-  enums are opaque to `bop::check`; a second pass that walks
+  enums are opaque to `nybl::check`; a second pass that walks
   the import graph would close that gap.
 - **Documentation.** Tutorial + language reference + stdlib
   API docs. Nothing formally written yet beyond this roadmap.
@@ -881,11 +881,11 @@ the codebase walkthrough. Linked to the phase that delivered
 |------|--------|-------|
 | **Diagnostics** — column info, source snippets, carat, "did you mean?" | ✅ done | Phase 9 landed across walker / VM / AOT. |
 | **`std.collections`** (Set / Queue / Stack) | ✅ done | Shipped as struct types with value-semantic methods + `union`/`intersect`/`difference`. |
-| **`std.json`** (parse / stringify) | ✅ done | Pure Bop implementation; parse raises on malformed input and `try_call` surfaces the error. `\b` / `\f` / `\uXXXX` escapes documented as known gaps. |
-| **Match exhaustiveness checking** | ✅ done | `bop::check` + `BopWarning`, phase 9. Imported enums still opaque. |
+| **`std.json`** (parse / stringify) | ✅ done | Pure Nybl implementation; parse raises on malformed input and `try_call` surfaces the error. `\b` / `\f` / `\uXXXX` escapes documented as known gaps. |
+| **Match exhaustiveness checking** | ✅ done | `nybl::check` + `NyblWarning`, phase 9. Imported enums still opaque. |
 | **Performance** | ✅ meaningfully faster | VM now runs **2.5×–3.1× faster** than the tree-walker on micro-benchmarks (combined: 2.6×; fib(28): 2.5×; 500k-iter loop: 3.1×). Earned via compile-time slot resolution + capture analysis + peephole superinstructions. Makes the VM a genuinely useful tier for embedders: walker for simple/portable cases, VM for "I need speed but can't bring rustc to the target machine," AOT for max speed. |
 | **Documentation** (tutorial, reference, API docs) | ❌ open | No user-facing docs beyond this roadmap and inline `///` comments. |
-| **Packaging** (`bop install`, dependency manifest) | ⏸ deferred | Phase 8 in the plan; explicitly parked for now. `bop-std` bundled-source approach handles stdlib without needing a package manager. |
+| **Packaging** (`nybl install`, dependency manifest) | ⏸ deferred | Phase 8 in the plan; explicitly parked for now. `nybl-std` bundled-source approach handles stdlib without needing a package manager. |
 
 ## Known tech debt
 
@@ -904,24 +904,24 @@ shipping, but each one hurts maintenance or future work.
   since the `run()` signature genuinely differs — collapsing
   them wouldn't pay for itself.
 - ~~**Walker's `try` unwinding uses a sentinel error.**~~ ✅
-  Fixed. `BopError` gained an `is_try_return: bool` flag;
-  `try` builds one via a new `BopError::try_return_signal`
+  Fixed. `NyblError` gained an `is_try_return: bool` flag;
+  `try` builds one via a new `NyblError::try_return_signal`
   `pub(crate)` constructor and the fn-call boundary checks
   the flag instead of comparing `.message` against a magic
-  string. The `"__bop_try_return_signal__"` constant is
+  string. The `"__nybl_try_return_signal__"` constant is
   gone. A regression test
   (`try_sentinel_uses_flag_not_message_string`) pins the
   invariant that a real runtime error never carries
   `is_try_return: true`. The value still lives on
   `Evaluator::pending_try_return` — moving it onto the
-  error itself would cycle `bop::error` ↔ `bop::value`,
+  error itself would cycle `nybl::error` ↔ `nybl::value`,
   which isn't worth it.
 - ~~**AOT `TypeRegistry` is flat, not module-scoped.**~~ ✅
   Fixed by detecting clashes at transpile time instead of
   scoping. Walker rejects cross-module type redeclarations
   with different shapes; AOT used to silently pick whichever
   module was seen last. `collect_type_registry` now returns
-  `Result<TypeRegistry, BopError>` and raises when two
+  `Result<TypeRegistry, NyblError>` and raises when two
   modules declare a struct/enum with the same name but
   different fields / variants. Same-shape redeclarations
   stay idempotent (mirrors the walker's re-import behaviour
@@ -933,7 +933,7 @@ shipping, but each one hurts maintenance or future work.
   Methods remain last-wins, matching the walker's
   permissive method-import path.
 - ~~**Error paths have subtly different wording across engines.**~~
-  ✅ Fixed. A new `bop::error_messages` module hosts format
+  ✅ Fixed. A new `nybl::error_messages` module hosts format
   helpers for the 12 messages that previously had 2+ copies
   across engines (`variable_not_found`, `function_not_found`,
   `struct_has_no_field`, `variant_has_no_field`,
@@ -974,7 +974,7 @@ shipping, but each one hurts maintenance or future work.
   - The memory-limit check in `tick()` ran two TLS loads per
     instruction. Batched to once every 256 ticks (masked
     with `TICK_MEMCHECK_MASK`), plus a final
-    `bop_memory_exceeded()` check at the end of `run()` so
+    `nybl_memory_exceeded()` check at the end of `run()` so
     programs that allocate past the cap and then terminate
     in fewer than 256 remaining instructions still trap
     (regression-guarded by `safety_range_hard_cap`).
@@ -1098,7 +1098,7 @@ shipping, but each one hurts maintenance or future work.
   the three-way corpus, and the compile-roundtrip / stdlib
   smoke suites stay green. Nothing in the walker or AOT
   changed — this is purely additive VM work.
-- ~~**`no_std` builds broken in `bop-lang`.**~~ ✅ Fixed. The
+- ~~**`no_std` builds broken in `nybl-lang`.**~~ ✅ Fixed. The
   `no_std` path had drifted: 27 compile errors from missing
   `alloc::{format, string::ToString, vec}` imports in
   `check.rs` / `suggest.rs` / `error.rs` / `parser.rs` /
@@ -1106,18 +1106,18 @@ shipping, but each one hurts maintenance or future work.
   `cos`, `tan`, `floor`, `ceil`, `round`, `trunc`, `powf`,
   `ln`, `exp`) — all of those live in `std::f64`, not
   `core::f64`. Fixes:
-  - New `bop::math` module wraps each `f64` method with a
+  - New `nybl::math` module wraps each `f64` method with a
     one-liner that dispatches to the native method under
     `std` and to `libm` under the `no_std` feature. Every
     builtin call site goes through the wrapper so the rest
     of the code stays `#[cfg]`-free.
-  - New `no_std` feature (opt-in, forwarded from `bop-vm`)
+  - New `no_std` feature (opt-in, forwarded from `nybl-vm`)
     pulls in the tiny pure-Rust `libm` crate under the
     hood. Named after the user intent ("I'm targeting
     no_std"), not the implementation detail (libm). Gated
     as an `optional = true` dep so std users never see it
     in their dep graph — verified via `cargo tree -p
-    bop-lang` (empty) vs `cargo tree -p bop-lang
+    nybl-lang` (empty) vs `cargo tree -p nybl-lang
     --no-default-features --features no_std` (one line:
     `libm v0.2.16`).
   
@@ -1125,7 +1125,7 @@ shipping, but each one hurts maintenance or future work.
   End-to-end proof the `no_std` surface works: a
   `wasm32-unknown-unknown` `cdylib` that `#![no_std]`s,
   uses `lol_alloc` for the global allocator, and exposes
-  both `bop::run` and `bop_vm::run` to JS builds clean at
+  both `nybl::run` and `nybl_vm::run` to JS builds clean at
   **355 KB** stripped (walker + VM + libm + allocator) — `no_std` is
   slightly smaller because there's no std runtime lib.
   Either is shippable to a browser / edge / embedded
@@ -1135,21 +1135,21 @@ shipping, but each one hurts maintenance or future work.
 
 Keeping this list is as important as the roadmap itself.
 
-- **Static typing.** Bop is dynamic. If static typing becomes
+- **Static typing.** Nybl is dynamic. If static typing becomes
   interesting, it's an entirely separate language; don't bolt it
   on.
-- **Macros / metaprogramming.** Adds complexity; the niche Bop
+- **Macros / metaprogramming.** Adds complexity; the niche Nybl
   fills doesn't need it.
 - **JIT.** Already rejected in `plans/execution-modes.md`. AOT
   covers "I want native speed".
 - **Concurrency / async / threading.** Out of scope at the
   language level. Embedders already drive the host; if they want
   concurrency, they run multiple engines on multiple threads.
-- **FFI to arbitrary C.** The `BopHost` trait *is* the FFI. If
+- **FFI to arbitrary C.** The `NyblHost` trait *is* the FFI. If
   you want to call C, expose it through a host method.
 - **GC beyond reference counting.** The current Value model
   (Clone/Drop with tracked allocations) is fine for the
-  workloads Bop targets.
+  workloads Nybl targets.
 - **Breaking the embeddable invariant for convenience.** Ever.
 
 ## Open questions
@@ -1159,31 +1159,31 @@ Keeping this list is as important as the roadmap itself.
   clones the whole env on every `Fn` value construction. Consider
   a flat slot vec indexed at compile time for speed.
 - **Integer vs Number default for comparison.** Should
-  `1 == 1.0` be `true` or `false`? Current Bop says `1 == "1"`
+  `1 == 1.0` be `true` or `false`? Current Nybl says `1 == "1"`
   is `false`; consistency argues `Int(1) == Number(1.0)` is also
   `false`. Users might expect `true`. Decide before shipping
   phase 5.
 - **Enum variant resolution.** `Shape::Circle(5)` is the fully
   qualified form. Should bare `Circle(5)` work when the parser
   can tell it's an enum variant by context? Rust allows
-  `use Shape::*;` to make variants callable unqualified; Bop
+  `use Shape::*;` to make variants callable unqualified; Nybl
   could follow suit via `import Shape.*` or by auto-importing
   the variants of an enum declared in the current module. Pick
   auto-import-in-scope for ergonomics.
-- **Which `BopError`s are fatal.** Resource-limit errors must stay
+- **Which `NyblError`s are fatal.** Resource-limit errors must stay
   uncatchable by `try_call` — that's the sandbox invariant. Type
   errors, division by zero, index OOB probably should be catchable
   since user code has a reasonable interest in recovering from
   parse-like failures. Needs an explicit `is_fatal` bit on
-  `BopError`, populated at construction.
+  `NyblError`, populated at construction.
 - **Module resolution timing.** Parse-time (all imports resolved
   before any code runs) or run-time (imports resolved when
   executed)? Python does the latter, which enables lazy /
   conditional imports but makes error diagnostics worse. Lean
   toward parse-time for clarity; revisit if it bites.
-- **Should `bop-std` modules be in `bop-sys`'s default resolver
+- **Should `nybl-std` modules be in `nybl-sys`'s default resolver
   chain, or opt-in?** Default-on is friendlier; opt-in is purer.
-  Lean default-on in `bop-cli`, opt-in for direct embedders.
+  Lean default-on in `nybl-cli`, opt-in for direct embedders.
 
 ## Dependency graph between phases
 
@@ -1224,7 +1224,7 @@ Follow the pattern the execution-modes roadmap established:
 1. Design note in this document (update the phase's scope block
    with concrete decisions).
 2. Land the feature in the tree-walker first, with walker-only
-   tests in `bop/src/lib.rs`.
+   tests in `nybl/src/lib.rs`.
 3. Extend the VM and the AOT transpiler.
 4. Add the 2c differential test cases so walker + VM agree.
 5. Add 3-way corpus entries where feasible.
@@ -1234,5 +1234,5 @@ Follow the pattern the execution-modes roadmap established:
    style.
 
 Safety / resource-limit semantics carry over unchanged — every new
-feature must respect `BopLimits` and go through the existing
+feature must respect `NyblLimits` and go through the existing
 tick / memory hooks in all three engines.

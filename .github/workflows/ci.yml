@@ -24,9 +24,9 @@ jobs:
             - uses: actions/checkout@v4
             # `--no-default-features`; `--features no_std`
             # pulls in the `libm`-backed math facade so the `f64`
-            # builtins still resolve. See `bop/src/math.rs` for the
+            # builtins still resolve. See `nybl/src/math.rs` for the
             # feature contract.
-            - run: cargo check -p bop-lang --no-default-features --features no_std
+            - run: cargo check -p nybl-lang --no-default-features --features no_std
 
     check-wasm:
         name: Check (wasm)
@@ -34,9 +34,9 @@ jobs:
         steps:
             - uses: actions/checkout@v4
             - run: rustup target add wasm32-unknown-unknown
-            - run: cargo check -p bop-lang --target wasm32-unknown-unknown
+            - run: cargo check -p nybl-lang --target wasm32-unknown-unknown
             # Same no_std feature requirement on wasm.
-            - run: cargo check -p bop-lang --target wasm32-unknown-unknown --no-default-features --features no_std
+            - run: cargo check -p nybl-lang --target wasm32-unknown-unknown --no-default-features --features no_std
 
     check-docs:
         name: Check docs and LLM exports

@@ -18,7 +18,7 @@ Dictionaries (dicts) are key-value stores. Keys are always strings; values can b
 
 ## Creating dictionaries
 
-```bop
+```nybl
 let person = {"name": "Alice", "age": 30, "active": true}
 let empty = {}
 ```
@@ -27,14 +27,14 @@ let empty = {}
 
 Use bracket notation with a string key:
 
-```bop
+```nybl
 let name = person["name"]     // "Alice"
 let age = person["age"]       // 30
 ```
 
 Accessing a missing key returns `none` (no error):
 
-```bop
+```nybl
 let email = person["email"]
 print(email)    // none
 
@@ -48,7 +48,7 @@ Two caveats:
 
 ## Modifying values
 
-```bop
+```nybl
 person["age"] = 31             // update existing key
 person["email"] = "a@b.com"   // add new entry
 ```
@@ -68,7 +68,7 @@ Plus the universal `d.type()`, `d.to_str()`, `d.inspect()`.
 
 ### Counting occurrences
 
-```bop
+```nybl
 let words = ["apple", "banana", "apple", "cherry", "banana", "apple"]
 let counts = {}
 for word in words {
@@ -86,7 +86,7 @@ for key in counts {
 
 ### Storing structured data
 
-```bop
+```nybl
 let point = {"x": 10, "y": 20}
 let x = point["x"].to_str()
 let y = point["y"].to_str()
@@ -95,7 +95,7 @@ print("Position: ({x}, {y})")
 
 ### Iterating over entries
 
-```bop
+```nybl
 let config = {"width": 800, "height": 600, "title": "My App"}
 for key in config {
   let val = config[key].to_str()
@@ -105,7 +105,7 @@ for key in config {
 
 ### Checking for a key before using it
 
-```bop
+```nybl
 let settings = {"volume": 80}
 
 if settings.has("volume") {

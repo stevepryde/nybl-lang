@@ -7,30 +7,30 @@
 <section class="hero">
   <div class="hero-grid site-container">
     <div class="hero-copy">
-      <h1>Bop</h1>
+      <h1>Nybl</h1>
       <p class="hero-lede">A small, dynamically typed programming language for teaching and embedding in Rust applications.</p>
       <p class="hero-detail">Zero runtime dependencies. Tree-walker, bytecode VM, and Rust AOT execution. Embedded scripts receive only the capabilities their host explicitly provides.</p>
 
-      <nav class="home-links" aria-label="Bop resources">
+      <nav class="home-links" aria-label="Nybl resources">
         <a href="/docs/">Documentation {{ ui::icon(name="arrow-right", size="18") }}</a>
         <a href="{{ config.extra.github_url }}" target="_blank" rel="noreferrer">GitHub {{ ui::icon(name="arrow-right", size="18") }}</a>
       </nav>
 
-      <button class="install-command" type="button" data-copy="cargo install bop-cli" aria-label="Copy cargo install bop-cli">
+      <button class="install-command" type="button" data-copy="cargo install nybl-cli" aria-label="Copy cargo install nybl-cli">
         <span aria-hidden="true">$</span>
-        <code>cargo install bop-cli</code>
+        <code>cargo install nybl-cli</code>
         <span class="copy-label" data-copy-label>Copy</span>
         {{ ui::icon(name="copy") }}
       </button>
     </div>
 
-    <div class="hero-code-wrap" aria-label="Bop code example">
+    <div class="hero-code-wrap" aria-label="Nybl code example">
       <div class="code-window hero-code">
         <div class="code-window-bar">
-          <span>hello.bop</span>
-          <span class="code-command">bop run hello.bop</span>
+          <span>hello.nybl</span>
+          <span class="code-command">nybl run hello.nybl</span>
         </div>
-        <pre aria-label="A complete Bop program"><code>{% raw %}<span class="token-keyword">fn</span> <span class="token-fn">greet</span>(name) {
+        <pre aria-label="A complete Nybl program"><code>{% raw %}<span class="token-keyword">fn</span> <span class="token-fn">greet</span>(name) {
   <span class="token-keyword">return</span> <span class="token-string">"Hello, {name}!"</span>
 }
 

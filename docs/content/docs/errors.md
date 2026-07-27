@@ -1,6 +1,6 @@
 +++
 title = "Error Handling"
-description = "Bop uses a `Result`-shaped value model for recoverable errors, with two language features that make it ergonomic:"
+description = "Nybl uses a `Result`-shaped value model for recoverable errors, with two language features that make it ergonomic:"
 weight = 15
 template = "docs/page.html"
 page_template = "docs/page.html"
@@ -14,7 +14,7 @@ path = "/docs/repl/"
 
 # Error Handling
 
-Bop uses a `Result`-shaped value model for recoverable errors, with two language features that make it ergonomic:
+Nybl uses a `Result`-shaped value model for recoverable errors, with two language features that make it ergonomic:
 
 - `try` — unwrap an `Ok(v)` or propagate an `Err(e)` up to the enclosing function.
 - `try_call(f)` — run a zero-arg callable, catch any runtime error, and return the outcome as a `Result`.
@@ -32,7 +32,7 @@ enum Result {
 
 By convention, `Ok(v)` carries the successful value and `Err(e)` carries whatever describes the failure — a string, a struct, anything. Values from fallible operations are the typical shape:
 
-```bop
+```nybl
 fn parse_positive(s) {
   let n = s.to_int()
   if n <= 0 {
@@ -49,7 +49,7 @@ print(parse_positive("-3"))    // Result::Err("must be positive, got -3")
 
 `Ok(x)` and `Err(e)` are parser-level sugar for `Result::Ok(x)` and `Result::Err(e)`. The rewrite applies in both expression and pattern position, so you can write:
 
-```bop
+```nybl
 fn classify(n) {
   if n > 0 { return Ok(n) }
   return Err("non-positive")
@@ -62,7 +62,7 @@ print(match classify(5) {
 // ok: 5
 ```
 
-Bop's case rules already reserve uppercase identifiers for types and variants, so `Ok` and `Err` can't collide with a user fn or variable. The long form (`Result::Ok(v)`, `Result::Err(e)`) still works — pick whichever reads better.
+Nybl's case rules already reserve uppercase identifiers for types and variants, so `Ok` and `Err` can't collide with a user fn or variable. The long form (`Result::Ok(v)`, `Result::Err(e)`) still works — pick whichever reads better.
 
 If a different enum happens to have its own `Ok` / `Err` variants, use the qualified `MyEnum::Ok(x)` form for those. The bare sugar always means `Result::Ok` / `Result::Err`.
 
@@ -74,7 +74,7 @@ If a different enum happens to have its own `Ok` / `Err` variants, use the quali
 - If the result is `Result::Err(e)`, immediately returns `e` from the enclosing function as-is (wrapped in the same `Err` variant the caller will see).
 - If the result is anything else (not `Result`-shaped), raises a runtime error.
 
-```bop
+```nybl
 fn pipeline(s) {
   let n = try parse_positive(s)        // Err propagates; Ok unwraps to `n`
   let doubled = try double_checked(n)
@@ -95,7 +95,7 @@ Because `try` propagates by returning from the *enclosing function*, it only wor
 
 Catch runtime errors from a zero-arg callable. Returns `Result::Ok(value)` on success or `Result::Err(RuntimeError { message, line })` on a caught error.
 
-```bop
+```nybl
 let r = try_call(fn() { return 1 / 0 })
 
 print(match r {
@@ -106,7 +106,7 @@ print(match r {
 // failed at line 1: Division by zero
 ```
 
-`try_call` is Bop's answer to exception-like error handling without exceptions. It *only* catches **non-fatal** errors. Fatal conditions — step-budget exhaustion, memory-limit violation, host `on_tick` returning `BopError::fatal` — are **not** caught. That keeps the sandbox invariant intact: a runaway loop can't wrap itself in `try_call` and keep going.
+`try_call` is Nybl's answer to exception-like error handling without exceptions. It *only* catches **non-fatal** errors. Fatal conditions — step-budget exhaustion, memory-limit violation, host `on_tick` returning `NyblError::fatal` — are **not** caught. That keeps the sandbox invariant intact: a runaway loop can't wrap itself in `try_call` and keep going.
 
 ### `RuntimeError` — the caught error shape
 
@@ -123,7 +123,7 @@ You can construct one explicitly (it's a regular struct), but most of the time y
 
 Every `Result` value has a small set of always-available methods. No import needed — `Result` is a built-in type and its combinators are engine-level methods.
 
-```bop
+```nybl
 print(Ok(1).is_ok())                     // true
 print(Err("oops").is_err())              // true
 
@@ -161,7 +161,7 @@ Available: `is_ok`, `is_err`, `unwrap`, `expect`, `unwrap_or`, `map`, `map_err`,
 
 ## Fatal vs non-fatal
 
-- **Non-fatal** (catchable by `try_call`): division by zero, "variable not found", type mismatches, host-raised errors via `BopError::runtime`, wrong arg count, missing field, etc.
-- **Fatal** (not catchable): step-budget exceeded, memory-limit exceeded, fn-call-depth exceeded, host-raised `BopError::fatal`.
+- **Non-fatal** (catchable by `try_call`): division by zero, "variable not found", type mismatches, host-raised errors via `NyblError::runtime`, wrong arg count, missing field, etc.
+- **Fatal** (not catchable): step-budget exceeded, memory-limit exceeded, fn-call-depth exceeded, host-raised `NyblError::fatal`.
 
 A script can observe whether an error was fatal by inspecting whether `try_call` caught it — fatal errors propagate past `try_call` to the host.

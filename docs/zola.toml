@@ -1,6 +1,6 @@
-base_url = "https://bop-lang.com"
-title = "Bop — a small language for teaching and embedding"
-description = "Bop is a small, zero-dependency programming language with familiar syntax, friendly errors, sandboxed embedding, and three interchangeable execution engines."
+base_url = "https://nybl-lang.com"
+title = "Nybl — a small language for teaching and embedding"
+description = "Nybl is a small, zero-dependency programming language with familiar syntax, friendly errors, sandboxed embedding, and three interchangeable execution engines."
 default_language = "en"
 author = "Steve Pryde"
 output_dir = "public"
@@ -23,7 +23,7 @@ error_on_missing_language = true
 style = "inline"
 light_theme = "github-light"
 dark_theme = "github-dark"
-extra_grammars = ["syntaxes/bop.tmLanguage.json"]
+extra_grammars = ["syntaxes/nybl.tmLanguage.json"]
 
 [link_checker]
 internal_level = "error"
@@ -42,6 +42,6 @@ truncate_content_length = 6000
 index_format = "fuse_json"
 
 [extra]
-github_url = "https://github.com/stevepryde/bop-lang"
-crates_url = "https://crates.io/crates/bop-lang"
+github_url = "https://github.com/stevepryde/nybl-lang"
+crates_url = "https://crates.io/crates/nybl-lang"
 docs_url = "/docs/"
