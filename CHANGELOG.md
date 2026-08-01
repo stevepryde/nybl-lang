@@ -3,7 +3,7 @@
 All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
-## 0.4.1 - Unreleased
+## 0.4.1
 
 `0.4.1` is the first coordinated release after `0.3.0`. It expands Nybl from a
 small one-shot scripting runtime into a module-aware language with persistent
