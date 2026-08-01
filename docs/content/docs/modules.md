@@ -27,6 +27,36 @@ use path.{a, b} as m        // aliased + selective
 
 Paths are dot-joined identifiers: `std.math`, `game.entity.player`. How the host resolves a path is up to the embedder — `nybl-sys`'s `StandardHost::with_module_root` maps `foo.bar` to `<root>/foo/bar.nybl`, in-memory hosts can look up a string table, a web host can fetch a URL. See [Embedding](/docs/embedding/#resolve_module-custom-use-resolution).
 
+## Explicit public surfaces
+
+A module can declare an export allow-list with `pub { ... }`:
+
+```nybl
+let visible = 1
+let implementation_detail = 2
+let _explicitly_public = 3
+struct Widget { value }
+fn helper() { return implementation_detail }
+
+pub { visible, _explicitly_public, Widget, helper }
+```
+
+When at least one list appears, only listed values, functions, types, and
+re-exports can cross the module boundary. Multiple lists are unioned, and
+`pub {}` exports nothing. Listed underscore-prefixed names are public even to a
+glob import. Private implementation bindings remain available to exported
+functions inside their defining module.
+
+Without a `pub { ... }` list, modules keep the legacy convention described
+below: glob imports omit `_` names, while aliases and selective imports may
+reach them. This compatibility rule lets existing modules adopt explicit
+surfaces incrementally.
+
+`pub { ... }` is separate from root-level `pub fn`: the former controls Nybl
+module imports, while the latter declares a host-callable
+[`NyblInstance`](/docs/embedding/instances/) entry point. A surface statement
+in the directly executed root has no effect.
+
 ## Glob `use`
 
 Brings every public export of a module into the current scope as a bare name:
@@ -63,7 +93,8 @@ print(factorial(4))
 // print(clamp(1, 0, 10))   // error — not imported
 ```
 
-Selective imports can reach private names explicitly:
+In a legacy module without an explicit public surface, selective imports can
+reach private names explicitly:
 
 ```nybl
 use foo.{_helper}

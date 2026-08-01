@@ -8,6 +8,37 @@ use std::{format, string::String, vec};
 use crate::error::NyblError;
 use crate::parser::ParamMode;
 
+/// Number of positional arguments required before an optional final rest
+/// parameter begins collecting values.
+pub fn required_arity(modes: &[ParamMode]) -> usize {
+    modes.len() - usize::from(matches!(modes.last(), Some(ParamMode::Rest)))
+}
+
+/// Whether an actual positional count satisfies fixed or final-rest metadata.
+pub fn accepts_arity(modes: &[ParamMode], actual: usize) -> bool {
+    let required = required_arity(modes);
+    if matches!(modes.last(), Some(ParamMode::Rest)) {
+        actual >= required
+    } else {
+        actual == required
+    }
+}
+
+/// Validate engine-provided parameter metadata at a public trust boundary.
+pub fn validate_parameter_modes(modes: &[ParamMode], line: u32) -> Result<(), NyblError> {
+    if modes
+        .iter()
+        .enumerate()
+        .any(|(index, mode)| *mode == ParamMode::Rest && index + 1 != modes.len())
+    {
+        return Err(NyblError::runtime(
+            "Function rest parameter metadata must be final",
+            line,
+        ));
+    }
+    Ok(())
+}
+
 fn with_hint(mut error: NyblError, hint: impl Into<String>) -> NyblError {
     error.friendly_hint = Some(hint.into());
     error
@@ -21,7 +52,15 @@ pub fn validate_call_modes(
     actual: &[ParamMode],
     line: u32,
 ) -> Result<(), NyblError> {
-    for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+    let fixed = required_arity(expected);
+    for (index, actual) in actual.iter().enumerate() {
+        let expected = if index < fixed {
+            &expected[index]
+        } else if matches!(expected.last(), Some(ParamMode::Rest)) {
+            &ParamMode::Value
+        } else {
+            break;
+        };
         if expected == actual {
             continue;
         }
@@ -43,6 +82,9 @@ pub fn validate_call_modes(
                 ),
                 format!("Remove `ref` from argument {position}."),
             ),
+            (ParamMode::Rest, _) | (_, ParamMode::Rest) => {
+                unreachable!("rest is declaration-only and normalized to value mode")
+            }
             _ => unreachable!("equal modes were handled above"),
         });
     }

@@ -69,6 +69,10 @@ let mid = ((low + high) / 2).to_int()
 
 Works on every type. Arrays and dicts compare structurally (element-wise, then entry-wise). User-defined struct and enum values compare by full type identity `(declaring module, type name)` plus their payloads — two structs with the same name declared in different modules are *not* equal even with matching field values.
 
+Opaque host values compare by handle identity. Copies of the same host handle
+are equal; separately constructed handles are unequal even when their hidden
+Rust payloads would compare equal.
+
 ```nybl
 print(5 == 5)                   // true
 print(5 == "5")                 // false    (different types)

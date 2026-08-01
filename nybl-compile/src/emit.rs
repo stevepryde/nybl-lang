@@ -375,6 +375,9 @@ pub(crate) struct ModuleEntry {
     /// effective exports. Matches the walker's injection
     /// semantics (`use` re-exports by default).
     pub effective_exports: Vec<String>,
+    /// Whether this module declares an explicit `pub { ... }` allow-list.
+    /// Legacy modules continue underscore-filtered glob behavior.
+    explicit_surface: bool,
     /// Presence-aware function candidates propagated through flat imports.
     /// Unlike value exports, any one of these may be absent at runtime.
     effective_function_exports: BTreeSet<String>,
@@ -581,6 +584,15 @@ fn analyze_module(
     let own_fns = collect_top_level_fn_params(&ast);
     let function_candidates: BTreeSet<String> = collect_fn_info(&ast).all_fns.into_iter().collect();
     let own_types = collect_top_level_types(&ast);
+    let public_surface = ast.iter().fold(None, |surface, stmt| {
+        if let StmtKind::PublicSurface { names } = &stmt.kind {
+            let mut merged = surface.unwrap_or_else(BTreeSet::new);
+            merged.extend(names.iter().cloned());
+            Some(merged)
+        } else {
+            surface
+        }
+    });
 
     // Effective exports mirror the bindings that each `use` shape
     // actually introduces into this module's scope. A plain glob
@@ -612,7 +624,7 @@ fn analyze_module(
             }
             None => {
                 for name in &module.effective_exports {
-                    if !name.starts_with('_') {
+                    if module.explicit_surface || !name.starts_with('_') {
                         push_unique(&mut exports, &mut seen, name);
                         if module.effective_function_exports.contains(name) {
                             effective_function_exports.insert(name.clone());
@@ -660,7 +672,7 @@ fn analyze_module(
             }
             None => {
                 for (type_name, origin) in &module.effective_types {
-                    if !type_name.starts_with('_') {
+                    if module.explicit_surface || !type_name.starts_with('_') {
                         type_exports
                             .entry(type_name.clone())
                             .or_insert_with(|| origin.clone());
@@ -673,8 +685,16 @@ fn analyze_module(
         type_exports.insert(ty.clone(), name.to_string());
     }
 
-    let (module_value_exports, module_alias_candidates, effective_value_exports) =
+    let (mut module_value_exports, module_alias_candidates, mut effective_value_exports) =
         effective_module_value_exports(&ast, &graph.modules);
+    let explicit_surface = public_surface.is_some();
+    if let Some(surface) = &public_surface {
+        exports.retain(|name| surface.contains(name));
+        effective_function_exports.retain(|name| surface.contains(name));
+        type_exports.retain(|name, _| surface.contains(name));
+        effective_value_exports.retain(|name| surface.contains(name));
+        module_value_exports.retain(|name, _| surface.contains(name));
+    }
 
     graph.modules.insert(
         name.to_string(),
@@ -688,6 +708,7 @@ fn analyze_module(
                 .map(|import| import.path)
                 .collect(),
             effective_exports: exports,
+            explicit_surface,
             effective_function_exports,
             effective_types: type_exports,
             effective_value_exports,
@@ -765,7 +786,7 @@ fn effective_module_value_exports(
                     None => module
                         .effective_exports
                         .iter()
-                        .filter(|name| !name.starts_with('_'))
+                        .filter(|name| module.explicit_surface || !name.starts_with('_'))
                         .collect(),
                 };
                 for name in exposed_names {
@@ -959,6 +980,7 @@ fn collect_imports_in_stmt(stmt: &Stmt, out: &mut Vec<ModuleImport>) {
         StmtKind::ExprStmt(expr) => collect_imports_in_expr(expr, out),
         StmtKind::Break
         | StmtKind::Continue
+        | StmtKind::PublicSurface { .. }
         | StmtKind::StructDecl { .. }
         | StmtKind::EnumDecl { .. } => {}
     }
@@ -1491,6 +1513,48 @@ enum RefTargetCandidate {
     DirectLocal(String),
     OptionalLocal(String),
     Persistent { module: String, name: String },
+}
+
+#[derive(Clone)]
+enum AotPlaceProjection {
+    Field(String),
+    Index(Expr),
+}
+
+#[derive(Clone)]
+struct AotPlace {
+    root: String,
+    projections: Vec<AotPlaceProjection>,
+}
+
+#[derive(Clone)]
+struct EmittedPlaceTarget {
+    place: AotPlace,
+    root_read: String,
+    root_write: String,
+}
+
+fn aot_place(expr: &Expr) -> Option<AotPlace> {
+    fn walk(expr: &Expr, projections: &mut Vec<AotPlaceProjection>) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(name.clone()),
+            ExprKind::FieldAccess { object, field } => {
+                let root = walk(object, projections)?;
+                projections.push(AotPlaceProjection::Field(field.clone()));
+                Some(root)
+            }
+            ExprKind::Index { object, index } => {
+                let root = walk(object, projections)?;
+                projections.push(AotPlaceProjection::Index((**index).clone()));
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+
+    let mut projections = Vec::new();
+    let root = walk(expr, &mut projections)?;
+    Some(AotPlace { root, projections })
 }
 
 #[derive(Clone)]
@@ -2076,6 +2140,7 @@ impl Emitter {
                 .imported_type_names(path, items.as_deref(), false)
                 .is_empty(),
             StmtKind::Use { alias: Some(_), .. } => false,
+            StmtKind::PublicSurface { .. } => false,
             StmtKind::StructDecl { .. } | StmtKind::EnumDecl { .. } => true,
             StmtKind::ExprStmt(expr) => expr_uses_runtime_type_bindings(expr),
         })
@@ -2462,6 +2527,55 @@ impl Emitter {
                 writes.join(", "),
             ),
         )
+    }
+
+    fn emitted_place_target(&mut self, place: AotPlace, line: u32) -> (String, EmittedPlaceTarget) {
+        let storage =
+            self.binding_storage(&place.root)
+                .unwrap_or_else(|| BindingStorage::Persistent {
+                    module: self.current_module.clone(),
+                    name: place.root.clone(),
+                });
+        let (preflight, root_read, root_write) =
+            self.ref_target_sources(&storage, &place.root, line);
+        (
+            preflight,
+            EmittedPlaceTarget {
+                place,
+                root_read,
+                root_write,
+            },
+        )
+    }
+
+    /// Emit projection expressions in root-to-leaf order and retain their
+    /// values in a reusable path vector. Callers choose where this text is
+    /// placed to preserve the language's call-entry ordering.
+    fn place_steps_src(&mut self, place: &AotPlace) -> Result<(String, String), NyblError> {
+        let mut prelude = String::new();
+        let mut steps = Vec::with_capacity(place.projections.len());
+        for projection in &place.projections {
+            match projection {
+                AotPlaceProjection::Field(field) => steps.push(format!(
+                    "__NyblPlaceStep::Field({})",
+                    rust_string_literal(field)
+                )),
+                AotPlaceProjection::Index(index) => {
+                    let value = self.expr_src(index)?;
+                    let tmp = self.fresh_tmp();
+                    write!(prelude, "let {tmp} = {value}; ").unwrap();
+                    steps.push(format!("__NyblPlaceStep::Index({tmp})"));
+                }
+            }
+        }
+        let path = self.fresh_tmp();
+        write!(
+            prelude,
+            "let {path}: ::std::vec::Vec<__NyblPlaceStep> = ::std::vec![{}]; ",
+            steps.join(", ")
+        )
+        .unwrap();
+        Ok((prelude, path))
     }
 
     fn is_dynamic_namespace_local(&self, name: &str) -> bool {
@@ -3213,7 +3327,7 @@ impl Emitter {
             None => entry
                 .effective_exports
                 .iter()
-                .filter(|n| alias.is_some() || !n.starts_with('_'))
+                .filter(|n| entry.explicit_surface || alias.is_some() || !n.starts_with('_'))
                 .cloned()
                 .collect(),
         };
@@ -3235,7 +3349,9 @@ impl Emitter {
             None => entry
                 .effective_types
                 .iter()
-                .filter(|(name, _)| alias.is_some() || !name.starts_with('_'))
+                .filter(|(name, _)| {
+                    entry.explicit_surface || alias.is_some() || !name.starts_with('_')
+                })
                 .map(|(name, origin)| (name.clone(), origin.clone()))
                 .collect(),
         };
@@ -4275,23 +4391,23 @@ impl Emitter {
         let adapter = method_site_adapter_name(site.id);
         let body = method_site_fn_name(site.id);
         let arity = site.params.len();
+        let non_receiver_modes = site
+            .params
+            .iter()
+            .skip(1)
+            .map(|param| match param.mode {
+                ParamMode::Value => "::nybl::parser::ParamMode::Value",
+                ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                ParamMode::Rest => "::nybl::parser::ParamMode::Rest",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         writeln!(
             self.out,
             "fn {adapter}(ctx: &mut Ctx<'_>, obj: &::nybl::value::Value, args: &[::nybl::value::Value], line: u32) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{"
         )
         .unwrap();
-        writeln!(
-            self.out,
-            "    if args.len() + 1 != {arity} {{ return Err(::nybl::error::NyblError::runtime(format!({message}, args.len() + 1), line)); }}",
-            message = rust_string_literal(&format!(
-                "`{}.{}` expects {} argument{} (including `self`), but got {{}}",
-                site.type_name,
-                site.method_name,
-                arity,
-                if arity == 1 { "" } else { "s" },
-            )),
-        )
-        .unwrap();
+        writeln!(self.out, "    let __modes = &[{non_receiver_modes}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error({}, __modes, args.len(), line)); }} let args = __nybl_pack_rest_args(args.to_vec(), __modes, line, &ctx.memory)?; let _ = &args;", rust_string_literal(&format!("{}.{}", site.type_name, site.method_name))).unwrap();
         if arity == 0 {
             writeln!(self.out, "    {body}(ctx)").unwrap();
         } else if site.params[0].mode == ParamMode::Ref {
@@ -4327,18 +4443,7 @@ impl Emitter {
             "fn {outcome_adapter}(ctx: &mut Ctx<'_>, mut obj: ::nybl::value::Value, mut args: ::std::vec::Vec<::nybl::value::Value>, line: u32) -> Result<__NyblMethodOutcome, ::nybl::error::NyblError> {{"
         )
         .unwrap();
-        writeln!(
-            self.out,
-            "    if args.len() + 1 != {arity} {{ return Err(::nybl::error::NyblError::runtime(format!({message}, args.len() + 1), line)); }}",
-            message = rust_string_literal(&format!(
-                "`{}.{}` expects {} argument{} (including `self`), but got {{}}",
-                site.type_name,
-                site.method_name,
-                arity,
-                if arity == 1 { "" } else { "s" },
-            )),
-        )
-        .unwrap();
+        writeln!(self.out, "    let __modes = &[{non_receiver_modes}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error({}, __modes, args.len(), line)); }} args = __nybl_pack_rest_args(args, __modes, line, &ctx.memory)?; let _ = &args;", rust_string_literal(&format!("{}.{}", site.type_name, site.method_name))).unwrap();
         for index in 0..arity.saturating_sub(1) {
             writeln!(self.out, "    let mut __a{index} = args.remove(0);").unwrap();
         }
@@ -4481,6 +4586,7 @@ impl Emitter {
                     .map(|param| match param.mode {
                         ParamMode::Value => "::nybl::parser::ParamMode::Value",
                         ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                        ParamMode::Rest => "::nybl::parser::ParamMode::Rest",
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -4493,19 +4599,23 @@ impl Emitter {
                 } else {
                     ""
                 };
+                let full_modes = site
+                    .params
+                    .iter()
+                    .map(|param| match param.mode {
+                        ParamMode::Value => "::nybl::parser::ParamMode::Value",
+                        ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                        ParamMode::Rest => "::nybl::parser::ParamMode::Rest",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 writeln!(
                     self.out,
-                    "            Some(adapter) if adapter as usize == {adapter} as *const () as usize => {{ {receiver_check}if actual_modes.len() + 1 != {arity}usize {{ return Err(::nybl::error::NyblError::runtime(format!({arity_message}, actual_modes.len() + 1), line)); }} ::nybl::validate_call_modes({label}, &[{modes}], actual_modes, line)?; Ok(Some(adapter)) }},",
+                    "            Some(adapter) if adapter as usize == {adapter} as *const () as usize => {{ {receiver_check}let __full_modes = &[{full_modes}]; if !::nybl::ref_params::accepts_arity(__full_modes, actual_modes.len() + 1) {{ let required = ::nybl::ref_params::required_arity(__full_modes); let message = if matches!(__full_modes.last(), Some(::nybl::parser::ParamMode::Rest)) {{ format!(\"`{{}}.{{}}` expects at least {{}} arguments (including `self`), but got {{}}\", {type_name}, {method_name}, required, actual_modes.len() + 1) }} else {{ format!(\"`{{}}.{{}}` expects {{}} argument{{}} (including `self`), but got {{}}\", {type_name}, {method_name}, required, if required == 1 {{ \"\" }} else {{ \"s\" }}, actual_modes.len() + 1) }}; return Err(::nybl::error::NyblError::runtime(message, line)); }} ::nybl::validate_call_modes({label}, &[{modes}], actual_modes, line)?; Ok(Some(adapter)) }},",
                     adapter = method_site_adapter_name(site.id),
                     label = rust_string_literal(&format!("{type_name}.{method_name}")),
-                    arity = site.params.len(),
-                    arity_message = rust_string_literal(&format!(
-                        "`{}.{}` expects {} argument{} (including `self`), but got {{}}",
-                        type_name,
-                        method_name,
-                        site.params.len(),
-                        if site.params.len() == 1 { "" } else { "s" },
-                    )),
+                    type_name = rust_string_literal(type_name),
+                    method_name = rust_string_literal(method_name),
                 )
                 .unwrap();
             }
@@ -4698,21 +4808,12 @@ impl Emitter {
             .replace(
                 "/*__NYBL_VALIDATE_AOT_ARITY__*/",
                 if self.opts.sandbox {
-                    r#"            if args.len() != f.params.len() {
+                    r#"            if !::nybl::ref_params::accepts_arity(&f.param_modes, args.len()) {
                 let callable = f
                     .self_name
                     .as_ref()
                     .map_or_else(|| "lambda".to_string(), |name| format!("`{}`", name));
-                return Err(::nybl::error::NyblError::runtime(
-                    format!(
-                        "{} expects {} argument{}, but got {}",
-                        callable,
-                        f.params.len(),
-                        if f.params.len() == 1 { "" } else { "s" },
-                        args.len(),
-                    ),
-                    line,
-                ));
+                return Err(__nybl_arity_error(&callable, &f.param_modes, args.len(), line));
             }
 "#
                 } else {
@@ -4801,6 +4902,7 @@ impl Emitter {
                 .map(|param| match param.mode {
                     ParamMode::Value => "::nybl::parser::ParamMode::Value",
                     ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                    ParamMode::Rest => "::nybl::parser::ParamMode::Rest",
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -4870,17 +4972,8 @@ fn __nybl_preflight_function_site_call(
     line: u32,
 ) -> Result<(), ::nybl::error::NyblError> {
     let site = &__NYBL_FUNCTION_SITES[site_id];
-    if actual_modes.len() != site.params.len() {
-        return Err(::nybl::error::NyblError::runtime(
-            format!(
-                "`{}` expects {} argument{}, but got {}",
-                site.name,
-                site.params.len(),
-                if site.params.len() == 1 { "" } else { "s" },
-                actual_modes.len(),
-            ),
-            line,
-        ));
+    if !::nybl::ref_params::accepts_arity(site.param_modes, actual_modes.len()) {
+        return Err(__nybl_arity_error(site.name, site.param_modes, actual_modes.len(), line));
     }
     ::nybl::validate_call_modes(site.name, site.param_modes, actual_modes, line)
 }
@@ -5101,10 +5194,14 @@ fn __nybl_function_site_value(
         .iter()
         .filter_map(|site_id| {
             let site = &__NYBL_FUNCTION_SITES[*site_id];
-            site.is_public.then(|| ::nybl::EntryPoint::__new(
-                site.name.to_string(),
-                site.params.len(),
-            ))
+            site.is_public.then(|| {
+                let required = ::nybl::ref_params::required_arity(site.param_modes);
+                if matches!(site.param_modes.last(), Some(::nybl::parser::ParamMode::Rest)) {
+                    ::nybl::EntryPoint::__new_variadic(site.name.to_string(), required)
+                } else {
+                    ::nybl::EntryPoint::__new(site.name.to_string(), required)
+                }
+            })
         })
         .collect()
 }
@@ -5163,9 +5260,8 @@ fn __nybl_function_site_value(
         self.out
             .push_str("    let site = &__NYBL_FUNCTION_SITES[site_id];\n");
         self.out
-            .push_str("    if args.len() != site.params.len() {\n");
-        self.out.push_str("        return Err(::nybl::error::NyblError::runtime(format!(\"`{}` expects {} argument{}, but got {}\", site.name, site.params.len(), if site.params.len() == 1 { \"\" } else { \"s\" }, args.len()), line));\n");
-        self.out.push_str("    }\n    match site_id {\n");
+            .push_str("    if !::nybl::ref_params::accepts_arity(site.param_modes, args.len()) { return Err(__nybl_arity_error(site.name, site.param_modes, args.len(), line)); }\n");
+        self.out.push_str("    args = __nybl_pack_rest_args(args, site.param_modes, line, &ctx.memory)?;\n    let _ = &args;\n    match site_id {\n");
         for site in &self.functions.sites {
             let binds = (0..site.params.len())
                 .map(|index| format!("let mut __a{index} = args.remove(0);"))
@@ -5638,6 +5734,7 @@ fn __nybl_function_site_value(
                 let src = self.expr_src(expr)?;
                 self.line(&format!("let _ = {src};"));
             }
+            StmtKind::PublicSurface { .. } => {}
         }
         Ok(())
     }
@@ -5802,169 +5899,92 @@ fn __nybl_function_site_value(
                 Ok(())
             }
             AssignTarget::Index { object, index } => {
-                // Tree-walker requires the object to be a bare ident;
-                // anything else is a compile-time error here too.
-                let target_name = match &object.kind {
-                    ExprKind::Ident(n) => n,
-                    _ => {
-                        return Err(NyblError::runtime(
-                            "Can only assign to indexed variables (like `arr[0] = val`)",
-                            line,
-                        ));
-                    }
-                };
-                // Eval order mirrors the tree-walker: rhs value,
-                // then index, then (for compound) the current
-                // indexed value, then apply the op, then write back.
-                let val_src = self.expr_src(value)?;
-                let idx_src = self.expr_src(index)?;
-                let val_tmp = self.fresh_tmp();
-                let idx_tmp = self.fresh_tmp();
-                let target_is_local = self.is_local(target_name);
-                let memory_tmp = (!target_is_local).then(|| self.fresh_tmp());
-                self.line(&format!("let {val_tmp} = {val_src};"));
-                self.line(&format!("let {idx_tmp} = {idx_src};"));
-                if let Some(memory_tmp) = &memory_tmp {
-                    self.line(&format!("let {memory_tmp} = ctx.memory.clone();"));
-                }
-                let target_tmp = self.fresh_tmp();
-                let target_src = if !target_is_local {
-                    if let Some(target_src) = self.declaration_alias_mut_src(target_name, line) {
-                        target_src
-                    } else {
-                        let storage = self.binding_storage(target_name).unwrap_or_else(|| {
-                            BindingStorage::Persistent {
-                                module: self.current_module.clone(),
-                                name: target_name.to_string(),
-                            }
-                        });
-                        self.storage_mut_src(&storage, target_name, line)
-                    }
-                } else {
-                    format!("&mut {}", rust_user_ident(target_name))
-                };
-                self.line(&format!(
-                    "let {target_tmp}: &mut ::nybl::value::Value = {target_src};"
-                ));
-                let memory_ref = memory_tmp
-                    .as_ref()
-                    .map_or("&ctx.memory".to_string(), |tmp| format!("&{tmp}"));
-                match op {
-                    AssignOp::Eq => {
-                        self.line(&format!(
-                            "::nybl::ops::index_set_in({target_tmp}, &{idx_tmp}, {val_tmp}, {line}, {memory_ref})?;"
-                        ));
-                    }
-                    compound => {
-                        let op_path = compound_op_path(*compound);
-                        let cur_tmp = self.fresh_tmp();
-                        let new_tmp = self.fresh_tmp();
-                        self.line(&format!(
-                            "let {cur_tmp} = ::nybl::ops::index_get_in({target_tmp}, &{idx_tmp}, {line}, {memory_ref})?;"
-                        ));
-                        self.line(&format!(
-                            "let {new_tmp} = {op_path}(&{cur_tmp}, &{val_tmp}, {line}, {memory_ref})?;"
-                        ));
-                        self.line(&format!(
-                            "::nybl::ops::index_set_in({target_tmp}, &{idx_tmp}, {new_tmp}, {line}, {memory_ref})?;"
-                        ));
-                    }
-                }
-                self.refresh_write_through_alias_overlay(target_name);
-                Ok(())
+                let mut place = aot_place(object).ok_or_else(|| {
+                    NyblError::runtime(
+                        "Can only assign to indexed variables (like `arr[0] = val`)",
+                        line,
+                    )
+                })?;
+                place
+                    .projections
+                    .push(AotPlaceProjection::Index(index.clone()));
+                self.emit_place_assign(&place, op, value, line)
             }
             AssignTarget::Field { object, field } => {
-                let target_name = match &object.kind {
-                    ExprKind::Ident(n) => n,
-                    _ => {
-                        return Err(NyblError::runtime(
-                            "Can only assign to fields of named variables (like `p.x = val`)",
-                            line,
-                        ));
-                    }
-                };
-                let val_src = self.expr_src(value)?;
-                let val_tmp = self.fresh_tmp();
-                let target_is_local = self.is_local(target_name);
-                let memory_tmp = (!target_is_local).then(|| self.fresh_tmp());
-                self.line(&format!("let {val_tmp} = {val_src};"));
-                if let Some(memory_tmp) = &memory_tmp {
-                    self.line(&format!("let {memory_tmp} = ctx.memory.clone();"));
-                }
-                let target_tmp = self.fresh_tmp();
-                let target_src = if target_is_local {
-                    format!("&mut {}", rust_user_ident(target_name))
-                } else {
-                    self.declaration_alias_mut_src(target_name, line)
-                        .unwrap_or_else(|| {
-                            let storage = self.binding_storage(target_name).unwrap_or_else(|| {
-                                BindingStorage::Persistent {
-                                    module: self.current_module.clone(),
-                                    name: target_name.to_string(),
-                                }
-                            });
-                            self.storage_mut_src(&storage, target_name, line)
-                        })
-                };
-                self.line(&format!(
-                    "let {target_tmp}: &mut ::nybl::value::Value = {target_src};"
-                ));
-                let memory_ref = memory_tmp
-                    .as_ref()
-                    .map_or("&ctx.memory".to_string(), |tmp| format!("&{tmp}"));
-                match op {
-                    AssignOp::Eq => {
-                        let old_tmp = self.fresh_tmp();
-                        let new_tmp = self.fresh_tmp();
-                        self.line(&format!(
-                            "let {old_tmp} = ::core::mem::replace(&mut *{target_tmp}, ::nybl::value::Value::None);"
-                        ));
-                        self.line(&format!(
-                            "let {} = __nybl_field_set({}, {}, {}, {}, {})?;",
-                            new_tmp,
-                            memory_ref,
-                            old_tmp,
-                            rust_string_literal(field),
-                            val_tmp,
-                            line
-                        ));
-                        self.line(&format!("*{target_tmp} = {new_tmp};"));
-                    }
-                    compound => {
-                        let op_path = compound_op_path(*compound);
-                        let cur_tmp = self.fresh_tmp();
-                        let new_tmp = self.fresh_tmp();
-                        self.line(&format!(
-                            "let {} = __nybl_field_get(&*{}, {}, {})?;",
-                            cur_tmp,
-                            target_tmp,
-                            rust_string_literal(field),
-                            line
-                        ));
-                        self.line(&format!(
-                            "let {new_tmp} = {op_path}(&{cur_tmp}, &{val_tmp}, {line}, {memory_ref})?;"
-                        ));
-                        let old_tmp = self.fresh_tmp();
-                        let replaced_tmp = self.fresh_tmp();
-                        self.line(&format!(
-                            "let {old_tmp} = ::core::mem::replace(&mut *{target_tmp}, ::nybl::value::Value::None);"
-                        ));
-                        self.line(&format!(
-                            "let {} = __nybl_field_set({}, {}, {}, {}, {})?;",
-                            replaced_tmp,
-                            memory_ref,
-                            old_tmp,
-                            rust_string_literal(field),
-                            new_tmp,
-                            line
-                        ));
-                        self.line(&format!("*{target_tmp} = {replaced_tmp};"));
-                    }
-                }
-                self.refresh_write_through_alias_overlay(target_name);
-                Ok(())
+                let mut place = aot_place(object).ok_or_else(|| {
+                    NyblError::runtime(
+                        "Can only assign to fields of named variables (like `p.x = val`)",
+                        line,
+                    )
+                })?;
+                place
+                    .projections
+                    .push(AotPlaceProjection::Field(field.clone()));
+                self.emit_place_assign(&place, op, value, line)
             }
         }
+    }
+
+    fn emit_place_assign(
+        &mut self,
+        place: &AotPlace,
+        op: &AssignOp,
+        value: &Expr,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        // Preserve assignment order: RHS, then projection expressions, then
+        // the current leaf for compound operations.
+        let rhs = self.expr_src(value)?;
+        let rhs_tmp = self.fresh_tmp();
+        self.line(&format!("let {rhs_tmp} = {rhs};"));
+        let (steps, path) = self.place_steps_src(place)?;
+        self.line(&steps);
+        let storage =
+            self.binding_storage(&place.root)
+                .unwrap_or_else(|| BindingStorage::Persistent {
+                    module: self.current_module.clone(),
+                    name: place.root.clone(),
+                });
+        let root_read = self
+            .declaration_alias_read_src(&place.root, line)
+            .unwrap_or_else(|| self.storage_read_src(&storage, line));
+        let root_write = self
+            .declaration_alias_mut_src(&place.root, line)
+            .unwrap_or_else(|| self.storage_mut_src(&storage, &place.root, line));
+        let root = self.fresh_tmp();
+        self.line(&format!("let {root} = {root_read};"));
+        let replacement = match op {
+            AssignOp::Eq => rhs_tmp,
+            compound => {
+                let current = self.fresh_tmp();
+                let replacement = self.fresh_tmp();
+                self.line(&format!(
+                    "let {current} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?;"
+                ));
+                self.line(&format!(
+                    "let {replacement} = {}(&{current}, &{rhs_tmp}, {line}, &ctx.memory)?;",
+                    compound_op_path(*compound),
+                ));
+                replacement
+            }
+        };
+        let candidate = self.fresh_tmp();
+        self.line(&format!(
+            "let {candidate} = __nybl_place_set(&ctx.memory, {root}, &{path}, {replacement}, {line})?;"
+        ));
+        if self.opts.sandbox {
+            self.line(&format!("__nybl_check_memory(ctx, {line})?;"));
+        }
+        let target = self.fresh_tmp();
+        self.line(&format!(
+            "let {target}: &mut ::nybl::value::Value = {root_write};"
+        ));
+        self.line(&format!("*{target} = {candidate};"));
+        self.refresh_write_through_alias_overlay(&place.root);
+        if self.is_local(&place.root) {
+            self.mark_local_mutated(&place.root);
+        }
+        Ok(())
     }
 
     fn emit_fn_decl_as(
@@ -6488,18 +6508,19 @@ fn __nybl_function_site_value(
             .map(|arg| match arg.mode {
                 ParamMode::Value => "::nybl::parser::ParamMode::Value",
                 ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                ParamMode::Rest => "::nybl::parser::ParamMode::Value",
             })
             .collect::<Vec<_>>()
             .join(", ");
         let mut fences = String::new();
         let mut seen_targets = HashSet::new();
-        let mut targets: Vec<Option<(String, String)>> = vec![None; args.len()];
+        let mut targets: Vec<Option<EmittedPlaceTarget>> = vec![None; args.len()];
         for (index, arg) in args.iter().enumerate() {
             if arg.mode != ParamMode::Ref {
                 continue;
             }
             let position = index + 1;
-            let ExprKind::Ident(name) = &arg.value.kind else {
+            let Some(place) = aot_place(&arg.value) else {
                 write!(
                     fences,
                     "return Err(::nybl::ref_params::invalid_ref_target({position}, {line})); "
@@ -6507,6 +6528,7 @@ fn __nybl_function_site_value(
                 .unwrap();
                 continue;
             };
+            let name = &place.root;
             if !seen_targets.insert(name.clone()) {
                 write!(
                     fences,
@@ -6532,16 +6554,9 @@ fn __nybl_function_site_value(
                 .unwrap();
                 continue;
             }
-            let storage =
-                self.binding_storage(name)
-                    .unwrap_or_else(|| BindingStorage::Persistent {
-                        module: self.current_module.clone(),
-                        name: name.clone(),
-                    });
-            let (target_preflight, target_read, target_write) =
-                self.ref_target_sources(&storage, name, line);
+            let (target_preflight, target) = self.emitted_place_target(place, line);
             fences.push_str(&target_preflight);
-            targets[index] = Some((target_read, target_write));
+            targets[index] = Some(target);
         }
         let mut ordinary_lets = String::new();
         let mut arg_names: Vec<Option<String>> = vec![None; args.len()];
@@ -6555,13 +6570,22 @@ fn __nybl_function_site_value(
             arg_names[index] = Some(tmp);
         }
         let mut snapshot_lets = String::new();
+        let mut resolved: Vec<Option<(String, String, String)>> = vec![None; args.len()];
         for (index, target) in targets.iter().enumerate() {
-            let Some((read, _)) = target else {
+            let Some(target) = target else {
                 continue;
             };
-            let tmp = self.fresh_tmp();
-            write!(snapshot_lets, "let {tmp} = {read}; ").unwrap();
-            arg_names[index] = Some(tmp);
+            let (projection_lets, path) = self.place_steps_src(&target.place)?;
+            let root = self.fresh_tmp();
+            let leaf = self.fresh_tmp();
+            write!(
+                snapshot_lets,
+                "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?; ",
+                read = target.root_read,
+            )
+            .unwrap();
+            arg_names[index] = Some(leaf);
+            resolved[index] = Some((root, path, target.root_write.clone()));
         }
         let arg_values = arg_names
             .iter()
@@ -6577,23 +6601,35 @@ fn __nybl_function_site_value(
             format!("vec![{arg_values}]")
         };
         let outcome_tmp = self.fresh_tmp();
+        let mut candidates = String::new();
         let mut commits = String::new();
-        for (index, target) in targets.iter().enumerate() {
-            let Some((_, target)) = target else {
+        for (index, target) in resolved.iter().enumerate() {
+            let Some((root, path, write_target)) = target else {
                 continue;
             };
+            let candidate = self.fresh_tmp();
+            write!(
+                candidates,
+                "let {candidate} = __nybl_place_set(&ctx.memory, {root}.clone(), &{path}, {outcome_tmp}.args[{index}].clone(), {line})?; "
+            )
+            .unwrap();
             write!(
                 commits,
-                "{{ let __nybl_target: &mut ::nybl::value::Value = {target}; *__nybl_target = {outcome_tmp}.args[{index}].clone(); }} "
+                "{{ let __nybl_target: &mut ::nybl::value::Value = {write_target}; *__nybl_target = {candidate}; }} "
             )
             .unwrap();
         }
+        let memory_check = if self.opts.sandbox {
+            format!("__nybl_check_memory(ctx, {line})?; ")
+        } else {
+            String::new()
+        };
         Ok(format!(
             "{{ let {callee_tmp} = {callee_src}; \
              __nybl_preflight_value_call(ctx, &{callee_tmp}, &[{modes}], {line})?; \
              {fences}{ordinary_lets}{snapshot_lets}\
              let {outcome_tmp} = __nybl_call_value(ctx, {callee_tmp}, {args_vec}, {line})?; \
-             {commits}{outcome_tmp}.value }}"
+             {candidates}{memory_check}{commits}{outcome_tmp}.value }}"
         ))
     }
 
@@ -6631,7 +6667,11 @@ fn __nybl_function_site_value(
                 .params
                 .iter()
                 .any(|param| param.mode == ParamMode::Ref);
-            if site_has_ref || call_has_ref {
+            let site_has_rest = self.functions.sites[site]
+                .params
+                .last()
+                .is_some_and(|param| param.mode == ParamMode::Rest);
+            if site_has_ref || site_has_rest || call_has_ref {
                 let callee_src = format!("__nybl_function_site_value(ctx, {site}, {line})?");
                 return self.dynamic_value_call_src(callee_src, args, line);
             }
@@ -6643,7 +6683,14 @@ fn __nybl_function_site_value(
         // argument side effect.
         let declared_has_ref = self.fn_info.names_with_ref_sites.contains(&name);
         let declared_has_value_only = self.fn_info.names_with_value_only_sites.contains(&name);
-        if call_has_ref || (declared_has_ref && !declared_has_value_only) {
+        let declared_has_rest = self.functions.sites.iter().any(|site| {
+            site.name == name
+                && site
+                    .params
+                    .last()
+                    .is_some_and(|param| param.mode == ParamMode::Rest)
+        });
+        if call_has_ref || declared_has_rest || (declared_has_ref && !declared_has_value_only) {
             if self.fn_info.all_fns.contains(&name) {
                 let callee_src = format!(
                     "__nybl_active_function_value(ctx, {}, {}, {})?",
@@ -6662,6 +6709,7 @@ fn __nybl_function_site_value(
                 .map(|arg| match arg.mode {
                     ParamMode::Value => "::nybl::parser::ParamMode::Value",
                     ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                    ParamMode::Rest => "::nybl::parser::ParamMode::Value",
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -6716,6 +6764,7 @@ fn __nybl_function_site_value(
             .map(|arg| match arg.mode {
                 ParamMode::Value => "::nybl::parser::ParamMode::Value",
                 ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                ParamMode::Rest => "::nybl::parser::ParamMode::Value",
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -7260,6 +7309,206 @@ fn __nybl_function_site_value(
         Ok(body)
     }
 
+    fn nested_place_method_call_src(
+        &mut self,
+        receiver_place: AotPlace,
+        method: &str,
+        args: &[CallArg],
+        line: u32,
+    ) -> Result<String, NyblError> {
+        let modes = args
+            .iter()
+            .map(|arg| match arg.mode {
+                ParamMode::Value => "::nybl::parser::ParamMode::Value",
+                ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                ParamMode::Rest => "::nybl::parser::ParamMode::Value",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let method_lit = rust_string_literal(method);
+        let (receiver_fence, receiver_target) =
+            self.emitted_place_target(receiver_place.clone(), line);
+        let (receiver_projection_lets, receiver_path) = self.place_steps_src(&receiver_place)?;
+        let receiver_pre_root = self.fresh_tmp();
+        let receiver_pre_value = self.fresh_tmp();
+        let user_method = self.fresh_tmp();
+        let module_callable = self.fresh_tmp();
+        let receiver_mutates = self.fresh_tmp();
+
+        let mut fences = String::new();
+        let mut seen = HashSet::new();
+        let mut targets: Vec<Option<EmittedPlaceTarget>> = vec![None; args.len()];
+        for (index, arg) in args.iter().enumerate() {
+            if arg.mode != ParamMode::Ref {
+                continue;
+            }
+            let position = index + 1;
+            let Some(place) = aot_place(&arg.value) else {
+                write!(
+                    fences,
+                    "return Err(::nybl::ref_params::invalid_ref_target({position}, {line})); "
+                )
+                .unwrap();
+                continue;
+            };
+            let name = &place.root;
+            if !seen.insert(name.clone()) {
+                write!(
+                    fences,
+                    "return Err(::nybl::ref_params::duplicate_ref_target({line})); "
+                )
+                .unwrap();
+                continue;
+            }
+            if self.is_constant_binding(name) {
+                write!(
+                    fences,
+                    "return Err(::nybl::error_messages::constant_mutation_error({}, {line})); ",
+                    rust_string_literal(name),
+                )
+                .unwrap();
+                continue;
+            }
+            if self.is_captured_binding(name) {
+                write!(
+                    fences,
+                    "return Err(::nybl::ref_params::captured_ref_target({position}, {line})); "
+                )
+                .unwrap();
+                continue;
+            }
+            let (preflight, target) = self.emitted_place_target(place, line);
+            fences.push_str(&preflight);
+            targets[index] = Some(target);
+        }
+
+        let receiver_guard = if self.is_constant_binding(&receiver_place.root) {
+            format!(
+                "if {receiver_mutates} {{ return Err(::nybl::error_messages::constant_mutation_error({}, {line})); }} ",
+                rust_string_literal(&receiver_place.root),
+            )
+        } else if self.is_captured_binding(&receiver_place.root) {
+            format!(
+                "if {receiver_mutates} {{ return Err(::nybl::ref_params::captured_ref_target(1, {line})); }} "
+            )
+        } else {
+            String::new()
+        };
+        let duplicate_receiver_guard = if seen.contains(&receiver_place.root) {
+            format!(
+                "if {receiver_mutates} {{ return Err(::nybl::ref_params::duplicate_ref_target({line})); }} "
+            )
+        } else {
+            String::new()
+        };
+
+        let mut ordinary = String::new();
+        let mut names: Vec<Option<String>> = vec![None; args.len()];
+        for (index, arg) in args.iter().enumerate() {
+            if arg.mode == ParamMode::Ref {
+                continue;
+            }
+            let src = self.expr_src(&arg.value)?;
+            let tmp = self.fresh_tmp();
+            write!(ordinary, "let {tmp} = {src}; ").unwrap();
+            names[index] = Some(tmp);
+        }
+
+        // Mutable/ref-self receivers snapshot after ordinary arguments; value
+        // receivers retain the value produced by the callee expression.
+        let receiver_root = self.fresh_tmp();
+        let receiver_value = self.fresh_tmp();
+        let receiver_snapshot = format!(
+            "let {receiver_root} = if {receiver_mutates} {{ {read} }} else {{ {receiver_pre_root}.clone() }}; let {receiver_value} = if {receiver_mutates} {{ __nybl_place_get(&{receiver_root}, &{receiver_path}, {line}, &ctx.memory)? }} else {{ {receiver_pre_value}.clone() }}; ",
+            read = receiver_target.root_read,
+        );
+
+        let mut snapshots = String::new();
+        let mut resolved: Vec<Option<(String, String, String)>> = vec![None; args.len()];
+        for (index, target) in targets.iter().enumerate() {
+            let Some(target) = target else { continue };
+            let (projection_lets, path) = self.place_steps_src(&target.place)?;
+            let root = self.fresh_tmp();
+            let leaf = self.fresh_tmp();
+            write!(
+                snapshots,
+                "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?; ",
+                read = target.root_read,
+            )
+            .unwrap();
+            names[index] = Some(leaf);
+            resolved[index] = Some((root, path, target.root_write.clone()));
+        }
+        let values = names
+            .iter()
+            .map(|name| {
+                name.clone()
+                    .unwrap_or_else(|| "::nybl::value::Value::None".to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let args_vec = format!("::std::vec![{values}]");
+        let outcome = self.fresh_tmp();
+        let receiver_candidate = self.fresh_tmp();
+        let result = self.fresh_tmp();
+        let mut candidates = String::new();
+        let mut commits = String::new();
+        for (index, target) in resolved.iter().enumerate() {
+            let Some((root, path, write_target)) = target else {
+                continue;
+            };
+            let candidate = self.fresh_tmp();
+            write!(
+                candidates,
+                "let {candidate} = __nybl_place_set(&ctx.memory, {root}.clone(), &{path}, __nybl_staged_args[{index}].clone(), {line})?; "
+            )
+            .unwrap();
+            write!(
+                commits,
+                "{{ let __target: &mut ::nybl::value::Value = {write_target}; *__target = {candidate}; }} "
+            )
+            .unwrap();
+        }
+        let memory_check = if self.opts.sandbox {
+            format!("__nybl_check_memory(ctx, {line})?; ")
+        } else {
+            String::new()
+        };
+        let builtin_mutates = methods::is_mutating_method(method);
+        let builtin_arity = methods::builtin_method_arity(method).map_or(String::new(), |expected| {
+            format!(
+                "if {user_method}.is_none() && {module_callable}.is_none() && {}usize != {expected}usize {{ return Err(::nybl::error::NyblError::runtime({}, {line})); }} ",
+                args.len(),
+                rust_string_literal(&format!(
+                    "`.{}()` needs {} argument{}",
+                    method,
+                    expected,
+                    if expected == 1 { "" } else { "s" }
+                )),
+            )
+        });
+
+        Ok(format!(
+            "{{ {receiver_fence}{receiver_projection_lets}let {receiver_pre_root} = {receiver_read}; let {receiver_pre_value} = __nybl_place_get(&{receiver_pre_root}, &{receiver_path}, {line}, &ctx.memory)?; \
+             let {user_method} = __nybl_preflight_user_method(ctx, &{receiver_pre_value}, {method_lit}, &[{modes}], true, {line})?; \
+             let {module_callable} = if {user_method}.is_some() {{ ::std::option::Option::None }} else {{ __nybl_preflight_module_call(ctx, &{receiver_pre_value}, {method_lit}, &[{modes}], {line})? }}; \
+             if {user_method}.is_none() && {module_callable}.is_none() {{ ::nybl::validate_value_only_call_modes({method_lit}, &[{modes}], {line})?; }} \
+             {builtin_arity}let {receiver_mutates} = {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) || ({user_method}.is_none() && {module_callable}.is_none() && {builtin_mutates}); \
+             {receiver_guard}{duplicate_receiver_guard}{fences}{ordinary}{receiver_snapshot}{snapshots}\
+             let ({result}, __nybl_staged_args, __nybl_staged_receiver) = if let ::std::option::Option::Some(__nybl_method_adapter) = {user_method} {{ \
+                 let {outcome} = __nybl_call_preflighted_user_method_outcome(ctx, __nybl_method_adapter, {receiver_value}.clone(), {args_vec}, {line})?; \
+                 let __receiver = if __nybl_user_method_receiver_is_ref(__nybl_method_adapter) {{ ::std::option::Option::Some({outcome}.receiver) }} else {{ ::std::option::Option::None }}; \
+                 ({outcome}.value, {outcome}.args, __receiver) \
+             }} else if let ::std::option::Option::Some(__nybl_module_callable) = {module_callable} {{ \
+                 let {outcome} = __nybl_call_value(ctx, __nybl_module_callable, {args_vec}, {line})?; ({outcome}.value, {outcome}.args, ::std::option::Option::None) \
+             }} else {{ let (__value, __receiver) = __nybl_call_method(ctx, &{receiver_value}, {method_lit}, &[{values}], {line})?; (__value, ::std::vec::Vec::new(), __receiver) }}; \
+             let {receiver_candidate} = match __nybl_staged_receiver {{ ::std::option::Option::Some(__value) => ::std::option::Option::Some(__nybl_place_set(&ctx.memory, {receiver_root}.clone(), &{receiver_path}, __value, {line})?), ::std::option::Option::None => ::std::option::Option::None }}; \
+             {candidates}{memory_check}if let ::std::option::Option::Some(__root) = {receiver_candidate} {{ let __target: &mut ::nybl::value::Value = {receiver_write}; *__target = __root; }} {commits}{result} }}",
+            receiver_read = receiver_target.root_read,
+            receiver_write = receiver_target.root_write,
+        ))
+    }
+
     fn method_call_src(
         &mut self,
         object: &Expr,
@@ -7267,6 +7516,11 @@ fn __nybl_function_site_value(
         args: &[CallArg],
         line: u32,
     ) -> Result<String, NyblError> {
+        if let Some(place) = aot_place(object)
+            && !place.projections.is_empty()
+        {
+            return self.nested_place_method_call_src(place, method, args, line);
+        }
         if args.iter().any(|arg| arg.mode == ParamMode::Ref) {
             let object_src = self.expr_src(object)?;
             let object_tmp = self.fresh_tmp();
@@ -7276,18 +7530,19 @@ fn __nybl_function_site_value(
                 .map(|arg| match arg.mode {
                     ParamMode::Value => "::nybl::parser::ParamMode::Value",
                     ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                    ParamMode::Rest => "::nybl::parser::ParamMode::Value",
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut fences = String::new();
             let mut seen = HashSet::new();
-            let mut targets: Vec<Option<(String, String)>> = vec![None; args.len()];
+            let mut targets: Vec<Option<EmittedPlaceTarget>> = vec![None; args.len()];
             for (index, arg) in args.iter().enumerate() {
                 if arg.mode != ParamMode::Ref {
                     continue;
                 }
                 let position = index + 1;
-                let ExprKind::Ident(name) = &arg.value.kind else {
+                let Some(place) = aot_place(&arg.value) else {
                     write!(
                         fences,
                         "return Err(::nybl::ref_params::invalid_ref_target({position}, {line})); "
@@ -7295,6 +7550,7 @@ fn __nybl_function_site_value(
                     .unwrap();
                     continue;
                 };
+                let name = &place.root;
                 if !seen.insert(name.clone()) {
                     write!(
                         fences,
@@ -7320,16 +7576,9 @@ fn __nybl_function_site_value(
                     .unwrap();
                     continue;
                 }
-                let storage =
-                    self.binding_storage(name)
-                        .unwrap_or_else(|| BindingStorage::Persistent {
-                            module: self.current_module.clone(),
-                            name: name.clone(),
-                        });
-                let (target_preflight, target_read, target_write) =
-                    self.ref_target_sources(&storage, name, line);
+                let (target_preflight, target) = self.emitted_place_target(place, line);
                 fences.push_str(&target_preflight);
-                targets[index] = Some((target_read, target_write));
+                targets[index] = Some(target);
             }
             let mut ordinary = String::new();
             let mut names: Vec<Option<String>> = vec![None; args.len()];
@@ -7343,13 +7592,22 @@ fn __nybl_function_site_value(
                 names[index] = Some(tmp);
             }
             let mut snapshots = String::new();
+            let mut resolved: Vec<Option<(String, String, String)>> = vec![None; args.len()];
             for (index, target) in targets.iter().enumerate() {
-                let Some((read, _)) = target else {
+                let Some(target) = target else {
                     continue;
                 };
-                let tmp = self.fresh_tmp();
-                write!(snapshots, "let {tmp} = {read}; ").unwrap();
-                names[index] = Some(tmp);
+                let (projection_lets, path) = self.place_steps_src(&target.place)?;
+                let root = self.fresh_tmp();
+                let leaf = self.fresh_tmp();
+                write!(
+                    snapshots,
+                    "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?; ",
+                    read = target.root_read,
+                )
+                .unwrap();
+                names[index] = Some(leaf);
+                resolved[index] = Some((root, path, target.root_write.clone()));
             }
             let values = names
                 .into_iter()
@@ -7358,17 +7616,29 @@ fn __nybl_function_site_value(
                 .join(", ");
             let outcome = self.fresh_tmp();
             let module_callable = self.fresh_tmp();
+            let mut candidates = String::new();
             let mut commits = String::new();
-            for (index, target) in targets.iter().enumerate() {
-                let Some((_, target)) = target else {
+            for (index, target) in resolved.iter().enumerate() {
+                let Some((root, path, write_target)) = target else {
                     continue;
                 };
+                let candidate = self.fresh_tmp();
+                write!(
+                    candidates,
+                    "let {candidate} = __nybl_place_set(&ctx.memory, {root}.clone(), &{path}, __nybl_staged_args[{index}].clone(), {line})?; "
+                )
+                .unwrap();
                 write!(
                     commits,
-                    "{{ let __target: &mut ::nybl::value::Value = {target}; *__target = __nybl_staged_args[{index}].clone(); }} "
+                    "{{ let __target: &mut ::nybl::value::Value = {write_target}; *__target = {candidate}; }} "
                 )
                 .unwrap();
             }
+            let memory_check = if self.opts.sandbox {
+                format!("__nybl_check_memory(ctx, {line})?; ")
+            } else {
+                String::new()
+            };
             let (receiver_fence, receiver_snapshot, receiver_commit) = if let ExprKind::Ident(
                 name,
             ) = &object.kind
@@ -7389,7 +7659,7 @@ fn __nybl_function_site_value(
                              let (__nybl_result, __nybl_staged_args) = if let ::std::option::Option::Some(__nybl_method_adapter) = {user_method} {{ \
                                  let {outcome} = __nybl_call_preflighted_user_method_outcome(ctx, __nybl_method_adapter, {object_tmp}.clone(), vec![{values}], {line})?; ({outcome}.value, {outcome}.args) \
                              }} else {{ let {outcome} = __nybl_call_value(ctx, {module_callable}.expect(\"preflight selected a live module export\"), vec![{values}], {line})?; ({outcome}.value, {outcome}.args) }}; \
-                             {commits}__nybl_result }}",
+                             {candidates}{memory_check}{commits}__nybl_result }}",
                         method = rust_string_literal(method),
                     ));
                 };
@@ -7452,7 +7722,7 @@ fn __nybl_function_site_value(
                      let {outcome} = __nybl_call_value(ctx, {module_callable}.expect(\"preflight selected a live module export\"), vec![{values}], {line})?; \
                      ({outcome}.value, {outcome}.args, ::std::option::Option::None) \
                  }}; \
-                 {receiver_commit}{commits}__nybl_result }}",
+                 {candidates}{memory_check}{receiver_commit}{commits}__nybl_result }}",
                 method = rust_string_literal(method),
                 receiver_is_place = matches!(&object.kind, ExprKind::Ident(_)),
             ));
@@ -8060,8 +8330,6 @@ fn __nybl_function_site_value(
             );
         }
 
-        let arity = params.len();
-        let arity_suffix = if arity == 1 { "" } else { "s" };
         let mut param_binds = String::new();
         for (index, p) in params.iter().enumerate() {
             writeln!(
@@ -8104,11 +8372,21 @@ fn __nybl_function_site_value(
                     .map(|p| match p.mode {
                         ParamMode::Value => "::nybl::parser::ParamMode::Value",
                         ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                        ParamMode::Rest => "::nybl::parser::ParamMode::Rest",
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         };
+        let modes_slice = params
+            .iter()
+            .map(|p| match p.mode {
+                ParamMode::Value => "::nybl::parser::ParamMode::Value",
+                ParamMode::Ref => "::nybl::parser::ParamMode::Ref",
+                ParamMode::Rest => "::nybl::parser::ParamMode::Rest",
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let final_args = if params.is_empty() {
             "::std::vec::Vec::new()".to_string()
         } else {
@@ -8137,7 +8415,7 @@ fn __nybl_function_site_value(
         };
 
         Ok(format!(
-            "{{ {capture_prelude}let __opaque_body_depth = {opaque_body_depth}; let __callable: ::std::rc::Rc<dyn for<'__a> Fn(&mut Ctx<'__a>, ::std::vec::Vec<::nybl::value::Value>) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>> = ::std::rc::Rc::new(move |ctx, mut args| {{ if args.len() != {arity} {{ return Err(::nybl::error::NyblError::runtime(format!(\"lambda expects {arity} argument{arity_suffix}, but got {{}}\", args.len()), {line})); }} {type_bindings_init}{capture_moves}{param_binds}let __nybl_value_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{ {body_src} #[allow(unreachable_code)] Ok(::nybl::value::Value::None) }})(); let value = __nybl_value_result?; {memory_check}{param_sync}Ok(__NyblCallOutcome {{ value, args: {final_args} }}) }}); __nybl_wrap_callable({wrap_ctx}{params_array}, {modes_array}, ::std::vec::Vec::new(), None, __opaque_body_depth, {line}, __callable)? }}",
+            "{{ {capture_prelude}let __opaque_body_depth = {opaque_body_depth}; let __callable: ::std::rc::Rc<dyn for<'__a> Fn(&mut Ctx<'__a>, ::std::vec::Vec<::nybl::value::Value>) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>> = ::std::rc::Rc::new(move |ctx, mut args| {{ let __modes = &[{modes_slice}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error(\"lambda\", __modes, args.len(), {line})); }} args = __nybl_pack_rest_args(args, __modes, {line}, &ctx.memory)?; let _ = &args; {type_bindings_init}{capture_moves}{param_binds}let __nybl_value_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{ {body_src} #[allow(unreachable_code)] Ok(::nybl::value::Value::None) }})(); let value = __nybl_value_result?; {memory_check}{param_sync}Ok(__NyblCallOutcome {{ value, args: {final_args} }}) }}); __nybl_wrap_callable({wrap_ctx}{params_array}, {modes_array}, ::std::vec::Vec::new(), None, __opaque_body_depth, {line}, __callable)? }}",
         ))
     }
 }
@@ -8310,6 +8588,7 @@ fn scan_free_vars_stmt(
             // Method declarations — the AOT rejects them at emit
             // time; no free-var analysis needed here.
         }
+        StmtKind::PublicSurface { .. } => {}
         StmtKind::ExprStmt(e) => {
             scan_free_vars_expr(e, known, free, outer_scopes, fn_info);
         }

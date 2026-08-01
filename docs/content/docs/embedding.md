@@ -98,6 +98,17 @@ pub trait NyblHost {
         line: u32,
     ) -> Option<Result<Value, NyblError>>;
 
+    /// Called for a non-common method on an opaque host value.
+    /// `None` = this host does not implement the method.
+    fn call_method(
+        &mut self,
+        receiver: &HostValue,
+        method: &str,
+        args: &[Value],
+        line: u32,
+    ) -> Option<Result<Value, NyblError>>
+    { let _ = (receiver, method, args, line); None }
+
     /// Called by `print()`. Default: drops the message.
     fn on_print(&mut self, message: &str) { let _ = message; }
 
@@ -171,6 +182,98 @@ impl NyblHost for MyHost {
 ```
 
 Nybl scripts now call `square(5)` as if it were built-in.
+
+### Opaque host values and methods
+
+Use `HostValue` when a script should retain a host resource or capability and
+call methods on it without exposing its Rust representation. `Value::new_host`
+stores an owned, `'static` Rust payload behind a cheap reference-counted
+handle. `NyblHost::call_method` receives that handle and can recover its
+concrete payload with `downcast_ref`.
+
+```rust
+use std::cell::Cell;
+use nybl::{HostValue, NyblError, NyblHost, Value};
+
+struct Counter(Cell<i64>);
+struct AppHost;
+
+impl NyblHost for AppHost {
+    fn call(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        match (name, args) {
+            ("counter", []) => Some(Ok(Value::new_host(
+                "counter",
+                Counter(Cell::new(0)),
+            ))),
+            ("counter", _) => Some(Err(NyblError::runtime(
+                "counter() expects no arguments",
+                line,
+            ))),
+            _ => None,
+        }
+    }
+
+    fn call_method(
+        &mut self,
+        receiver: &HostValue,
+        method: &str,
+        args: &[Value],
+        line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        // A different host-value type is not handled by this dispatcher.
+        let counter = receiver.downcast_ref::<Counter>()?;
+        match (method, args) {
+            ("get", []) => Some(Ok(Value::Int(counter.0.get()))),
+            ("add", [Value::Int(amount)]) => {
+                counter.0.set(counter.0.get() + amount);
+                Some(Ok(Value::Int(counter.0.get())))
+            }
+            ("get" | "add", _) => Some(Err(NyblError::runtime(
+                "invalid counter method arguments",
+                line,
+            ))),
+            _ => None,
+        }
+    }
+}
+```
+
+The returned value behaves naturally in Nybl:
+
+```nybl
+let count = counter()
+print(count.type())     // counter
+print(count)            // <host counter>
+print(count.add(4))     // 4
+print(count.get())      // 4
+```
+
+The type name is the static string supplied to `new_host`. Display,
+`to_str()`, and `inspect()` deliberately use the fixed `<host type>` form and
+never format the opaque payload. The universal methods `type`, `to_str`,
+`inspect`, `is_none`, and `is_some` run before `call_method` and cannot be
+overridden by the host.
+
+Cloning or passing a host value preserves the same handle. Equality is
+identity-based: two aliases of one handle compare equal, while two separately
+constructed handles compare unequal even if their Rust payloads contain equal
+data. `HostValue` and `&HostValue` also participate in `IntoValue` /
+`FromValue`, and `is::<T>()` is available for type tests at the Rust boundary.
+
+Host methods accept ordinary value arguments only; `ref` arguments are
+rejected. A method may mutate its payload through interior mutability, a host
+registry, or another external resource. Those effects are host effects, not
+Nybl `ref` transactions: a later runtime error does not roll them back.
+
+Opaque payload allocation and nesting are outside `NyblLimits::max_memory`
+and the Nybl value-depth calculation. The host is responsible for bounding
+those resources. The payload remains alive until the last cloned handle is
+dropped.
 
 ### Typed `Value` conversions
 

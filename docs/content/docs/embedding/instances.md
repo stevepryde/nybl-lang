@@ -70,6 +70,11 @@ parameter](/docs/functions/reference-parameters/).
 host-facing entries value-only and put ref-based mutation behind an ordinary
 Nybl wrapper when needed.
 
+A public entry may end in a value-only `..rest` parameter. For those entries,
+`EntryPoint::arity()` is the minimum fixed argument count,
+`is_variadic()` is true, `max_arity()` is `None`, and `accepts_arity(count)`
+performs the complete check.
+
 ## Tree-walker instance
 
 ```rust
@@ -206,6 +211,13 @@ replaces a declaration.
 An instance borrows a `NyblHost` only for `load` or one call; it never stores the
 host. Later operations may use a different compatible host. This also keeps
 host-owned allocations outside the instance's memory account.
+
+Opaque `HostValue` handles may be stored in globals and survive across calls.
+The compatible host supplied for the current operation dispatches their
+methods; the instance does not retain the host that originally created them.
+Their payload allocation is host-owned and untracked, and any external
+mutation performed by a host method remains visible even if the enclosing
+Nybl call later fails.
 
 The same instance cannot be re-entered while one of its operations is active.
 For example, a host function called by instance A must not recursively call A.

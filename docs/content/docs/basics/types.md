@@ -30,6 +30,7 @@ Nybl is dynamically typed — variables can hold any type, and types are checked
 | `"enum"` | User-defined enum variant | `Color::Red` |
 | `"module"` | Aliased module namespace | result of `use foo as m` |
 | `"iter"` | Lazy iterator | `[1, 2, 3].iter()`, `"abc".iter()` |
+| host-defined name | Opaque host resource or capability | returned by a host function |
 
 ```nybl
 let x = 42
@@ -41,6 +42,13 @@ print(y.type())      // "number"
 let s = "hello"
 print(s.type())      // "string"
 ```
+
+An embedding host can return an opaque host value with its own static type
+name. For example, a file handle created as `Value::new_host("file", value)`
+reports `"file"` from `.type()` and displays as `<host file>`. Nybl can retain,
+pass, compare, and invoke host-provided methods on the handle, but cannot
+inspect its Rust payload. See [Opaque host values and
+methods](/docs/embedding/#opaque-host-values-and-methods).
 
 ## Integers and floats
 

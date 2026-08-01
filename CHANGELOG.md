@@ -3,9 +3,9 @@
 All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
-## 0.4.0 - Unreleased
+## 0.4.1 - Unreleased
 
-`0.4.0` is the first coordinated release after `0.3.0`. It expands Nybl from a
+`0.4.1` is the first coordinated release after `0.3.0`. It expands Nybl from a
 small one-shot scripting runtime into a module-aware language with persistent
 embedding APIs across all three execution engines.
 
@@ -15,14 +15,21 @@ embedding APIs across all three execution engines.
   selective-plus-aliased imports.
 - Add module-qualified struct and enum construction/patterns, declaration
   origin tracking, live module bindings, and transitive re-exports.
+- Add explicit `pub { ... }` module export allow-lists while preserving legacy
+  underscore/selective behavior for modules that do not declare one.
 - Add `const` and enforce lowercase value names, ALL_CAPS constants, and
   UpperCamel-style type/variant names at parse time.
 - Add explicit second-class `ref` parameters to user-defined functions,
   method parameters, and method receivers. `ref self` updates a mutable
-  plain-variable receiver; ordinary `self` is read-only and mutation through it
-  is a parse error. Calls use transactional copy-in/copy-out: distinct mutable
+  field/index place rooted in a `let` binding; ordinary `self` is read-only and
+  mutation through it is a parse error. Calls use transactional
+  copy-in/copy-out: distinct mutable
   targets commit together after a normal return and roll back together on
   runtime or resource errors.
+- Add final `..rest` parameters to named functions, closures, methods, and
+  variadic persistent entry points.
+- Extend assignment, explicit `ref`, built-in array mutation, and `ref self`
+  write-back through arbitrarily nested field/index places.
 - Restore `//` line comments. Integer division now uses
   `(left / right).to_int()` because `/` always returns `number`.
 - Move introspection, conversion, collection, string, and math operations to
@@ -46,6 +53,8 @@ embedding APIs across all three execution engines.
   output.
 - Add strict, path-aware Rust ↔ `Value` conversion through `IntoValue`,
   `FromValue`, `Value::to_rust`, and `nybl_value!`.
+- Add opaque, identity-based `HostValue` handles and host method dispatch via
+  `NyblHost::call_method`.
 - Add in-memory module helpers in `nybl::host`.
 - Move the Nybl standard library into `nybl-lang` behind the default `nybl-std`
   feature. The old standalone `nybl-std` crate is no longer needed.
@@ -97,7 +106,7 @@ embedding APIs across all three execution engines.
 
 ### Publishing order
 
-The crates use `0.4.0` requirements for workspace dependencies and should be
+The crates use `0.4.1` requirements for workspace dependencies and should be
 published in dependency order:
 
 1. `nybl-lang`

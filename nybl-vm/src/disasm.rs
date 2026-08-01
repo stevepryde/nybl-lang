@@ -12,7 +12,10 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::chunk::{Chunk, Constant, Instr, InterpPart, LoopStateKind, NamespaceIdx};
+use crate::chunk::{
+    Chunk, Constant, Instr, InterpPart, LoopStateKind, NamespaceIdx, PlaceIdx,
+    PlaceProjectionRecipe,
+};
 
 /// Render a chunk as a string. One line per instruction; nested
 /// function bodies are indented and follow the main body.
@@ -34,8 +37,30 @@ fn namespace_prefix(chunk: &Chunk, namespace: Option<NamespaceIdx>) -> String {
     }
 }
 
+fn place_text(chunk: &Chunk, place: PlaceIdx) -> String {
+    let recipe = chunk.place(place);
+    let mut text = match recipe.root.slot_idx() {
+        Some(slot) => format!("@{}", slot.0),
+        None => chunk.name(recipe.root.name_idx()).to_string(),
+    };
+    for projection in &recipe.projections {
+        match projection {
+            PlaceProjectionRecipe::Index => text.push_str("[?]"),
+            PlaceProjectionRecipe::Field(field) => {
+                text.push('.');
+                text.push_str(chunk.name(*field));
+            }
+        }
+    }
+    text
+}
+
 fn render_chunk(chunk: &Chunk, out: &mut String, indent: usize) {
     let pad = "  ".repeat(indent);
+    if let Some(names) = &chunk.public_surface {
+        out.push_str(&pad);
+        out.push_str(&format!("pub {{{}}}\n", names.join(", ")));
+    }
     let width = chunk.code.len().saturating_sub(1).to_string().len().max(1);
     for (i, instr) in chunk.code.iter().enumerate() {
         out.push_str(&pad);
@@ -60,6 +85,7 @@ fn render_chunk(chunk: &Chunk, out: &mut String, indent: usize) {
                 .map(|(name, mode)| match mode {
                     nybl::parser::ParamMode::Value => name.clone(),
                     nybl::parser::ParamMode::Ref => format!("ref {name}"),
+                    nybl::parser::ParamMode::Rest => format!("..{name}"),
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -144,6 +170,11 @@ fn render_instr(chunk: &Chunk, instr: &Instr) -> String {
                 )
             }
         },
+        Instr::AssignPlace { place, op } => format!(
+            "AssignPlace{} {}",
+            assign_op_suffix(*op),
+            place_text(chunk, *place)
+        ),
 
         Instr::StringInterp(idx) => {
             let recipe = chunk.interp(*idx);
@@ -198,6 +229,16 @@ fn render_instr(chunk: &Chunk, instr: &Instr) -> String {
                 chunk.name(target.name_idx())
             ),
         },
+        Instr::PrepareMethodPlace {
+            place,
+            method,
+            site,
+        } => format!(
+            "PrepareMethodPlace .{}/#{} (target {})",
+            chunk.name(*method),
+            site.0,
+            place_text(chunk, *place)
+        ),
         Instr::CallPrepared { site } => format!("CallPrepared #{}", site.0),
         Instr::CallMethod {
             method,

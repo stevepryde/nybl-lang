@@ -15,7 +15,7 @@ path = "/docs/basics/syntax/"
 # What's new in Nybl 0.4
 
 Nybl 0.4 is the first coordinated release after 0.3. All five crates move
-together to `0.4.0`:
+together to `0.4.1`:
 
 ```toml
 [dependencies]
@@ -93,6 +93,11 @@ through re-exports, so two same-shaped structs from different modules remain
 distinct. Glob collisions produce warnings and keep the first binding;
 selective and aliased forms make deliberate conflicts explicit.
 
+Modules may now declare an exact allow-list with `pub { name, Type }`. It
+filters values, functions, types, aliases, and re-exports while keeping private
+implementation bindings available to exported functions. Modules without a
+list retain the legacy underscore/selective behavior.
+
 Imported parse and runtime errors now render against the source module that
 owns the failure, including through transitive calls. Read [Modules](/docs/modules/)
 for resolution, visibility, namespaced construction and patterns, type
@@ -138,8 +143,9 @@ print([first, second])    // [2, 1]
 ```
 
 References are second-class parameters rather than general aliasing values.
-Each target must be a distinct mutable plain variable; constants, expressions,
-indexes, fields, and captured bindings are rejected. The callee works on staged
+Each target must be a distinct mutable place rooted in a `let` binding;
+constants, temporary roots, and captured bindings are rejected. Fields and
+indexes can be chained to any depth. The callee works on staged
 copies, then commits every target together only after a normal return. Runtime
 and fatal sandbox errors roll the call back, including errors caught by
 `try_call`; a returned `Result::Err` is an ordinary return and commits.
@@ -148,10 +154,11 @@ Reference parameters work through first-class function aliases, may be
 forwarded into another ref call, and are supported by the walker, VM, and AOT
 engines. Built-in and host functions remain value-only, as do Rust
 `NyblInstance::call` and `call_value` arguments. User-defined methods can declare
-`ref self` to update a mutable plain-variable receiver and can place explicit
+`ref self` to update a mutable place receiver and can place explicit
 refs after it. Ordinary `self` receivers are read-only, so attempting to mutate
 one is a parse error rather than a silently discarded change. Built-in array
-mutators use the same transaction model implicitly for a named receiver.
+mutators use the same transaction model implicitly, including nested field and
+index receivers.
 
 Read [Reference Parameters](/docs/functions/reference-parameters/) for target
 rules, evaluation order, forwarding, rollback, methods, and embedding
@@ -221,7 +228,8 @@ See [Syntax](/docs/basics/syntax/) and
 ## First-class functions and matching
 
 Function expressions can be stored, passed, returned, and captured as
-closures. Match expressions support literals, bindings, structs, enum
+closures. A final `..rest` parameter collects extra arguments into an array on
+named functions, closures, and methods. Match expressions support literals, bindings, structs, enum
 variants, namespaced types, arrays with rests, or-patterns, and guards.
 Exhaustiveness diagnostics understand local and imported enum declarations.
 

@@ -8,6 +8,7 @@
 
 #[cfg(all(feature = "no_std", not(feature = "std")))]
 use alloc::{
+    boxed::Box,
     collections::BTreeMap,
     format,
     rc::{Rc, Weak},
@@ -18,11 +19,12 @@ use alloc::{
 
 #[cfg(any(feature = "std", not(feature = "no_std")))]
 use std::{
+    boxed::Box,
     collections::BTreeMap,
     rc::{Rc, Weak},
 };
 
-use core::cell::RefCell;
+use core::{any::Any, cell::RefCell};
 
 use crate::error::NyblError;
 use crate::memory::{MemoryContext, MemoryReceipt};
@@ -101,6 +103,72 @@ impl Ord for NyblStr {
         self.0.text.cmp(&other.0.text)
     }
 }
+
+/// An opaque, host-owned value that Nybl can retain and pass back to a host.
+///
+/// The payload is deliberately invisible to the language runtime. Cloning a
+/// handle shares the same payload, while language equality compares handle
+/// identity rather than attempting to inspect the host's Rust value.
+#[derive(Clone)]
+pub struct HostValue(Rc<HostValueData>);
+
+struct HostValueData {
+    type_name: &'static str,
+    payload: Box<dyn Any>,
+}
+
+impl HostValue {
+    /// Wrap an owned, `'static` Rust value for use in Nybl.
+    pub fn new<T: 'static>(type_name: &'static str, value: T) -> Self {
+        Self(Rc::new(HostValueData {
+            type_name,
+            payload: Box::new(value),
+        }))
+    }
+
+    /// The host-defined type name exposed by Nybl's `.type()` method and
+    /// runtime diagnostics.
+    pub fn type_name(&self) -> &'static str {
+        self.0.type_name
+    }
+
+    /// Whether the opaque payload has Rust type `T`.
+    pub fn is<T: 'static>(&self) -> bool {
+        self.0.payload.is::<T>()
+    }
+
+    /// Borrow the opaque payload when its Rust type is `T`.
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.0.payload.downcast_ref::<T>()
+    }
+
+    /// Whether two handles refer to the exact same host value.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl core::fmt::Debug for HostValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HostValue")
+            .field("type_name", &self.type_name())
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Display for HostValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "<host {}>", self.type_name())
+    }
+}
+
+impl PartialEq for HostValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr_eq(other)
+    }
+}
+
+impl Eq for HostValue {}
 
 #[derive(Debug, Clone)]
 pub struct NyblArray(Rc<ArrayData>);
@@ -690,6 +758,7 @@ impl NyblFn {
                 line,
             ));
         }
+        crate::ref_params::validate_parameter_modes(&param_modes, line)?;
         let depth = checked_owner_depth(captures.iter().map(|(_, value)| value), 1, line)?;
         let body = FnBody::Ast(body);
         Ok(Rc::new(Self {
@@ -813,6 +882,7 @@ impl NyblFn {
                 line,
             ));
         }
+        crate::ref_params::validate_parameter_modes(&param_modes, line)?;
         let capture_depth = captures
             .iter()
             .map(|(_, value)| value.ownership_depth())
@@ -853,6 +923,10 @@ pub enum Value {
     Str(NyblStr),
     Bool(bool),
     None,
+    /// Opaque host-owned capability or resource handle. Nybl never traverses
+    /// or accounts the Rust payload; method calls are delegated to the active
+    /// [`crate::NyblHost`].
+    Host(HostValue),
     Array(NyblArray),
     Dict(NyblDict),
     Fn(Rc<NyblFn>),
@@ -1102,6 +1176,15 @@ impl NyblModule {
 
     #[doc(hidden)]
     pub fn __binding(&self, name: &str) -> Option<Value> {
+        // A live environment contains the module's private implementation
+        // bindings too. Membership in the immutable exported snapshot (or in
+        // its explicit live-origin map) is therefore a capability check, not
+        // merely a cache lookup.
+        if !self.live_bindings.contains_key(name)
+            && !self.bindings.iter().any(|(binding, _)| binding == name)
+        {
+            return None;
+        }
         self.live_environments
             .as_ref()
             .and_then(Weak::upgrade)
@@ -1159,8 +1242,18 @@ impl Value {
                 .try_borrow()
                 .map(|iter| iter.depth)
                 .unwrap_or(MAX_VALUE_DEPTH),
-            _ => 0,
+            Value::Int(_)
+            | Value::Number(_)
+            | Value::Str(_)
+            | Value::Bool(_)
+            | Value::None
+            | Value::Host(_) => 0,
         }
+    }
+
+    /// Wrap an owned Rust value as an opaque host handle.
+    pub fn new_host<T: 'static>(type_name: &'static str, value: T) -> Self {
+        Value::Host(HostValue::new(type_name, value))
     }
 
     pub fn new_str(s: String) -> Self {
@@ -1718,6 +1811,7 @@ impl Clone for Value {
             Value::Number(n) => Value::Number(*n),
             Value::Bool(b) => Value::Bool(*b),
             Value::None => Value::None,
+            Value::Host(value) => Value::Host(value.clone()),
             Value::Str(s) => Value::Str(NyblStr(Rc::clone(&s.0))),
             Value::Array(arr) => Value::Array(arr.clone()),
             Value::Dict(dict) => Value::Dict(dict.clone()),
@@ -1790,6 +1884,7 @@ impl Value {
             (Self::Iter(left), Self::Iter(right)) => Rc::ptr_eq(left, right),
             (Self::Fn(left), Self::Fn(right)) => Rc::ptr_eq(left, right),
             (Self::Module(left), Self::Module(right)) => Rc::ptr_eq(left, right),
+            (Self::Host(left), Self::Host(right)) => left.ptr_eq(right),
             _ => false,
         }
     }
@@ -1804,6 +1899,7 @@ impl Value {
             Value::Iter(value) => Some((5, Rc::as_ptr(value) as usize)),
             Value::Fn(value) => Some((6, Rc::as_ptr(value) as usize)),
             Value::Module(value) => Some((7, Rc::as_ptr(value) as usize)),
+            Value::Host(value) => Some((8, Rc::as_ptr(&value.0) as usize)),
             Value::Int(_) | Value::Number(_) | Value::Bool(_) | Value::None => None,
         }
     }
@@ -1822,6 +1918,7 @@ impl Value {
             Value::Number(value) => Value::Number(*value),
             Value::Bool(value) => Value::Bool(*value),
             Value::None => Value::None,
+            Value::Host(value) => Value::Host(value.clone()),
             Value::Str(value) => {
                 let text = value.0.text.clone();
                 let bytes = text.capacity();
@@ -2026,6 +2123,7 @@ impl core::fmt::Display for Value {
             Value::Str(s) => write!(f, "{}", s.0.text),
             Value::Bool(b) => write!(f, "{b}"),
             Value::None => write!(f, "none"),
+            Value::Host(value) => core::fmt::Display::fmt(value, f),
             Value::Array(items) => {
                 write!(f, "[")?;
                 for (i, item) in items.iter().enumerate() {
@@ -2146,6 +2244,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Bool(_) => "bool",
             Value::None => "none",
+            Value::Host(value) => value.type_name(),
             Value::Array(_) => "array",
             Value::Dict(_) => "dict",
             Value::Fn(_) => "fn",
@@ -2176,6 +2275,7 @@ impl Value {
         match self {
             Value::Bool(b) => *b,
             Value::None => false,
+            Value::Host(_) => true,
             Value::Int(n) => *n != 0,
             Value::Number(n) => *n != 0.0,
             Value::Str(s) => !s.0.text.is_empty(),
@@ -2700,6 +2800,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::None, Value::None) => true,
+        (Value::Host(a), Value::Host(b)) => a.ptr_eq(b),
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
@@ -2914,6 +3015,38 @@ mod display_tests {
         assert!(matches!(NyblIter::next(&mut iter), Some(Value::Int(1))));
         assert!(matches!(Iterator::next(&mut *iter), Some(Value::Int(2))));
         assert!(NyblIter::next(&mut iter).is_none());
+    }
+}
+
+#[cfg(test)]
+mod host_value_tests {
+    use super::*;
+
+    #[test]
+    fn host_values_are_opaque_identity_handles() {
+        let value = HostValue::new("counter", 41_i64);
+        let alias = value.clone();
+        let distinct = HostValue::new("counter", 41_i64);
+
+        assert!(value.is::<i64>());
+        assert_eq!(value.downcast_ref::<i64>(), Some(&41));
+        assert!(value.downcast_ref::<String>().is_none());
+        assert!(value.ptr_eq(&alias));
+        assert_eq!(value, alias);
+        assert_ne!(value, distinct);
+        assert_eq!(format!("{value}"), "<host counter>");
+        assert_eq!(
+            format!("{value:?}"),
+            "HostValue { type_name: \"counter\", .. }"
+        );
+
+        let wrapped = Value::Host(value);
+        assert_eq!(wrapped.type_name(), "counter");
+        assert_eq!(wrapped.inspect(), "<host counter>");
+        assert!(wrapped.is_truthy());
+        assert_eq!(wrapped.ownership_depth(), 0);
+        assert!(values_equal(&wrapped, &wrapped.clone()));
+        assert!(!values_equal(&wrapped, &Value::new_host("counter", 41_i64)));
     }
 }
 

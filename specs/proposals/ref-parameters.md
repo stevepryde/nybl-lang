@@ -71,12 +71,11 @@ behaviour.
   target resolution or snapshot failure happens after ordinary arguments but
   still enters no callee and commits nothing. Side effects in ordinary
   arguments are visible in the copied-in values.
-- **REF-006 — Second-class targets.** Initially, an explicit `ref` argument must
-  name one mutable plain-variable binding. Constants, expressions, index
-  targets, field targets, and closure-captured bindings are not valid targets.
+- **REF-006 — Second-class targets.** An explicit `ref` argument must name a
+  mutable field/index place rooted in one `let` binding. Constants, temporary
+  roots, and closure-captured bindings are not valid targets.
   Place classification must first remove transparent grouping parentheses, so
-  `ref (items)` is the same target as `ref items`, while `ref (items[0])`
-  remains an invalid index target. A call must not use the same binding for two
+  `ref (items)` is the same target as `ref items`. A call must not use the same root binding for two
   `ref` positions. Target records and duplicate checks must use the caller's
   stable binding identity (such as frame and slot), never the source spelling.
   These restrictions keep aliasing unobservable and make statically illegal
@@ -87,7 +86,7 @@ behaviour.
   caller. A lambda or nested function must not capture a `ref` parameter.
 - **REF-008 — Mutating receivers.** A built-in mutating method receiver uses the
   same model implicitly when its receiver is a supported referenceable place.
-  Initially that means a mutable plain variable. Method arguments are evaluated
+  This includes arbitrarily nested field/index places. Method arguments are evaluated
   left to right before the receiver is snapshotted, matching REF-005. Grouping
   parentheses are removed before classification: `(items).push(value)` targets
   `items`, not a temporary. A true-temporary receiver expression is evaluated
@@ -101,24 +100,19 @@ behaviour.
   `[1, 2].pop()` returns `2`; neither writes a container back. This is not an
   implicit `ref` call and has no write-back target. Grouping does not change the
   classification: `([1, 2]).pop()` is still a true-temporary call.
-- **REF-010 — Unsupported nested places.** Syntactic index and field receivers
-  are not treated as true temporaries. Until places are extended, a built-in
-  mutating method on `items[0]` or `record.items` must produce a line-aware,
-  non-fatal error catchable by `try_call`. Its message is
-  `can't mutate through an index or field receiver yet` and its friendly hint is
-  `Assign the value to a variable, mutate that variable, then assign it back.`
-  Grouped forms such as `(items[0]).push(value)` and
-  `(record.items).push(value)` produce the same error. Tracking issue
-  [#43](https://github.com/stevepryde/nybl-lang/issues/43) records delivery; this
-  proposal owns the behavior. A future extension may admit those places for
-  both explicit `ref` arguments and implicit-ref method receivers as one
-  coherent feature.
+- **REF-010 — Nested places.** Syntactic index and field chains are supported
+  uniformly by assignment, explicit `ref`, built-in mutating receivers, and
+  `ref self`. Index expressions evaluate once, an updated leaf rebuilds a
+  candidate root, and only a successful operation commits that root. Two
+  targets rooted in the same binding are rejected conservatively even when
+  their projections differ. Tracking issue
+  [#43](https://github.com/stevepryde/nybl-lang/issues/43) records delivery.
 - **REF-011 — User-defined method receivers.** A user-defined method may
   declare its first parameter as `ref self`. Method-call syntax supplies that
   receiver reference implicitly: `value.update()`, not a call-site `ref`
-  marker. The receiver must be a mutable plain-variable binding and joins any
+  marker. The receiver must be a mutable place and joins any
   explicit ref arguments in the same ordered snapshot/atomic commit. Constants,
-  temporaries, indexes, fields, captures, and duplicate receiver/argument
+  temporary roots, captures, and duplicate receiver/argument root
   identities fail preflight before ordinary argument evaluation. An ordinary
   value receiver is read-only: assigning to it or through one of its
   fields/indexes is a parse error with a `ref self` hint. User-defined dispatch
@@ -154,18 +148,18 @@ behaviour.
   target unchanged. A regression where the final callee operation crosses the
   tracked-memory limit must error and leave every target unchanged rather than
   committing a nominal return value.
-- **AC-REF-005 — Target fence:** Constants, duplicate binding identities,
-  index/field targets, captured bindings, and attempts to capture a `ref`
-  parameter are rejected consistently. Grouping does not alter classification:
-  `ref (value)` is a plain target and `ref (items[0])` is not.
+- **AC-REF-005 — Target fence:** Constants, duplicate root identities,
+  temporary roots, captured bindings, and attempts to capture a `ref`
+  parameter are rejected consistently. Grouping does not alter classification,
+  and nested index/field targets are accepted.
 - **AC-REF-006 — Forwarding:** Forwarding a `ref` parameter is valid and
   transactional across both call frames. Inner success updates only the outer
   staged local; a later outer error still rolls back the original caller.
 - **AC-REF-007 — Method receivers:** `(items).push(value)` writes back to
   `items`; `[1, 2].push(3)` returns `none` and discards its temporary mutation;
   `([1, 2]).pop()` returns `2` and discards its temporary mutation; and grouped
-  or ungrouped index/field receivers produce the REF-010 diagnostic and hint.
-  A user-defined `ref self` receiver updates a mutable variable transactionally
+  nested index/field receivers write back atomically.
+  A user-defined `ref self` receiver updates a mutable place transactionally
   without a call-site marker, joins explicit ref arguments in the same
   transaction, and rejects invalid or duplicate targets before argument side
   effects. Mutation through an ordinary value receiver is a parse error.

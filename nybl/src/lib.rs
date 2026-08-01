@@ -79,14 +79,15 @@
 //! print(count)    // 1
 //! ```
 //!
-//! A reference argument must be a distinct mutable plain-variable binding.
+//! A reference argument must be a distinct mutable field/index place rooted in
+//! a `let` binding.
 //! The callee receives a staged copy; every reference target commits together
 //! only after a normal return and rolls back together on runtime or resource
 //! errors. Reference parameters may be forwarded but not captured. Built-in
 //! and host functions are value-only.
 //!
 //! User-defined methods may declare `ref self` to update a mutable
-//! plain-variable receiver. Method-call syntax supplies that reference
+//! place receiver. Method-call syntax supplies that reference
 //! implicitly (`counter.increment()`); the receiver joins explicit reference
 //! arguments in the same transaction. Ordinary `self` receivers are read-only,
 //! and assigning through one is a parse error with a `ref self` hint.
@@ -208,7 +209,7 @@ pub use error::NyblWarning;
 pub use instance::{EntryPoint, NyblInstance};
 pub use parser::{ParamMode, Stmt, count_instructions};
 pub use ref_params::{validate_call_modes, validate_value_only_call_modes};
-pub use value::Value;
+pub use value::{HostValue, Value};
 pub use value_conversion::{FromValue, IntoValue, ValueConversionError, ValuePathSegment};
 
 /// The core pattern matcher. Re-exported so engines beyond the
@@ -278,6 +279,23 @@ impl Default for NyblLimits {
 pub trait NyblHost {
     /// Called for unknown function names. Return `None` = not handled.
     fn call(&mut self, name: &str, args: &[Value], line: u32) -> Option<Result<Value, NyblError>>;
+
+    /// Called for a non-common method on an opaque [`HostValue`]. Return
+    /// `None` when this host does not implement the method.
+    ///
+    /// Host methods are value-only calls. Any mutation they perform is an
+    /// external host side effect and is not part of Nybl's `ref` transaction
+    /// or rollback semantics.
+    fn call_method(
+        &mut self,
+        receiver: &HostValue,
+        method: &str,
+        args: &[Value],
+        line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        let _ = (receiver, method, args, line);
+        None
+    }
 
     /// Called by `print()`.
     fn on_print(&mut self, message: &str) {
@@ -1149,6 +1167,154 @@ let item = Box { value: 1 }
 item.set(4)
 print(item.value)"#),
             "4"
+        );
+    }
+
+    #[test]
+    fn nested_places_support_assignment_refs_and_mutating_receivers() {
+        assert_eq!(
+            say(r#"
+struct Bucket { items }
+struct Counter { value }
+
+fn add_many(ref value, ..extra) {
+    value += extra.len()
+    return extra
+}
+
+fn Counter.add(ref self, amount) {
+    self.value += amount
+}
+
+let buckets = [Bucket { items: [10, 20] }]
+buckets[0].items[1] += 2
+let captured = add_many(ref buckets[0].items[0], 7, 8, 9)
+buckets[0].items.push(30)
+
+let rows = [[Counter { value: 1 }]]
+rows[0][0].add(4)
+
+print([buckets[0].items, captured, rows[0][0].value])
+"#),
+            "[[13, 22, 30], [7, 8, 9], 5]"
+        );
+    }
+
+    #[test]
+    fn nested_ref_places_are_atomic_and_unique_by_root() {
+        let error = run_err(
+            r#"
+fn fail(ref value) {
+    value = 99
+    return 1 / 0
+}
+let rows = [[1]]
+fail(ref rows[0][0])
+"#,
+        );
+        assert!(error.contains("Division by zero"), "got: {error}");
+
+        let duplicate = run_err(
+            r#"
+fn swap(ref left, ref right) {}
+let values = [1, 2]
+swap(ref values[0], ref values[1])
+"#,
+        );
+        assert!(duplicate.contains("same variable"), "got: {duplicate}");
+    }
+
+    #[test]
+    fn place_indexes_run_once_before_root_snapshot() {
+        let assignment = run_err("let values = [0, 1]\nvalues[values.pop()] = 9");
+        assert!(assignment.contains("out of bounds"), "got: {assignment}");
+
+        assert_eq!(
+            say(r#"
+let indexes = [0]
+let groups = [[1]]
+groups[indexes.pop()].push(indexes.len())
+print([groups, indexes])
+"#),
+            "[[[1, 0]], []]"
+        );
+    }
+
+    #[test]
+    fn rest_parameters_are_value_only_and_accept_zero_or_many_extras() {
+        assert_eq!(
+            say(r#"
+fn collect(head, ..tail) { return [head, tail] }
+let closure = fn(..items) { return items.len() }
+print([collect(1), collect(1, 2, 3), closure(), closure(4, 5)])
+"#),
+            "[[1, []], [1, [2, 3]], 0, 2]"
+        );
+
+        let error = run_err(
+            r#"
+fn collect(..items) {}
+let value = 1
+collect(ref value)
+"#,
+        );
+        assert!(error.contains("value parameter"), "got: {error}");
+    }
+
+    #[test]
+    fn rest_and_public_surface_syntax_is_strict() {
+        let not_final = parse_err("fn collect(..items, value) {}");
+        assert!(not_final.contains("final parameter"), "got: {not_final}");
+
+        let nested_surface = parse_err("if true { pub { value } }");
+        assert!(
+            nested_surface.contains("module root"),
+            "got: {nested_surface}"
+        );
+
+        let duplicate = parse_err("pub { value }\npub { value }");
+        assert!(
+            duplicate.contains("duplicate public name"),
+            "got: {duplicate}"
+        );
+
+        let ast = parse("fn collect(ref first, ..items) {}\npub { collect }").unwrap();
+        let parser::StmtKind::FnDecl { params, .. } = &ast[0].kind else {
+            panic!("expected function declaration");
+        };
+        assert_eq!(params[0].mode, ParamMode::Ref);
+        assert_eq!(params[1].mode, ParamMode::Rest);
+        assert!(matches!(
+            ast[1].kind,
+            parser::StmtKind::PublicSurface { .. }
+        ));
+    }
+
+    #[test]
+    fn walker_instances_expose_variadic_entry_metadata() {
+        let mut host = TestHost::new();
+        let mut instance = NyblInstance::load(
+            "pub fn collect(first, ..items) { return [first, items] }",
+            &mut host,
+            &test_limits(),
+        )
+        .unwrap();
+        let entry = &instance.entry_points()[0];
+        assert_eq!(entry.name(), "collect");
+        assert_eq!(entry.arity(), 1);
+        assert_eq!(entry.max_arity(), None);
+        assert!(entry.is_variadic());
+        assert!(entry.accepts_arity(3));
+        assert_eq!(
+            instance
+                .call(
+                    "collect",
+                    &[Value::Int(1), Value::Int(2), Value::Int(3)],
+                    &mut host,
+                )
+                .unwrap()
+                .inspect(),
+            "[1, [2, 3]]"
         );
     }
 
@@ -4628,6 +4794,64 @@ print(label(o.Color::Green))"#,
         )
         .unwrap();
         assert_eq!(host.output(), "hi nybl");
+    }
+
+    #[test]
+    fn explicit_public_surfaces_filter_values_functions_and_types() {
+        let module = r#"
+let visible = 1
+let hidden = 2
+let _shown = 3
+struct Visible { value }
+struct Hidden { value }
+fn read_hidden() { return hidden }
+pub { visible, _shown, read_hidden, Visible }
+"#;
+        let mut host = crate::host::StringModuleHost::new([("surface", module)]);
+        run(
+            r#"
+use surface as module
+use surface
+print([module.visible, visible, _shown, module.read_hidden(), Visible { value: 4 }])
+"#,
+            &mut host,
+            &NyblLimits::standard(),
+        )
+        .unwrap();
+        assert_eq!(host.output(), "[1, 1, 3, 2, Visible { value: 4 }]");
+
+        let mut hidden_host = crate::host::StringModuleHost::new([("surface", module)]);
+        let hidden = run(
+            "use surface as module\nprint(module.hidden)",
+            &mut hidden_host,
+            &NyblLimits::standard(),
+        )
+        .unwrap_err();
+        assert!(hidden.message.contains("isn't exported"), "got: {hidden:?}");
+
+        let mut type_host = crate::host::StringModuleHost::new([("surface", module)]);
+        let hidden_type = run(
+            "use surface.{Hidden}",
+            &mut type_host,
+            &NyblLimits::standard(),
+        )
+        .unwrap_err();
+        assert!(
+            hidden_type.message.contains("isn't exported"),
+            "got: {hidden_type:?}"
+        );
+    }
+
+    #[test]
+    fn modules_without_public_surfaces_keep_legacy_private_access() {
+        let mut host = crate::host::StringModuleHost::new([("legacy", "let _private = 9")]);
+        run(
+            "use legacy.{_private}\nprint(_private)",
+            &mut host,
+            &NyblLimits::standard(),
+        )
+        .unwrap();
+        assert_eq!(host.output(), "9");
     }
 
     // ─── column info on runtime errors ───────────────────────────────

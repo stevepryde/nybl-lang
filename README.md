@@ -10,6 +10,9 @@ A small, dynamically-typed, **embeddable** programming language for Rust hosts �
 ## Why Nybl?
 
 - **Embedded-first.** One crate (`nybl-lang`), one trait (`NyblHost`), no runtime dependencies. You wire up the functions you want Nybl to reach; Nybl can't touch anything else.
+- **Opaque host resources.** `HostValue` lets scripts retain host capabilities
+  and call methods through `NyblHost::call_method` without exposing Rust
+  payloads to the language.
 - **Sandboxed by default.** No filesystem, network, clock, or ambient I/O.
   `NyblLimits` caps steps and tracked bytes, and every sandboxed engine also
   enforces a fixed function-call depth. A runaway script halts cleanly with a
@@ -19,12 +22,16 @@ A small, dynamically-typed, **embeddable** programming language for Rust hosts �
   whose `pub fn` entries, globals, modules, callbacks, types, methods, and RNG
   state remain live across host calls.
 - **Explicit in-place APIs.** Second-class `ref` parameters and `ref self`
-  method receivers make caller mutation visible in declarations and commit
-  transactionally on normal return. Ordinary `self` receivers are read-only.
+  method receivers make caller mutation visible in declarations, support deep
+  field/index places, and commit transactionally on normal return. Ordinary
+  `self` receivers are read-only.
   Read the [reference-parameters
   guide](https://nybl-lang.com/docs/functions/reference-parameters/).
 - **`no_std` + WASM.** Core crate builds clean for `wasm32-unknown-unknown` and bare-metal targets. Enable the `no_std` feature for a `libm`-backed math facade.
-- **Small, stable grammar.** Functions, closures, arrays, dicts, structs, enums, pattern matching, string interpolation, modules, `Result` / `Iter` built-ins. Deliberately small — easy to teach, easy for tooling to target.
+- **Small, stable grammar.** Functions and variadic closures, arrays, dicts,
+  structs, enums, pattern matching, string interpolation, explicit module
+  surfaces, and `Result` / `Iter` built-ins. Deliberately small — easy to teach,
+  easy for tooling to target.
 - **Helpful errors.** Parse and runtime errors include the source snippet, a caret under the offending column, and `hint:` suggestions (`"I don't know what 'pritn' is — did you mean 'print'?"`).
 
 ## Three engines, one language
@@ -176,6 +183,12 @@ deterministic `BTreeMap<String, T>`. The JSON-like `nybl_value!` macro builds
 nested arrays and dictionaries and returns a conversion `Result`, preserving
 Nybl's value-depth checks and nested error paths.
 
+For opaque resources, return `Value::new_host("type", payload)` and implement
+`NyblHost::call_method`. Handles compare by identity, display as `<host type>`,
+and keep host-side mutation outside Nybl's transaction and memory-accounting
+semantics. See [Opaque host values and
+methods](https://nybl-lang.com/docs/embedding/#opaque-host-values-and-methods).
+
 ## WASM / no_std
 
 Nybl builds clean for `wasm32-unknown-unknown`. Walker + VM + libm + `lol_alloc` as `#[global_allocator]` ships at ~355 KB stripped.
@@ -206,7 +219,7 @@ until an engine mutation copies their backing storage into its own account.
 - [`nybl-sys`](nybl-sys/) — `StdHost`, the default OS-backed host
 - [`nybl-cli`](nybl-cli/) — the `nybl` command-line tool
 
-See [CHANGELOG.md](CHANGELOG.md) for the complete `0.4.0` release notes and
+See [CHANGELOG.md](CHANGELOG.md) for the complete `0.4.1` release notes and
 the publishing order for the crates.
 
 ## Website

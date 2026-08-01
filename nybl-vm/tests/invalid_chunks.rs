@@ -600,6 +600,56 @@ fn parameter_binding_metadata_must_match_names_and_slots() {
 }
 
 #[test]
+fn rest_parameter_metadata_must_be_unique_and_final() {
+    let function = |modes: Vec<ParamMode>| FnDef {
+        name: "rest".into(),
+        params: (0..modes.len()).map(|index| format!("p{index}")).collect(),
+        param_modes: modes.clone(),
+        chunk: Rc::new(Chunk {
+            code: vec![Instr::ReturnNone],
+            lines: vec![0],
+            slot_count: modes.len() as u32,
+            parameter_slots: (0..modes.len() as u32).map(SlotIdx).collect(),
+            ..Chunk::new()
+        }),
+        slot_count: modes.len() as u32,
+        capture_names: vec![],
+        capture_sources: vec![],
+    };
+    let outer = |function| Chunk {
+        code: vec![Instr::DefineFn(FnIdx(0)), Instr::Halt],
+        lines: vec![1, 0],
+        functions: vec![function],
+        ..Chunk::new()
+    };
+
+    let non_final = execution_error(outer(function(vec![ParamMode::Rest, ParamMode::Value])));
+    assert!(
+        non_final
+            .message
+            .contains("invalid rest-parameter metadata")
+    );
+    let duplicate = execution_error(outer(function(vec![ParamMode::Rest, ParamMode::Rest])));
+    assert!(
+        duplicate
+            .message
+            .contains("invalid rest-parameter metadata")
+    );
+}
+
+#[test]
+fn public_surface_metadata_must_not_repeat_names() {
+    let chunk = Chunk {
+        code: vec![Instr::Halt],
+        lines: vec![0],
+        public_surface: Some(vec!["same".into(), "same".into()]),
+        ..Chunk::new()
+    };
+    let error = execution_error(chunk);
+    assert!(error.message.contains("duplicate name `same`"));
+}
+
+#[test]
 fn trusted_vm_api_checks_every_fused_local_slot_instruction() {
     let instructions = [
         Instr::AddLocals(SlotIdx(0), SlotIdx(0)),

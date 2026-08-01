@@ -21,8 +21,8 @@ use crate::chunk::{
     CallSite, CallSiteIdx, CaptureSource, Chunk, CodeOffset, ConstIdx, Constant,
     ConstructFieldsIdx, EnumConstructShape, EnumDef, EnumIdx, EnumVariantDef, EnumVariantShape,
     FnDef, FnIdx, InPlaceAssignOp, Instr, InterpIdx, InterpPart, InterpRecipe, LoopRange,
-    LoopStateKind, NameIdx, NamespaceIdx, NamespaceRef, PatternIdx, PatternRecipe, RefArgTarget,
-    SlotIdx, StructDef, StructIdx,
+    LoopStateKind, NameIdx, NamespaceIdx, NamespaceRef, PatternIdx, PatternRecipe, PlaceIdx,
+    PlaceProjectionRecipe, PlaceRecipe, RefArgTarget, SlotIdx, StructDef, StructIdx,
 };
 use nybl::parser::{MatchArm, Pattern, VariantKind};
 
@@ -95,6 +95,12 @@ struct Compiler {
     /// the enclosing lambda's capture list.
     runtime_bindings: Vec<Vec<String>>,
     root_function_visibility: BTreeMap<u32, Visibility>,
+}
+
+#[derive(Clone)]
+enum PlaceProjectionExpr {
+    Index(Expr),
+    Field(String),
 }
 
 struct LoopCtx {
@@ -433,7 +439,10 @@ impl Compiler {
                 }
                 Some(match &arg.value.kind {
                     ExprKind::Ident(name) => RefArgTarget::Binding(self.namespace_ref(name)),
-                    _ => RefArgTarget::Invalid,
+                    _ => match self.add_expr_place(&arg.value) {
+                        Some(place) => RefArgTarget::Place(place),
+                        None => RefArgTarget::Invalid,
+                    },
                 })
             })
             .collect();
@@ -443,6 +452,68 @@ impl Compiler {
             ref_targets,
         });
         idx
+    }
+
+    fn decompose_place_expr(
+        expr: &Expr,
+        projections: &mut Vec<PlaceProjectionExpr>,
+    ) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(name.clone()),
+            ExprKind::Index { object, index } => {
+                let root = Self::decompose_place_expr(object, projections)?;
+                projections.push(PlaceProjectionExpr::Index((**index).clone()));
+                Some(root)
+            }
+            ExprKind::FieldAccess { object, field } => {
+                let root = Self::decompose_place_expr(object, projections)?;
+                projections.push(PlaceProjectionExpr::Field(field.clone()));
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+
+    fn add_place_parts(&mut self, root: &str, projections: &[PlaceProjectionExpr]) -> PlaceIdx {
+        let root = self.namespace_ref(root);
+        let projections = projections
+            .iter()
+            .map(|projection| match projection {
+                PlaceProjectionExpr::Index(_) => PlaceProjectionRecipe::Index,
+                PlaceProjectionExpr::Field(field) => {
+                    PlaceProjectionRecipe::Field(self.add_name(field))
+                }
+            })
+            .collect();
+        let idx = PlaceIdx(self.chunk.places.len() as u32);
+        self.chunk.places.push(PlaceRecipe { root, projections });
+        idx
+    }
+
+    fn add_expr_place(&mut self, expr: &Expr) -> Option<PlaceIdx> {
+        let mut projections = Vec::new();
+        let root = Self::decompose_place_expr(expr, &mut projections)?;
+        Some(self.add_place_parts(&root, &projections))
+    }
+
+    fn compile_place_indices(
+        &mut self,
+        projections: &[PlaceProjectionExpr],
+    ) -> Result<(), NyblError> {
+        for projection in projections {
+            if let PlaceProjectionExpr::Index(index) = projection {
+                self.compile_expr(index)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compile_expr_place_indices(&mut self, expr: &Expr) -> Result<(), NyblError> {
+        let mut projections = Vec::new();
+        if Self::decompose_place_expr(expr, &mut projections).is_some() {
+            self.compile_place_indices(&projections)?;
+        }
+        Ok(())
     }
 
     fn add_namespace_ref(&mut self, name: &str) -> NamespaceIdx {
@@ -746,6 +817,15 @@ impl Compiler {
                 self.emit(Instr::Use(idx), line);
             }
 
+            StmtKind::PublicSurface { names } => {
+                let surface = self.chunk.public_surface.get_or_insert_with(Vec::new);
+                for name in names {
+                    if !surface.contains(name) {
+                        surface.push(name.clone());
+                    }
+                }
+            }
+
             StmtKind::StructDecl { name, fields } => {
                 let def = StructDef {
                     name: name.clone(),
@@ -903,67 +983,42 @@ impl Compiler {
             }
 
             AssignTarget::Index { object, index } => {
-                // Mirror tree-walker: only bare Ident objects are
-                // assignable; anything else is a compile-time error.
-                let name = match &object.kind {
-                    ExprKind::Ident(n) => n.clone(),
-                    _ => {
-                        return Err(err(
+                let mut projections = Vec::new();
+                let root =
+                    Self::decompose_place_expr(object, &mut projections).ok_or_else(|| {
+                        err(
                             line,
                             "Can only assign to indexed variables (like `arr[0] = val`)",
-                        ));
-                    }
-                };
-                let slot = self.resolve_local_slot(&name);
-                let name_idx = self.add_name(&name);
-                if slot.is_none() {
-                    self.note_free_var(&name);
-                }
-                let target = slot
-                    .map(crate::chunk::AssignBack::Slot)
-                    .unwrap_or(crate::chunk::AssignBack::Name(name_idx));
-
-                // Match the walker/AOT: RHS first, then index, then read the
-                // current element (for compound ops) and mutate the live
-                // binding. The target-aware opcode performs the last two
-                // steps without ever cloning the receiver onto the stack.
+                        )
+                    })?;
+                projections.push(PlaceProjectionExpr::Index(index.clone()));
+                let place = self.add_place_parts(&root, &projections);
                 self.compile_expr(value)?;
-                self.compile_expr(index)?;
+                self.compile_place_indices(&projections)?;
                 self.emit(
-                    Instr::SetIndexInPlace {
-                        target,
+                    Instr::AssignPlace {
+                        place,
                         op: in_place_assign_op(*op),
                     },
                     line,
                 );
             }
             AssignTarget::Field { object, field } => {
-                // Only bare-`Ident` objects are assignable — the
-                // write-back goes through the same fast/slow
-                // fork as regular assignment.
-                let name = match &object.kind {
-                    ExprKind::Ident(n) => n.clone(),
-                    _ => {
-                        return Err(err(
+                let mut projections = Vec::new();
+                let root =
+                    Self::decompose_place_expr(object, &mut projections).ok_or_else(|| {
+                        err(
                             line,
                             "Can only assign to fields of named variables (like `p.x = val`)",
-                        ));
-                    }
-                };
-                let slot = self.resolve_local_slot(&name);
-                let name_idx = self.add_name(&name);
-                let field_idx = self.add_name(field);
-                if slot.is_none() {
-                    self.note_free_var(&name);
-                }
-                let target = slot
-                    .map(crate::chunk::AssignBack::Slot)
-                    .unwrap_or(crate::chunk::AssignBack::Name(name_idx));
+                        )
+                    })?;
+                projections.push(PlaceProjectionExpr::Field(field.clone()));
+                let place = self.add_place_parts(&root, &projections);
                 self.compile_expr(value)?;
+                self.compile_place_indices(&projections)?;
                 self.emit(
-                    Instr::FieldSetInPlace {
-                        target,
-                        field: field_idx,
+                    Instr::AssignPlace {
+                        place,
                         op: in_place_assign_op(*op),
                     },
                     line,
@@ -1120,6 +1175,14 @@ impl Compiler {
                         self.compile_expr(&arg.value)?;
                     }
                 }
+                // Explicit ref paths resolve after all ordinary arguments,
+                // in ref-parameter order. Their root mutability was already
+                // encoded for preflight in the call-site recipe.
+                for arg in args {
+                    if arg.mode == ParamMode::Ref {
+                        self.compile_expr_place_indices(&arg.value)?;
+                    }
+                }
                 self.emit(Instr::CallPrepared { site }, line);
             }
 
@@ -1130,15 +1193,21 @@ impl Compiler {
             } => {
                 let site = self.add_call_site(args);
                 let method_idx = self.add_name(method);
-                let nested_place = matches!(
-                    &object.kind,
-                    ExprKind::Index { .. } | ExprKind::FieldAccess { .. }
-                );
                 if let ExprKind::Ident(name) = &object.kind {
                     let target = self.namespace_ref(name);
                     self.emit(
                         Instr::PrepareMethodNamed {
                             target,
+                            method: method_idx,
+                            site,
+                        },
+                        line,
+                    );
+                } else if let Some(place) = self.add_expr_place(object) {
+                    self.compile_expr_place_indices(object)?;
+                    self.emit(
+                        Instr::PrepareMethodPlace {
+                            place,
                             method: method_idx,
                             site,
                         },
@@ -1150,7 +1219,7 @@ impl Compiler {
                         Instr::PrepareMethodValue {
                             method: method_idx,
                             site,
-                            nested_place,
+                            nested_place: false,
                         },
                         line,
                     );
@@ -1158,6 +1227,11 @@ impl Compiler {
                 for arg in args {
                     if arg.mode == ParamMode::Value {
                         self.compile_expr(&arg.value)?;
+                    }
+                }
+                for arg in args {
+                    if arg.mode == ParamMode::Ref {
+                        self.compile_expr_place_indices(&arg.value)?;
                     }
                 }
                 self.emit(Instr::CallPrepared { site }, line);

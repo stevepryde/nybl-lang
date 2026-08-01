@@ -49,7 +49,7 @@ Informal EBNF. Whitespace is insignificant *except* for newlines, which auto-ins
 program     = statement*
 statement   = letDecl | constDecl | assign | ifStmt | whileStmt | repeatStmt
             | forStmt | fnDecl | returnStmt | breakStmt | continueStmt
-            | useStmt | structDecl | enumDecl | methodDecl
+            | useStmt | publicSurface | structDecl | enumDecl | methodDecl
             | exprStmt
 
 letDecl     = "let" IDENT "=" expr
@@ -71,6 +71,7 @@ useStmt     = "use" path
             | "use" path "as" IDENT
             | "use" path "." "{" IDENT ("," IDENT)* "}" "as" IDENT
 path        = IDENT ("." IDENT)*
+publicSurface = "pub" "{" (IDENT ("," IDENT)* ","?)? "}"
 
 structDecl  = "struct" IDENT "{" fields? "}"
 fields      = IDENT ("," IDENT)*
@@ -128,27 +129,32 @@ arrayPattern   = "[" patternList? arrayRest? "]"
 patternList    = pattern ("," pattern)*
 arrayRest      = ".." | ".." IDENT
 
-params      = param ("," param)*
-param       = "ref"? IDENT
+params      = fixedParam ("," fixedParam)* ("," restParam)? | restParam
+fixedParam  = "ref"? IDENT
+restParam   = ".." IDENT
 args        = arg ("," arg)*
 arg         = "ref"? expr
 ```
 
 `INT` is an exact signed 64-bit integer after unary parsing. Decimal magnitudes through `9223372036854775807` are ordinary primary expressions; the boundary spelling `-9223372036854775808` is accepted when unary `-` directly owns that magnitude, including in literal patterns. A bare `9223372036854775808`, `0 - 9223372036854775808`, or any larger magnitude is out of range rather than being converted to a floating-point `number`.
 
-Note: `pub` is accepted only on a named `fn` at the direct program root; it
-marks an entry for the stateful embedding ABI. It is not valid on methods,
-function expressions, or declarations nested in a block or callable.
+`pub fn` is accepted only on a named function at the direct program root and
+marks an entry for the stateful embedding ABI. Separately, a direct module-root
+`pub { name, Type }` statement declares that module's importable allow-list.
+It is inert in the directly executed root.
 
 `ref` marks copy-in/copy-out parameters and normally appears at the same
 positional argument at the call site. A method's first parameter is the
 exception: `fn Point.move(ref self, dx) { ... }` is called as `point.move(dx)`
 because method syntax supplies the receiver reference implicitly. Although the
 grammar accepts an expression after an argument marker so parsing stays
-independent of the dynamic callee, semantic validation requires a mutable,
-uncaptured plain variable. Ordinary method receivers are read-only, and
+independent of the dynamic callee, semantic validation requires a mutable
+field/index place rooted in an uncaptured `let` binding. Ordinary method receivers are read-only, and
 assigning through one is a parse error. See
 [Reference Parameters](/docs/functions/reference-parameters/).
+
+A final `..rest` parameter collects zero or more extra value arguments into an
+array. It is declaration-only, value-only, and must be the last parameter.
 
 `methodDecl`, enum variant `IDENT`s, and `struct` names must start with an
 uppercase letter. `IDENT` bound by `let`, `fn`, parameters, `for`, etc. must

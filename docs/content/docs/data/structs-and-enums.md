@@ -197,8 +197,8 @@ print(p)    // Point { x: 3, y: 4 }
 ```
 
 The call site does not write another `ref`: method syntax supplies the receiver
-implicitly. A mutable receiver must be a mutable plain-variable binding, and it
-uses the same transactional copy-in/copy-out rules as an explicit [`ref`
+implicitly. A mutable receiver may be a field/index place rooted in a `let`
+binding, and it uses the same transactional copy-in/copy-out rules as an explicit [`ref`
 parameter](/docs/functions/reference-parameters/). A normal return commits it;
 an error rolls it back.
 

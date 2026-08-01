@@ -4,7 +4,7 @@ use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use std::{collections::BTreeMap, format, string::String, vec::Vec};
 
 use crate::value::{BUILTIN_MODULE_PATH, EnumPayload};
-use crate::{Value, ValueConversionError};
+use crate::{HostValue, Value, ValueConversionError};
 
 use super::FromValue;
 
@@ -17,6 +17,21 @@ impl<'value> FromValue<'value> for &'value Value {
 impl FromValue<'_> for Value {
     fn from_value(value: &Value) -> Result<Self, ValueConversionError> {
         Ok(value.clone())
+    }
+}
+
+impl<'value> FromValue<'value> for &'value HostValue {
+    fn from_value(value: &'value Value) -> Result<Self, ValueConversionError> {
+        match value {
+            Value::Host(value) => Ok(value),
+            other => Err(ValueConversionError::type_mismatch("host value", other)),
+        }
+    }
+}
+
+impl FromValue<'_> for HostValue {
+    fn from_value(value: &Value) -> Result<Self, ValueConversionError> {
+        <&HostValue>::from_value(value).cloned()
     }
 }
 

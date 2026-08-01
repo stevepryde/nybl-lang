@@ -19,7 +19,7 @@ Nybl dispatches methods with `.name(args...)`. Every built-in method on primitiv
 ## Mutating receivers
 
 Array methods such as `push`, `pop`, `insert`, `remove`, `reverse`, and `sort`
-mutate a mutable plain-variable receiver using the same transactional
+mutate a mutable place rooted in a `let` binding using the same transactional
 copy-in/copy-out model as a [`ref`
 parameter](/docs/functions/reference-parameters/). Method
 arguments run first, then Nybl snapshots the receiver, and a normal return writes
@@ -27,11 +27,9 @@ the updated value back.
 
 A genuine temporary is allowed and its ordinary result is preserved, but its
 mutation has nowhere to be stored: `([1, 2]).pop()` returns `2`, while
-`[1, 2].push(3)` returns `none`. An index or field receiver is not treated as a
-temporary because silently discarding that mutation is error-prone. Until those
-places become referenceable, `groups[0].push(x)` and
-`record.items.push(x)` raise a catchable error with an assign-mutate-reassign
-hint.
+`[1, 2].push(3)` returns `none`. Index and field receivers are write-back
+places, so `groups[0].push(x)` and `record.items.push(x)` update their root
+binding atomically.
 
 User-defined methods choose their receiver mode explicitly. An ordinary `self`
 is a read-only value snapshot; assigning through it is a parse error. Declare
@@ -50,19 +48,34 @@ print(counter.amount)    // 7
 ```
 
 The receiver marker appears only in the declaration: `counter.add(4)`, not
-`ref counter.add(4)`. The receiver must be a mutable plain-variable binding.
+`ref counter.add(4)`. The receiver must be a mutable field/index place rooted
+in a `let` binding.
 It is snapshotted after ordinary arguments, commits on a normal return, and
 rolls back on an error. A method may also declare explicit `ref` parameters
 after its receiver; all receiver and argument targets must be distinct and
 commit as one transaction.
 
+## Opaque host methods
+
+An embedder can return an opaque `HostValue` and implement its methods through
+`NyblHost::call_method`. These calls use the same `value.method(args...)`
+syntax, but their effects belong to the host: they do not write a new receiver
+back into a Nybl variable and are not rolled back by `ref` transactions or
+runtime errors. Arguments are value-only.
+
+Host values have a host-defined type name and a fixed, payload-hiding display:
+`handle.type()` may return `"file"`, while `handle.to_str()` and
+`handle.inspect()` return `"<host file>"`. Separate handles compare by
+identity, not by their hidden payload. See the [Rust embedding
+example](/docs/embedding/#opaque-host-values-and-methods).
+
 ## Methods on every value
 
-Three methods work on any value — introspection + stringification. They're dispatched before the type-specific tables, so they're always available:
+Five methods work on any value — introspection, stringification, and optional-value checks. They're dispatched before the type-specific and host method tables, so they're always available:
 
 | Method | Returns | Notes |
 |--------|---------|-------|
-| `x.type()` | string | One of `"int"`, `"number"`, `"string"`, `"bool"`, `"none"`, `"array"`, `"dict"`, `"fn"`, `"struct"`, `"enum"`, `"module"`, `"iter"` |
+| `x.type()` | string | A built-in type name, a declared struct/enum name, or an opaque host value's host-defined name |
 | `x.to_str()` | string | Display repr — same as what `print(x)` would emit for a single arg |
 | `x.inspect()` | string | Debug repr — strings are wrapped in `"..."`, nested strings stay quoted inside arrays / dicts |
 | `x.is_none()` | bool | `true` iff `x` is the `none` value. Equivalent to `x == none`. |
@@ -153,13 +166,14 @@ See [Strings](/docs/data/strings/) for worked examples.
 
 See [Arrays](/docs/data/arrays/) for worked examples.
 
-Mutating methods write back when the receiver is a variable (`items.push(x)`).
+Mutating methods write back when the receiver is a mutable place rooted in a
+`let` binding (`items.push(x)`, `groups[0].push(x)`, or
+`holder.items.pop()`).
 Calling one on a genuine temporary, such as `[1].push(2)` or
 `make_items().pop()`, is legal; the temporary is mutated and then discarded.
-An index or field read is not yet a write-back place, so
-`dict["items"].push(x)` and `holder.items.pop()` raise a runtime error instead
-of silently losing the mutation. Assign the nested array to a variable first,
-then explicitly store it back when needed.
+Nested receiver projections are evaluated once and the updated leaf is written
+back atomically through the root. If the method errors, the whole root remains
+unchanged.
 
 | Method | Returns | Description |
 |--------|---------|-------------|

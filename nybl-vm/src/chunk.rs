@@ -152,6 +152,13 @@ pub enum Instr {
         target: AssignBack,
         op: InPlaceAssignOp,
     },
+    /// Apply an assignment through an arbitrary identifier-rooted place. The
+    /// RHS and each dynamic index projection are evaluated before this
+    /// instruction; the place recipe supplies the root and field projections.
+    AssignPlace {
+        place: PlaceIdx,
+        op: InPlaceAssignOp,
+    },
 
     // ─── String interpolation ─────────────────────────────────────
     /// Interpolate using a recipe from the chunk's interp pool. Each
@@ -206,6 +213,14 @@ pub enum Instr {
     /// arguments have run.
     PrepareMethodNamed {
         target: NamespaceRef,
+        method: NameIdx,
+        site: CallSiteIdx,
+    },
+    /// Resolve an identifier-rooted field/index receiver before ordinary
+    /// arguments execute, retaining its exact place for mutating/ref-self
+    /// write-back.
+    PrepareMethodPlace {
+        place: PlaceIdx,
         method: NameIdx,
         site: CallSiteIdx,
     },
@@ -582,6 +597,10 @@ pub struct ConstructFieldsIdx(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CallSiteIdx(pub u32);
 
+/// Index into a chunk's identifier-rooted place recipe pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PlaceIdx(pub u32);
+
 /// Shape of an enum variant's payload at the construction site —
 /// tells the VM how many stack entries to pop.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -615,8 +634,25 @@ pub enum RefArgTarget {
     /// A mutable-binding candidate. Runtime preflight resolves the name form
     /// to an exact scope entry and rejects captures/constants before arguments.
     Binding(NamespaceRef),
+    /// An identifier root followed by zero or more field/index projections.
+    Place(PlaceIdx),
     /// Any expression other than a transparent-grouped plain identifier.
     Invalid,
+}
+
+/// One projection in a compiled mutable place. Index expressions are emitted
+/// as ordinary bytecode and supplied on the value stack; field names remain in
+/// the recipe side table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceProjectionRecipe {
+    Index,
+    Field(NameIdx),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceRecipe {
+    pub root: NamespaceRef,
+    pub projections: Vec<PlaceProjectionRecipe>,
 }
 
 /// Passive metadata for one source call. `arg_modes` retains positional
@@ -741,6 +777,9 @@ pub struct Chunk {
     pub construct_fields: Vec<Vec<String>>,
     /// Positional modes and reference-place recipes for source calls.
     pub call_sites: Vec<CallSite>,
+    /// Identifier-rooted mutable places used by deep assignments, explicit
+    /// ref arguments, and method receivers.
+    pub places: Vec<PlaceRecipe>,
     /// Match patterns referenced by `MatchFail` instructions. Pool entries
     /// are shared because matching may execute the same arm in a hot loop.
     pub patterns: Vec<PatternRecipe>,
@@ -748,6 +787,10 @@ pub struct Chunk {
     /// `Instr::Use`. Holds variable-length fields (path, items,
     /// alias) so the instruction payload stays `Copy`.
     pub use_specs: Vec<UseSpec>,
+    /// `Some` when this module declares one or more `pub { ... }` surfaces.
+    /// The names are unioned in source order. `Some([])` deliberately means
+    /// an explicit empty public surface; `None` preserves legacy exports.
+    pub public_surface: Option<Vec<String>>,
     /// Shared function-local name indexes referenced by `UseSpec` snapshots.
     /// Empty for top-level chunks, whose bindings already live in runtime
     /// scope maps.
@@ -841,6 +884,10 @@ impl Chunk {
 
     pub fn call_site(&self, idx: CallSiteIdx) -> &CallSite {
         &self.call_sites[idx.0 as usize]
+    }
+
+    pub fn place(&self, idx: PlaceIdx) -> &PlaceRecipe {
+        &self.places[idx.0 as usize]
     }
 
     pub fn namespace_ref(&self, idx: NamespaceIdx) -> NamespaceRef {

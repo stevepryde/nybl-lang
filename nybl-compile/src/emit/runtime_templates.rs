@@ -993,6 +993,33 @@ fn __nybl_declaration_alias_mut<'v>(
     /*__NYBL_RUNTIME_VIS__*/args: ::std::vec::Vec<::nybl::value::Value>,
 }
 
+fn __nybl_arity_error(callable: &str, modes: &[::nybl::parser::ParamMode], actual: usize, line: u32) -> ::nybl::error::NyblError {
+    let required = ::nybl::ref_params::required_arity(modes);
+    let expectation = if matches!(modes.last(), Some(::nybl::parser::ParamMode::Rest)) {
+        format!("at least {} argument{}", required, if required == 1 { "" } else { "s" })
+    } else {
+        format!("{} argument{}", required, if required == 1 { "" } else { "s" })
+    };
+    ::nybl::error::NyblError::runtime(format!("`{}` expects {}, but got {}", callable, expectation, actual), line)
+}
+
+fn __nybl_pack_rest_args(
+    mut args: ::std::vec::Vec<::nybl::value::Value>,
+    modes: &[::nybl::parser::ParamMode],
+    line: u32,
+    memory: &::nybl::memory::MemoryContext,
+) -> Result<::std::vec::Vec<::nybl::value::Value>, ::nybl::error::NyblError> {
+    if !::nybl::ref_params::accepts_arity(modes, args.len()) {
+        return Err(__nybl_arity_error("fn", modes, args.len(), line));
+    }
+    if matches!(modes.last(), Some(::nybl::parser::ParamMode::Rest)) {
+        let fixed = ::nybl::ref_params::required_arity(modes);
+        let extras = args.split_off(fixed);
+        args.push(::nybl::value::Value::__try_new_array_in(extras, line, memory)?);
+    }
+    Ok(args)
+}
+
 /*__NYBL_RUNTIME_VIS__*/struct AotClosure {
     /*__NYBL_RUNTIME_VIS__*/callable: ::std::rc::Rc<
         dyn for<'__a> Fn(
@@ -1024,17 +1051,8 @@ fn __nybl_preflight_value_call(
         .self_name
         .as_deref()
         .unwrap_or("fn");
-    if actual_modes.len() != function.params.len() {
-        return Err(::nybl::error::NyblError::runtime(
-            format!(
-                "`{}` expects {} argument{}, but got {}",
-                callable,
-                function.params.len(),
-                if function.params.len() == 1 { "" } else { "s" },
-                actual_modes.len(),
-            ),
-            line,
-        ));
+    if !::nybl::ref_params::accepts_arity(&function.param_modes, actual_modes.len()) {
+        return Err(__nybl_arity_error(callable, &function.param_modes, actual_modes.len(), line));
     }
     ::nybl::validate_call_modes(
         callable,
@@ -1552,6 +1570,69 @@ fn __nybl_field_set(
     }
 }
 
+#[derive(Clone)]
+enum __NyblPlaceStep {
+    Field(&'static str),
+    Index(::nybl::value::Value),
+}
+
+/// Read a leaf from an identifier-rooted field/index place. Projection
+/// expressions have already been evaluated by generated code, so this helper
+/// is deliberately side-effect free.
+fn __nybl_place_get(
+    root: &::nybl::value::Value,
+    steps: &[__NyblPlaceStep],
+    line: u32,
+    memory: &::nybl::memory::MemoryContext,
+) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {
+    let mut value = root.clone();
+    for step in steps {
+        value = match step {
+            __NyblPlaceStep::Field(field) => __nybl_field_get(&value, field, line)?,
+            __NyblPlaceStep::Index(index) =>
+                ::nybl::ops::index_get_in(&value, index, line, memory)?,
+        };
+    }
+    Ok(value)
+}
+
+/// Rebuild an owned root with one nested leaf replaced. All potentially
+/// fallible CoW detach/depth/accounting work happens on this candidate before
+/// generated code writes it into the live root binding.
+fn __nybl_place_set(
+    memory: &::nybl::memory::MemoryContext,
+    root: ::nybl::value::Value,
+    steps: &[__NyblPlaceStep],
+    value: ::nybl::value::Value,
+    line: u32,
+) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {
+    fn replace(
+        memory: &::nybl::memory::MemoryContext,
+        mut owner: ::nybl::value::Value,
+        steps: &[__NyblPlaceStep],
+        value: ::nybl::value::Value,
+        line: u32,
+    ) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {
+        let Some((head, tail)) = steps.split_first() else {
+            return Ok(value);
+        };
+        match head {
+            __NyblPlaceStep::Field(field) => {
+                let child = __nybl_field_get(&owner, field, line)?;
+                let child = replace(memory, child, tail, value, line)?;
+                __nybl_field_set(memory, owner, field, child, line)
+            }
+            __NyblPlaceStep::Index(index) => {
+                let child = ::nybl::ops::index_get_in(&owner, index, line, memory)?;
+                let child = replace(memory, child, tail, value, line)?;
+                ::nybl::ops::index_set_in(&mut owner, index, child, line, memory)?;
+                Ok(owner)
+            }
+        }
+    }
+    replace(memory, root, steps, value, line)
+}
+
 /// Mirror of Evaluator::call_method from nybl-lang: dispatches a
 /// method call to the right family for the receiver's type.
 ///
@@ -1617,6 +1698,13 @@ fn __nybl_call_method(
             let result = __nybl_call_value(ctx, binding, args.to_vec(), line)?;
             Ok((result.value, None))
         }
+        ::nybl::value::Value::Host(value) => match ctx.host.call_method(value, method, args, line) {
+            Some(result) => result.map(|value| (value, None)),
+            None => Err(::nybl::error::NyblError::runtime(
+                ::nybl::error_messages::no_such_method(obj.type_name(), method),
+                line,
+            )),
+        },
         _ => Err(::nybl::error::NyblError::runtime(
             ::nybl::error_messages::no_such_method(obj.type_name(), method),
             line,
@@ -1913,17 +2001,8 @@ impl NyblInstance {
                 0,
             ))?;
         let site = &__NYBL_FUNCTION_SITES[site_id];
-        if args.len() != site.params.len() {
-            return Err(::nybl::error::NyblError::runtime(
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    name,
-                    site.params.len(),
-                    if site.params.len() == 1 { "" } else { "s" },
-                    args.len(),
-                ),
-                0,
-            ));
+        if !::nybl::ref_params::accepts_arity(site.param_modes, args.len()) {
+            return Err(__nybl_arity_error(name, site.param_modes, args.len(), 0));
         }
         ::nybl::validate_call_modes(
             name,
@@ -1975,14 +2054,11 @@ impl NyblInstance {
                 0,
             ));
         }
-        if args.len() != function.params.len() {
-            return Err(::nybl::error::NyblError::runtime(
-                format!(
-                    "Function expects {} argument{}, but got {}",
-                    function.params.len(),
-                    if function.params.len() == 1 { "" } else { "s" },
-                    args.len(),
-                ),
+        if !::nybl::ref_params::accepts_arity(&function.param_modes, args.len()) {
+            return Err(__nybl_arity_error(
+                function.self_name.as_deref().unwrap_or("lambda"),
+                &function.param_modes,
+                args.len(),
                 0,
             ));
         }

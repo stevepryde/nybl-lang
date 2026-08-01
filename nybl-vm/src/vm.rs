@@ -71,7 +71,7 @@ use nybl::{EntryPoint, NyblHost, NyblLimits};
 use crate::chunk::{
     CallSiteIdx, CaptureSource, Chunk, CodeOffset, Constant, EnumConstructShape, EnumIdx,
     EnumVariantShape, FnDef, FnIdx, Instr, InterpPart, LoopStateKind, NameIdx, NamespaceRef,
-    PatternIdx, RefArgTarget, SlotIdx, StructIdx,
+    PatternIdx, PlaceIdx, PlaceProjectionRecipe, RefArgTarget, SlotIdx, StructIdx,
 };
 
 /// Hard cap on call depth; matches the tree-walker.
@@ -337,6 +337,7 @@ enum PreparedCallable {
         entry: Rc<FnEntry>,
         receiver: Value,
         receiver_target: Option<NamespaceRef>,
+        receiver_place: Option<ResolvedPlace>,
     },
     DeferredMethod {
         receiver: Value,
@@ -347,6 +348,10 @@ enum PreparedCallable {
         target: NamespaceRef,
         method: String,
     },
+    PlaceMethodInPlace {
+        place: ResolvedPlace,
+        method: String,
+    },
     /// Builtins and host callables are value-only. Host arity is intentionally
     /// deferred because the embedding trait does not expose signature metadata.
     NamedFallback(String),
@@ -354,11 +359,7 @@ enum PreparedCallable {
 
 impl PreparedCallable {
     fn named_user(name: &str, entry: Rc<FnEntry>) -> Self {
-        if entry
-            .param_modes
-            .iter()
-            .all(|mode| *mode == ParamMode::Value)
-        {
+        if entry.param_modes.iter().all(|mode| *mode != ParamMode::Ref) {
             Self::HostThenUser {
                 name: name.to_string(),
                 entry,
@@ -382,9 +383,30 @@ enum ResolvedRefTarget {
     },
 }
 
+#[derive(Clone)]
+enum ResolvedPlaceProjection {
+    Index(Value),
+    Field(String),
+}
+
+#[derive(Clone)]
+struct ResolvedPlace {
+    target: ResolvedRefTarget,
+    root_recipe: NamespaceRef,
+    root_name: String,
+    root: Value,
+    projections: Vec<ResolvedPlaceProjection>,
+}
+
 struct PreparedRef {
     param: usize,
-    recipe: NamespaceRef,
+    recipe: RefArgTarget,
+    index_count: usize,
+}
+
+enum PreparedReceiverRef {
+    Binding(NamespaceRef),
+    Place(ResolvedPlace),
 }
 
 struct PreparedCall {
@@ -392,13 +414,14 @@ struct PreparedCall {
     callable: PreparedCallable,
     display_name: String,
     refs: Vec<PreparedRef>,
-    receiver_ref: Option<NamespaceRef>,
+    receiver_ref: Option<PreparedReceiverRef>,
     value_count: usize,
+    ref_index_count: usize,
 }
 
 struct PendingWriteBack {
     parameter: usize,
-    target: ResolvedRefTarget,
+    place: ResolvedPlace,
 }
 
 /// Structural equality check for two enum-variant lists.
@@ -502,6 +525,9 @@ enum ImportSlot {
 
 #[derive(Clone)]
 struct ModuleArtifacts {
+    /// Whether the module opted into an explicit `pub { ... }` allow-list.
+    /// Legacy modules retain underscore/selective compatibility rules.
+    explicit_surface: bool,
     /// Top-level `let` bindings, reified as `Value`s. Fns live
     /// in `fn_decls` instead so the importer can register them
     /// in `self.functions` for cross-fn call resolution.
@@ -1330,6 +1356,12 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     }
 
     fn module_binding(&self, module: &nybl::value::NyblModule, name: &str) -> Option<Value> {
+        // The import-time snapshot is the module object's capability surface.
+        // Live-environment lookup refreshes values within that surface; it
+        // must never turn an unselected or private binding into a new member.
+        if !module.bindings.iter().any(|(binding, _)| binding == name) {
+            return None;
+        }
         if let Some((active_module, environment)) = self.frames.last().and_then(|frame| {
             let active_module = frame
                 .defining_environment_module
@@ -2177,6 +2209,31 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     }
                 }
             }
+            Instr::AssignPlace { place, op } => {
+                let index_count = self
+                    .current_chunk()
+                    .place(place)
+                    .projections
+                    .iter()
+                    .filter(|projection| matches!(projection, PlaceProjectionRecipe::Index))
+                    .count();
+                let indices = self.pop_n_values(index_count, line)?;
+                let rhs = self.pop_value(line)?;
+                let resolved =
+                    self.resolve_place_internal(place, indices, 0, line, false, false)?;
+                if nybl::naming::is_constant_name(&resolved.root_name) {
+                    return Err(nybl::error_messages::constant_mutation_error(
+                        &resolved.root_name,
+                        line,
+                    ));
+                }
+                let value = apply_in_place_assign(op, rhs, line, &self.memory, || {
+                    self.place_value_from(&resolved.root, &resolved.projections, line)
+                })?;
+                let mut root = resolved.root.clone();
+                self.write_place_value(&mut root, &resolved.projections, value, line)?;
+                self.store_resolved_target(&resolved.target, root, line)?;
+            }
 
             // ─── String interpolation ────────────────────────────
             Instr::StringInterp(idx) => {
@@ -2229,7 +2286,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 nested_place,
             } => {
                 let receiver = self.pop_value(line)?;
-                self.prepare_method_call(receiver, None, method, site, nested_place, line)?;
+                self.prepare_method_call(receiver, None, None, method, site, nested_place, line)?;
             }
             Instr::PrepareMethodNamed {
                 target,
@@ -2237,6 +2294,24 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 site,
             } => {
                 self.prepare_named_method_call(target, method, site, line)?;
+            }
+            Instr::PrepareMethodPlace {
+                place,
+                method,
+                site,
+            } => {
+                let index_count = self
+                    .current_chunk()
+                    .place(place)
+                    .projections
+                    .iter()
+                    .filter(|projection| matches!(projection, PlaceProjectionRecipe::Index))
+                    .count();
+                let indices = self.pop_n_values(index_count, line)?;
+                let resolved = self.resolve_place(place, indices, 0, line)?;
+                let receiver =
+                    self.place_value_from(&resolved.root, &resolved.projections, line)?;
+                self.prepare_method_call(receiver, None, Some(resolved), method, site, true, line)?;
             }
             Instr::CallPrepared { site } => {
                 return self.call_prepared(site, line);
@@ -2789,10 +2864,12 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_method_call(
         &mut self,
         receiver: Value,
         receiver_target: Option<NamespaceRef>,
+        receiver_place: Option<ResolvedPlace>,
         method_idx: NameIdx,
         site: CallSiteIdx,
         nested_place: bool,
@@ -2845,13 +2922,28 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     entry,
                     receiver,
                     receiver_target,
+                    receiver_place,
                 },
                 format!("{}.{}", type_key.1, method),
                 site,
                 line,
             );
         }
-        if nested_place {
+        if matches!(receiver, Value::Array(_))
+            && methods::is_mutating_method(&method)
+            && let Some(place) = receiver_place
+        {
+            return self.preflight_call(
+                PreparedCallable::PlaceMethodInPlace {
+                    place,
+                    method: method.clone(),
+                },
+                method,
+                site,
+                line,
+            );
+        }
+        if nested_place && receiver_place.is_none() {
             methods::reject_nested_array_mutation(&receiver, &method, line)?;
         }
         self.preflight_call(
@@ -2909,6 +3001,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                             return self.prepare_method_call(
                                 Value::Fn(function),
                                 None,
+                                None,
                                 method_idx,
                                 site,
                                 false,
@@ -2918,6 +3011,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                         if let Some(module) = self.module_alias(&receiver_name).cloned() {
                             return self.prepare_method_call(
                                 Value::Module(module),
+                                None,
                                 None,
                                 method_idx,
                                 site,
@@ -2951,7 +3045,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 line,
             );
         }
-        self.prepare_method_call(receiver, Some(target), method_idx, site, false, line)
+        self.prepare_method_call(receiver, Some(target), None, method_idx, site, false, line)
     }
 
     fn preflight_call(
@@ -2973,29 +3067,24 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             PreparedCallable::UserMethod {
                 entry,
                 receiver_target,
+                receiver_place,
                 ..
             } => {
-                let actual_arity = site.arg_modes.len() + 1;
-                if entry.param_modes.len() != actual_arity {
-                    return Err(error(
-                        line,
-                        format!(
-                            "`{display_name}` expects {} argument{} (including `self`), but got {}",
-                            entry.param_modes.len(),
-                            if entry.param_modes.len() == 1 {
-                                ""
-                            } else {
-                                "s"
-                            },
-                            actual_arity
-                        ),
-                    ));
-                }
-                if entry.param_modes.first() == Some(&ParamMode::Ref) && receiver_target.is_none() {
+                validate_user_arity(
+                    &display_name,
+                    &entry.param_modes,
+                    site.arg_modes.len() + 1,
+                    true,
+                    line,
+                )?;
+                if entry.param_modes.first() == Some(&ParamMode::Ref)
+                    && receiver_target.is_none()
+                    && receiver_place.is_none()
+                {
                     let mut error =
-                        NyblError::runtime("a `ref` method receiver must be a variable", line);
+                        NyblError::runtime("a `ref` method receiver must be a mutable place", line);
                     error.friendly_hint = Some(
-                        "Store the value in a `let` binding before calling this method."
+                        "Store the value in a `let` binding, or call through one of its fields or indexes."
                             .to_string(),
                     );
                     return Err(error);
@@ -3004,27 +3093,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
             PreparedCallable::NamedFallback(_)
             | PreparedCallable::DeferredMethod { .. }
-            | PreparedCallable::NamedMethodInPlace { .. } => None,
+            | PreparedCallable::NamedMethodInPlace { .. }
+            | PreparedCallable::PlaceMethodInPlace { .. } => None,
         };
         if let Some(expected) = expected_modes {
-            if site.arg_modes.len() != expected.len() {
-                return Err(error(
-                    line,
-                    format!(
-                        "`{display_name}` expects {} argument{}, but got {}",
-                        expected.len(),
-                        if expected.len() == 1 { "" } else { "s" },
-                        site.arg_modes.len()
-                    ),
-                ));
-            }
-            for (index, (actual, expected)) in
-                site.arg_modes.iter().zip(expected.iter()).enumerate()
-            {
-                if actual != expected {
-                    return Err(call_mode_error(line, &display_name, index, *expected));
-                }
-            }
+            validate_user_call_modes(&display_name, expected, &site.arg_modes, line)?;
         } else if let Some((index, _)) = site
             .arg_modes
             .iter()
@@ -3041,7 +3114,12 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
 
         if matches!(
             &callable,
-            PreparedCallable::DeferredMethod { .. } | PreparedCallable::NamedMethodInPlace { .. }
+            PreparedCallable::NamedMethodInPlace { .. }
+                | PreparedCallable::PlaceMethodInPlace { .. }
+        ) || matches!(
+            &callable,
+            PreparedCallable::DeferredMethod { receiver, .. }
+                if !matches!(receiver, Value::Host(_))
         ) {
             validate_builtin_method_arity(&display_name, site.arg_modes.len(), line)?;
         }
@@ -3057,35 +3135,56 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 return Err(nybl::ref_params::captured_ref_target(1, line));
             }
         }
+        if let PreparedCallable::PlaceMethodInPlace { place, method } = &callable {
+            methods::reject_constant_array_mutation(&place.root_name, method, line)?;
+            self.validate_mutable_resolved_target(&place.target, &place.root_name, 0, line)?;
+        }
 
         let receiver_ref = match &callable {
             PreparedCallable::UserMethod {
                 entry,
                 receiver_target,
+                receiver_place,
                 ..
             } if entry.param_modes.first() == Some(&ParamMode::Ref) => {
-                let recipe = receiver_target.expect("mutable receiver target was preflighted");
-                let name = self.current_chunk().name(recipe.name_idx());
-                if nybl::naming::is_constant_name(name) {
-                    return Err(nybl::error_messages::constant_mutation_error(name, line));
+                if let Some(place) = receiver_place {
+                    self.validate_mutable_resolved_target(
+                        &place.target,
+                        &place.root_name,
+                        0,
+                        line,
+                    )?;
+                    Some(PreparedReceiverRef::Place(place.clone()))
+                } else {
+                    let recipe = receiver_target.expect("mutable receiver target was preflighted");
+                    let name = self.current_chunk().name(recipe.name_idx());
+                    if nybl::naming::is_constant_name(name) {
+                        return Err(nybl::error_messages::constant_mutation_error(name, line));
+                    }
+                    if recipe.slot_idx().is_none()
+                        && self
+                            .frames
+                            .last()
+                            .is_some_and(|frame| frame.captured_names.contains(name))
+                    {
+                        return Err(nybl::ref_params::captured_ref_target(1, line));
+                    }
+                    Some(PreparedReceiverRef::Binding(recipe))
                 }
-                if recipe.slot_idx().is_none()
-                    && self
-                        .frames
-                        .last()
-                        .is_some_and(|frame| frame.captured_names.contains(name))
-                {
-                    return Err(nybl::ref_params::captured_ref_target(1, line));
-                }
-                Some(recipe)
             }
             _ => None,
         };
         let mut seen = BTreeSet::new();
-        if let Some(recipe) = receiver_ref {
-            let identity = match recipe.slot_idx() {
-                Some(slot) => (0_u8, slot.0),
-                None => (1_u8, recipe.name_idx().0),
+        if let Some(receiver) = &receiver_ref {
+            let identity = match receiver {
+                PreparedReceiverRef::Binding(recipe) => match recipe.slot_idx() {
+                    Some(slot) => (0_u8, slot.0),
+                    None => (1_u8, recipe.name_idx().0),
+                },
+                PreparedReceiverRef::Place(place) => match place.root_recipe.slot_idx() {
+                    Some(slot) => (0_u8, slot.0),
+                    None => (1_u8, place.root_recipe.name_idx().0),
+                },
             };
             seen.insert(identity);
         }
@@ -3096,20 +3195,26 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .zip(site.ref_targets.iter())
             .enumerate()
         {
-            if *mode == ParamMode::Value {
+            if *mode != ParamMode::Ref {
                 continue;
             }
             let recipe = match target {
-                Some(RefArgTarget::Binding(recipe)) => *recipe,
+                Some(RefArgTarget::Binding(recipe)) => RefArgTarget::Binding(*recipe),
+                Some(RefArgTarget::Place(place)) => RefArgTarget::Place(*place),
                 Some(RefArgTarget::Invalid) | None => {
                     return Err(invalid_ref_target_error(line, index));
                 }
             };
-            let name = self.current_chunk().name(recipe.name_idx());
+            let root = match recipe {
+                RefArgTarget::Binding(root) => root,
+                RefArgTarget::Place(place) => self.current_chunk().place(place).root,
+                RefArgTarget::Invalid => unreachable!(),
+            };
+            let name = self.current_chunk().name(root.name_idx());
             if nybl::naming::is_constant_name(name) {
                 return Err(nybl::error_messages::constant_mutation_error(name, line));
             }
-            if recipe.slot_idx().is_none()
+            if root.slot_idx().is_none()
                 && self
                     .frames
                     .last()
@@ -3117,9 +3222,23 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             {
                 return Err(nybl::ref_params::captured_ref_target(index + 1, line));
             }
-            let identity = match recipe.slot_idx() {
+            let root_exists = match root.slot_idx() {
+                Some(slot) => self
+                    .frames
+                    .last()
+                    .is_some_and(|frame| frame.slots.get(slot.0 as usize).is_some()),
+                None => self
+                    .current_scopes()
+                    .iter()
+                    .rev()
+                    .any(|scope| scope.contains_key(name)),
+            };
+            if !root_exists {
+                return Err(invalid_ref_target_error(line, index));
+            }
+            let identity = match root.slot_idx() {
                 Some(slot) => (0_u8, slot.0),
-                None => (1_u8, recipe.name_idx().0),
+                None => (1_u8, root.name_idx().0),
             };
             if !seen.insert(identity) {
                 return Err(duplicate_ref_target_error(line));
@@ -3127,6 +3246,16 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             refs.push(PreparedRef {
                 param: index,
                 recipe,
+                index_count: match recipe {
+                    RefArgTarget::Place(place) => self
+                        .current_chunk()
+                        .place(place)
+                        .projections
+                        .iter()
+                        .filter(|projection| matches!(projection, PlaceProjectionRecipe::Index))
+                        .count(),
+                    RefArgTarget::Binding(_) | RefArgTarget::Invalid => 0,
+                },
             });
         }
         let value_count = site
@@ -3134,6 +3263,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .iter()
             .filter(|mode| **mode == ParamMode::Value)
             .count();
+        let ref_index_count = refs.iter().map(|prepared| prepared.index_count).sum();
         self.frames
             .last_mut()
             .expect("frame present")
@@ -3145,6 +3275,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 refs,
                 receiver_ref,
                 value_count,
+                ref_index_count,
             });
         Ok(())
     }
@@ -3160,13 +3291,14 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         if prepared.site != site {
             return Err(error(line, "VM: prepared call-site mismatch"));
         }
-        let ordinary = self.pop_n_values(prepared.value_count, line)?;
+        let stacked = self.pop_n_values(prepared.value_count + prepared.ref_index_count, line)?;
+        let (ordinary, ref_indices) = stacked.split_at(prepared.value_count);
         let modes = self.current_chunk().call_site(site).arg_modes.clone();
         let param_offset = usize::from(matches!(
             &prepared.callable,
             PreparedCallable::UserMethod { .. }
         ));
-        let mut ordinary = ordinary.into_iter();
+        let mut ordinary = ordinary.iter().cloned();
         let mut full_args: Vec<Option<Value>> =
             core::iter::repeat_with(|| None).take(modes.len()).collect();
         for (index, mode) in modes.iter().enumerate() {
@@ -3178,28 +3310,46 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let mut pending =
             Vec::with_capacity(prepared.refs.len() + usize::from(prepared.receiver_ref.is_some()));
         let receiver_snapshot = if let Some(recipe) = prepared.receiver_ref {
-            let (target, snapshot) = self.resolve_ref_target(recipe, 0, line)?;
+            let place = match recipe {
+                PreparedReceiverRef::Binding(recipe) => {
+                    let (target, root) = self.resolve_ref_target(recipe, 0, line)?;
+                    ResolvedPlace {
+                        target,
+                        root_recipe: recipe,
+                        root_name: self.current_chunk().name(recipe.name_idx()).to_string(),
+                        root,
+                        projections: Vec::new(),
+                    }
+                }
+                PreparedReceiverRef::Place(place) => self.refresh_resolved_place(place, line)?,
+            };
+            let snapshot = self.place_value_from(&place.root, &place.projections, line)?;
             pending.push(PendingWriteBack {
                 parameter: 0,
-                target,
+                place,
             });
             Some(snapshot)
         } else {
             None
         };
+        let mut ref_index_offset = 0;
         for prepared_ref in prepared.refs {
-            let (target, snapshot) =
-                self.resolve_ref_target(prepared_ref.recipe, prepared_ref.param, line)?;
+            let next_offset = ref_index_offset + prepared_ref.index_count;
+            let indices = ref_indices[ref_index_offset..next_offset].to_vec();
+            ref_index_offset = next_offset;
+            let place =
+                self.resolve_ref_recipe(prepared_ref.recipe, indices, prepared_ref.param, line)?;
+            let snapshot = self.place_value_from(&place.root, &place.projections, line)?;
             if pending
                 .iter()
-                .any(|write_back: &PendingWriteBack| write_back.target == target)
+                .any(|write_back: &PendingWriteBack| write_back.place.target == place.target)
             {
                 return Err(duplicate_ref_target_error(line));
             }
             full_args[prepared_ref.param] = Some(snapshot);
             pending.push(PendingWriteBack {
                 parameter: prepared_ref.param + param_offset,
-                target,
+                place,
             });
         }
         let args = full_args
@@ -3238,6 +3388,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 debug_assert!(pending.is_empty());
                 return self.call_method_in_place_args(target, &method, args, line);
             }
+            PreparedCallable::PlaceMethodInPlace { place, method } => {
+                debug_assert!(pending.is_empty());
+                return self.call_method_at_place(place, &method, args, line);
+            }
             PreparedCallable::NamedFallback(name) => {
                 debug_assert!(pending.is_empty());
                 return self.invoke_named_fallback(&name, args, line);
@@ -3267,6 +3421,16 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         position: usize,
         line: u32,
     ) -> Result<(ResolvedRefTarget, Value), NyblError> {
+        self.resolve_target(recipe, position, line, true)
+    }
+
+    fn resolve_target(
+        &self,
+        recipe: NamespaceRef,
+        position: usize,
+        line: u32,
+        reject_capture: bool,
+    ) -> Result<(ResolvedRefTarget, Value), NyblError> {
         let frame_index = self.frames.len().saturating_sub(1);
         let frame = self.frames.last().expect("frame present");
         if let Some(slot) = recipe.slot_idx() {
@@ -3284,7 +3448,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             ));
         }
         let name = frame.chunk.name(recipe.name_idx()).to_string();
-        if frame.captured_names.contains(&name) {
+        if reject_capture && frame.captured_names.contains(&name) {
             return Err(nybl::ref_params::captured_ref_target(position + 1, line));
         }
         for (scope_index, scope) in frame.scopes.iter().enumerate().rev() {
@@ -3306,6 +3470,268 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         ))
     }
 
+    fn validate_mutable_resolved_target(
+        &self,
+        target: &ResolvedRefTarget,
+        root_name: &str,
+        position: usize,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        if nybl::naming::is_constant_name(root_name) {
+            return Err(nybl::error_messages::constant_mutation_error(
+                root_name, line,
+            ));
+        }
+        if let ResolvedRefTarget::Scope { frame, name, .. } = target
+            && self
+                .frames
+                .get(*frame)
+                .is_some_and(|frame| frame.captured_names.contains(name))
+        {
+            return Err(nybl::ref_params::captured_ref_target(position + 1, line));
+        }
+        Ok(())
+    }
+
+    fn resolved_target_value(
+        &self,
+        target: &ResolvedRefTarget,
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        match target {
+            ResolvedRefTarget::Slot { frame, slot } => self
+                .frames
+                .get(*frame)
+                .and_then(|frame| frame.slots.get(slot.0 as usize))
+                .cloned()
+                .ok_or_else(|| error(line, "VM: mutable place slot is no longer live")),
+            ResolvedRefTarget::Scope { frame, scope, name } => self
+                .frames
+                .get(*frame)
+                .and_then(|frame| frame.scopes.get(*scope))
+                .and_then(|scope| scope.get(name))
+                .cloned()
+                .ok_or_else(|| error(line, "VM: mutable place binding is no longer live")),
+        }
+    }
+
+    fn store_resolved_target(
+        &mut self,
+        target: &ResolvedRefTarget,
+        value: Value,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        match target {
+            ResolvedRefTarget::Slot { frame, slot } => {
+                let target = self
+                    .frames
+                    .get_mut(*frame)
+                    .and_then(|frame| frame.slots.get_mut(slot.0 as usize))
+                    .ok_or_else(|| error(line, "VM: mutable place slot is no longer live"))?;
+                *target = value;
+            }
+            ResolvedRefTarget::Scope { frame, scope, name } => {
+                let target = self
+                    .frames
+                    .get_mut(*frame)
+                    .and_then(|frame| frame.scopes.get_mut(*scope))
+                    .and_then(|scope| scope.get_mut(name))
+                    .ok_or_else(|| error(line, "VM: mutable place binding is no longer live"))?;
+                *target = value;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_ref_recipe(
+        &self,
+        recipe: RefArgTarget,
+        indices: Vec<Value>,
+        position: usize,
+        line: u32,
+    ) -> Result<ResolvedPlace, NyblError> {
+        match recipe {
+            RefArgTarget::Binding(root) => {
+                let (target, value) = self.resolve_ref_target(root, position, line)?;
+                Ok(ResolvedPlace {
+                    target,
+                    root_recipe: root,
+                    root_name: self.current_chunk().name(root.name_idx()).to_string(),
+                    root: value,
+                    projections: Vec::new(),
+                })
+            }
+            RefArgTarget::Place(place) => self.resolve_place(place, indices, position, line),
+            RefArgTarget::Invalid => Err(invalid_ref_target_error(line, position)),
+        }
+    }
+
+    fn resolve_place(
+        &self,
+        place: PlaceIdx,
+        indices: Vec<Value>,
+        position: usize,
+        line: u32,
+    ) -> Result<ResolvedPlace, NyblError> {
+        self.resolve_place_internal(place, indices, position, line, true, true)
+    }
+
+    fn resolve_place_internal(
+        &self,
+        place: PlaceIdx,
+        indices: Vec<Value>,
+        position: usize,
+        line: u32,
+        reject_capture: bool,
+        validate_path: bool,
+    ) -> Result<ResolvedPlace, NyblError> {
+        let recipe = self.current_chunk().place(place);
+        let root_recipe = recipe.root;
+        let root_name = self
+            .current_chunk()
+            .name(root_recipe.name_idx())
+            .to_string();
+        let (target, root) = self.resolve_target(root_recipe, position, line, reject_capture)?;
+        let mut indices = indices.into_iter();
+        let mut projections = Vec::with_capacity(recipe.projections.len());
+        for projection in &recipe.projections {
+            projections.push(match projection {
+                PlaceProjectionRecipe::Index => ResolvedPlaceProjection::Index(
+                    indices
+                        .next()
+                        .ok_or_else(|| error(line, "VM: missing mutable-place index"))?,
+                ),
+                PlaceProjectionRecipe::Field(field) => {
+                    ResolvedPlaceProjection::Field(self.current_chunk().name(*field).to_string())
+                }
+            });
+        }
+        if indices.next().is_some() {
+            return Err(error(line, "VM: too many mutable-place indices"));
+        }
+        let resolved = ResolvedPlace {
+            target,
+            root_recipe,
+            root_name,
+            root,
+            projections,
+        };
+        if validate_path {
+            let _ = self.place_value_from(&resolved.root, &resolved.projections, line)?;
+        }
+        Ok(resolved)
+    }
+
+    fn refresh_resolved_place(
+        &self,
+        mut place: ResolvedPlace,
+        line: u32,
+    ) -> Result<ResolvedPlace, NyblError> {
+        place.root = self.resolved_target_value(&place.target, line)?;
+        let _ = self.place_value_from(&place.root, &place.projections, line)?;
+        Ok(place)
+    }
+
+    fn place_value_from(
+        &self,
+        root: &Value,
+        projections: &[ResolvedPlaceProjection],
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        let mut value = root.clone();
+        for projection in projections {
+            value = match projection {
+                ResolvedPlaceProjection::Index(index) => {
+                    ops::index_get_in(&value, index, line, &self.memory)?
+                }
+                ResolvedPlaceProjection::Field(field) => match &value {
+                    Value::Struct(structure) => {
+                        structure.field(field).cloned().ok_or_else(|| {
+                            error(
+                                line,
+                                nybl::error_messages::struct_has_no_field(
+                                    structure.type_name(),
+                                    field,
+                                ),
+                            )
+                        })?
+                    }
+                    other => {
+                        return Err(error(
+                            line,
+                            nybl::error_messages::cant_assign_field(field, other.type_name()),
+                        ));
+                    }
+                },
+            };
+        }
+        Ok(value)
+    }
+
+    fn write_place_value(
+        &self,
+        root: &mut Value,
+        projections: &[ResolvedPlaceProjection],
+        value: Value,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        let Some((projection, tail)) = projections.split_first() else {
+            *root = value;
+            return Ok(());
+        };
+        if tail.is_empty() {
+            return match projection {
+                ResolvedPlaceProjection::Index(index) => {
+                    ops::index_set_in(root, index, value, line, &self.memory)
+                }
+                ResolvedPlaceProjection::Field(field) => {
+                    self.set_place_field(root, field, value, line)
+                }
+            };
+        }
+        let mut child = match projection {
+            ResolvedPlaceProjection::Index(index) => {
+                ops::index_get_in(root, index, line, &self.memory)?
+            }
+            ResolvedPlaceProjection::Field(_) => {
+                self.place_value_from(root, core::slice::from_ref(projection), line)?
+            }
+        };
+        self.write_place_value(&mut child, tail, value, line)?;
+        match projection {
+            ResolvedPlaceProjection::Index(index) => {
+                ops::index_set_in(root, index, child, line, &self.memory)
+            }
+            ResolvedPlaceProjection::Field(field) => self.set_place_field(root, field, child, line),
+        }
+    }
+
+    fn set_place_field(
+        &self,
+        root: &mut Value,
+        field: &str,
+        value: Value,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        match root {
+            Value::Struct(structure) => {
+                let type_name = structure.type_name().to_string();
+                if structure.__try_set_field_in(field, value, line, &self.memory)? {
+                    Ok(())
+                } else {
+                    Err(error(
+                        line,
+                        nybl::error_messages::struct_has_no_field(&type_name, field),
+                    ))
+                }
+            }
+            other => Err(error(
+                line,
+                nybl::error_messages::cant_assign_field(field, other.type_name()),
+            )),
+        }
+    }
+
     fn enter_user_fn_args(
         &mut self,
         entry: Rc<FnEntry>,
@@ -3319,6 +3745,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 "Check that your recursive function has a base case that stops calling itself.",
             ));
         }
+        let args = self.pack_rest_arguments(args, &entry.param_modes, line)?;
         let slot_count = entry.chunk.slot_count as usize;
         let mut slots = self.take_slots(slot_count);
         for (index, arg) in args.into_iter().enumerate() {
@@ -3343,6 +3770,29 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .current_function_entry = Some(Rc::clone(&entry));
         self.apply_entry_alias_context(&entry);
         Ok(Next::Continue)
+    }
+
+    fn pack_rest_arguments(
+        &self,
+        mut args: Vec<Value>,
+        modes: &[ParamMode],
+        line: u32,
+    ) -> Result<Vec<Value>, NyblError> {
+        if modes.last() != Some(&ParamMode::Rest) {
+            return Ok(args);
+        }
+        let fixed = modes.len().saturating_sub(1);
+        let extras = args.split_off(fixed);
+        let rest = Value::__try_new_array_in(extras, line, &self.memory)?;
+        if self.memory.__exceeded() {
+            return Err(error_fatal_with_hint(
+                line,
+                "Memory limit exceeded",
+                "Your code is using too much memory. Check for large strings or arrays growing in loops.",
+            ));
+        }
+        args.push(rest);
+        Ok(args)
     }
 
     fn invoke_named_fallback(
@@ -3462,18 +3912,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
 
         if let Some(entry) = self.imported_function(name).cloned() {
-            if argc != entry.params.len() {
-                return Err(error(
-                    line,
-                    format!(
-                        "`{}` expects {} argument{}, but got {}",
-                        name,
-                        entry.params.len(),
-                        if entry.params.len() == 1 { "" } else { "s" },
-                        argc
-                    ),
-                ));
-            }
+            validate_user_arity(name, &entry.param_modes, argc, false, line)?;
             drop(chunk);
             return self.enter_user_fn(entry, argc, line);
         }
@@ -3524,18 +3963,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         if let Some(entry) = self.lookup_function_entry(name) {
             // Argc check before we touch the stack so error
             // messages match the walker's `name` wording.
-            if argc != entry.params.len() {
-                return Err(error(
-                    line,
-                    format!(
-                        "`{}` expects {} argument{}, but got {}",
-                        name,
-                        entry.params.len(),
-                        if entry.params.len() == 1 { "" } else { "s" },
-                        argc
-                    ),
-                ));
-            }
+            validate_user_arity(name, &entry.param_modes, argc, false, line)?;
             drop(chunk);
             return self.enter_user_fn(entry, argc, line);
         }
@@ -3628,6 +4056,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         argc: usize,
         line: u32,
     ) -> Result<Next, NyblError> {
+        if entry.param_modes.last() == Some(&ParamMode::Rest) {
+            let args = self.pop_n_values(argc, line)?;
+            return self.enter_user_fn_args(entry, args, line);
+        }
         if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
             return Err(error_with_hint(
                 line,
@@ -3831,6 +4263,30 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         self.dispatch_method(fallback, method, args, Some(assign_back), false, line)
     }
 
+    fn call_method_at_place(
+        &mut self,
+        place: ResolvedPlace,
+        method: &str,
+        args: Vec<Value>,
+        line: u32,
+    ) -> Result<Next, NyblError> {
+        let place = self.refresh_resolved_place(place, line)?;
+        let mut receiver = self.place_value_from(&place.root, &place.projections, line)?;
+        methods::reject_constant_array_mutation(&place.root_name, method, line)?;
+        let result = methods::transactional_array_method_in(
+            &mut receiver,
+            method,
+            args,
+            line,
+            &self.memory,
+        )?;
+        let mut root = place.root.clone();
+        self.write_place_value(&mut root, &place.projections, receiver, line)?;
+        self.store_resolved_target(&place.target, root, line)?;
+        self.push_value(result);
+        Ok(Next::Continue)
+    }
+
     fn dispatch_method(
         &mut self,
         obj: Value,
@@ -3886,46 +4342,17 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 .and_then(|m| m.get(method))
                 .cloned();
             if let Some(entry) = entry {
-                if entry.params.len() != args.len() + 1 {
-                    return Err(error(
-                        line,
-                        format!(
-                            "`{}.{}` expects {} argument{} (including `self`), but got {}",
-                            type_key.1,
-                            method,
-                            entry.params.len(),
-                            if entry.params.len() == 1 { "" } else { "s" },
-                            args.len() + 1
-                        ),
-                    ));
-                }
-                if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
-                    return Err(error_with_hint(
-                        line,
-                        "Too many nested function calls (possible infinite recursion)",
-                        "Check that your recursive function has a base case that stops calling itself.",
-                    ));
-                }
-                // User methods use the same positional-to-binding metadata as
-                // regular functions. The receiver is position 0.
-                let slot_count = entry.chunk.slot_count as usize;
-                let mut slots = self.take_slots(slot_count);
-                for (position, value) in core::iter::once(obj).chain(args).enumerate() {
-                    let slot =
-                        entry.chunk.parameter_slots.get(position).ok_or_else(|| {
-                            error(line, "VM: parameter slot metadata is incomplete")
-                        })?;
-                    slots[slot.0 as usize] = value;
-                }
-                self.push_function_frame(
-                    entry.chunk.clone(),
-                    slots,
-                    Vec::new(),
-                    self.stack.len(),
-                    Some(entry.module_path.clone()),
-                    FrameWrap::None,
-                );
-                self.apply_entry_alias_context(&entry);
+                validate_user_arity(
+                    &format!("{}.{}", type_key.1, method),
+                    &entry.param_modes,
+                    args.len() + 1,
+                    true,
+                    line,
+                )?;
+                let mut method_args = Vec::with_capacity(args.len() + 1);
+                method_args.push(obj);
+                method_args.extend(args);
+                self.enter_user_fn_args(entry, method_args, line)?;
                 // Legacy `CallMethod` only reaches value-only methods. Calls
                 // with a `ref` receiver or explicit ref arguments use the
                 // prepared-call path above, which owns their atomic
@@ -3974,6 +4401,18 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             Value::Int(_) | Value::Number(_) => methods::numeric_method(&obj, method, &args, line)?,
             Value::Bool(_) => methods::bool_method(&obj, method, &args, line)?,
             Value::Iter(_) => methods::iter_method_in(&obj, method, &args, line, &self.memory)?,
+            Value::Host(value) => {
+                let result = self.host.call_method(value, method, &args, line);
+                match result {
+                    Some(result) => (result?, None),
+                    None => {
+                        return Err(error(
+                            line,
+                            nybl::error_messages::no_such_method(obj.type_name(), method),
+                        ));
+                    }
+                }
+            }
             _ => {
                 return Err(error(
                     line,
@@ -4841,19 +5280,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
         };
 
-        if args.len() != func.params.len() {
-            let display_name = func.self_name.as_deref().unwrap_or("fn");
-            return Err(error(
-                line,
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    display_name,
-                    func.params.len(),
-                    if func.params.len() == 1 { "" } else { "s" },
-                    args.len()
-                ),
-            ));
-        }
+        let display_name = func.self_name.as_deref().unwrap_or("fn");
+        validate_user_arity(display_name, &func.param_modes, args.len(), false, line)?;
+        let args = self.pack_rest_arguments(args, &func.param_modes, line)?;
 
         if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
             return Err(error_with_hint(
@@ -5048,7 +5477,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             None => artifacts
                 .type_exports
                 .iter()
-                .filter(|(name, _)| alias.is_some() || !nybl::naming::is_private(name))
+                .filter(|(name, _)| {
+                    artifacts.explicit_surface || alias.is_some() || !nybl::naming::is_private(name)
+                })
                 .map(|(name, origin)| (name.clone(), origin.clone()))
                 .collect(),
         };
@@ -5123,7 +5554,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             // Flat form (glob / selective). Glob skips
             // `_`-prefixed names (privacy); selective doesn't
             // (the user explicitly asked).
-            let skip_private = items.is_none();
+            let skip_private = items.is_none() && !artifacts.explicit_surface;
             let module_top_scope = self.is_module_top_scope();
             for (name, mut value) in exports {
                 if skip_private && nybl::naming::is_private(&name) {
@@ -5422,6 +5853,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     ) -> Result<ModuleArtifacts, NyblError> {
         let stmts = nybl::parse(source)?;
         let chunk = crate::compile(&stmts)?;
+        let public_surface = chunk.public_surface.clone();
         let module_runtime = ModuleRuntime {
             imports: Rc::clone(&self.imports),
             environments: Rc::clone(&self.live_value_environments),
@@ -5465,7 +5897,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
         // Collect top-level lets from the module frame's one
         // remaining scope…
-        let bindings = match sub
+        let mut bindings = match sub
             .frames
             .first()
             .and_then(|frame| frame.scopes.first())
@@ -5514,7 +5946,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // call resolution. Reified `Value::Fn`s for the same
         // fns are synthesised at the import site (see
         // `exec_import`).
-        let fn_decls: Vec<(String, Rc<FnEntry>)> = sub.functions.into_iter().collect();
+        let mut fn_decls: Vec<(String, Rc<FnEntry>)> = sub.functions.into_iter().collect();
         // Type decls & methods come along for the ride — the
         // importer needs them so pattern-matching and
         // construction against the module's types works
@@ -5538,7 +5970,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 methods.push((type_key.clone(), method_name, entry));
             }
         }
-        let module_exports: BTreeMap<String, Rc<nybl::value::NyblModule>> = bindings
+        let all_module_exports: BTreeMap<String, Rc<nybl::value::NyblModule>> = bindings
             .iter()
             .filter_map(|(name, value)| match value {
                 Value::Module(module) => Some((name.clone(), Rc::clone(module))),
@@ -5547,16 +5979,32 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .collect();
         let mut lexical_context = Rc::try_unwrap(core::mem::take(&mut sub.root_lexical_context))
             .unwrap_or_else(|context| (*context).clone());
-        lexical_context.module_aliases = Rc::new(module_exports.clone());
+        lexical_context.module_aliases = Rc::new(all_module_exports.clone());
         let lexical_context = Rc::new(lexical_context);
+        let mut type_exports = sub.type_exports;
+        let explicit_surface = public_surface.is_some();
+        if let Some(names) = public_surface {
+            let names: BTreeSet<String> = names.into_iter().collect();
+            bindings.retain(|(name, _)| names.contains(name));
+            fn_decls.retain(|(name, _)| names.contains(name));
+            type_exports.retain(|name, _| names.contains(name));
+        }
+        let module_exports: BTreeMap<String, Rc<nybl::value::NyblModule>> = bindings
+            .iter()
+            .filter_map(|(name, value)| match value {
+                Value::Module(module) => Some((name.clone(), Rc::clone(module))),
+                _ => None,
+            })
+            .collect();
         Ok(ModuleArtifacts {
+            explicit_surface,
             bindings,
             binding_origins,
             fn_decls,
             struct_defs,
             enum_defs,
             methods,
-            type_exports: sub.type_exports,
+            type_exports,
             module_exports,
             lexical_context,
         })
@@ -5733,41 +6181,12 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 .get(parameter_slot.0 as usize)
                 .cloned()
                 .ok_or_else(|| error(line, "VM: ref parameter slot out of range"))?;
-            match &pending.target {
-                ResolvedRefTarget::Slot { frame, slot } => {
-                    if self
-                        .frames
-                        .get(*frame)
-                        .and_then(|target| target.slots.get(slot.0 as usize))
-                        .is_none()
-                    {
-                        return Err(error(line, "VM: ref write-back slot is no longer live"));
-                    }
-                }
-                ResolvedRefTarget::Scope { frame, scope, name } => {
-                    if !self
-                        .frames
-                        .get(*frame)
-                        .and_then(|target| target.scopes.get(*scope))
-                        .is_some_and(|scope| scope.contains_key(name))
-                    {
-                        return Err(error(line, "VM: ref write-back binding is no longer live"));
-                    }
-                }
-            }
-            values.push(value);
+            let mut root = self.resolved_target_value(&pending.place.target, line)?;
+            self.write_place_value(&mut root, &pending.place.projections, value, line)?;
+            values.push(root);
         }
         for (pending, value) in frame.pending_write_backs.iter().zip(values) {
-            match &pending.target {
-                ResolvedRefTarget::Slot { frame, slot } => {
-                    self.frames[*frame].slots[slot.0 as usize] = value;
-                }
-                ResolvedRefTarget::Scope { frame, scope, name } => {
-                    *self.frames[*frame].scopes[*scope]
-                        .get_mut(name)
-                        .expect("write-back target prevalidated") = value;
-                }
-            }
+            self.store_resolved_target(&pending.place.target, value, line)?;
         }
         Ok(())
     }
@@ -5858,44 +6277,18 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     ),
                 )
             })?;
-        if entry.params.len() != extra_args.len() + 1 {
-            return Err(error(
-                line,
-                format!(
-                    "`{}.{}` expects {} argument{} (including `self`), but got {}",
-                    key.1,
-                    method,
-                    entry.params.len(),
-                    if entry.params.len() == 1 { "" } else { "s" },
-                    extra_args.len() + 1
-                ),
-            ));
-        }
-        if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
-            return Err(error_with_hint(
-                line,
-                "Too many nested function calls (possible infinite recursion)",
-                "Check that your recursive function has a base case that stops calling itself.",
-            ));
-        }
-        let slot_count = entry.chunk.slot_count as usize;
-        let mut slots = self.take_slots(slot_count);
-        for (position, value) in core::iter::once(receiver).chain(extra_args).enumerate() {
-            let slot = entry
-                .chunk
-                .parameter_slots
-                .get(position)
-                .ok_or_else(|| error(line, "VM: parameter slot metadata is incomplete"))?;
-            slots[slot.0 as usize] = value;
-        }
-        self.push_function_frame(
-            entry.chunk.clone(),
-            slots,
-            Vec::new(),
-            self.stack.len(),
-            Some(entry.module_path.clone()),
-            wrap,
-        );
+        validate_user_arity(
+            &format!("{}.{}", key.1, method),
+            &entry.param_modes,
+            extra_args.len() + 1,
+            true,
+            line,
+        )?;
+        let mut args = Vec::with_capacity(extra_args.len() + 1);
+        args.push(receiver);
+        args.extend(extra_args);
+        self.enter_user_fn_args(Rc::clone(&entry), args, line)?;
+        self.frames.last_mut().expect("callee frame").wrap = wrap;
         self.apply_entry_alias_context(&entry);
         Ok(())
     }
@@ -6222,7 +6615,14 @@ impl NyblInstance {
         let entries = vm
             .abi_declarations
             .iter()
-            .map(|(name, target)| EntryPoint::__new(name.clone(), target.params.len()))
+            .map(|(name, target)| {
+                let required = nybl::ref_params::required_arity(&target.param_modes);
+                if target.param_modes.last() == Some(&ParamMode::Rest) {
+                    EntryPoint::__new_variadic(name.clone(), required)
+                } else {
+                    EntryPoint::__new(name.clone(), required)
+                }
+            })
             .collect();
         Ok(Self {
             state: Some(vm.into_state()),
@@ -6251,18 +6651,7 @@ impl NyblInstance {
             .find(|(entry_name, _)| entry_name == name)
             .map(|(_, target)| Rc::clone(target))
             .ok_or_else(|| error(0, format!("Public entry point `{name}` was not found")))?;
-        if args.len() != target.params.len() {
-            return Err(error(
-                0,
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    name,
-                    target.params.len(),
-                    if target.params.len() == 1 { "" } else { "s" },
-                    args.len(),
-                ),
-            ));
-        }
+        validate_user_arity(name, &target.param_modes, args.len(), false, 0)?;
         nybl::ref_params::validate_call_modes(
             name,
             &target.param_modes,
@@ -6317,18 +6706,8 @@ impl NyblInstance {
                 "This function belongs to a different Nybl engine instance",
             ));
         }
-        if args.len() != function.params.len() {
-            return Err(error(
-                0,
-                format!(
-                    "Function expects {} argument{}, but got {}",
-                    function.params.len(),
-                    if function.params.len() == 1 { "" } else { "s" },
-                    args.len(),
-                ),
-            ));
-        }
         let display_name = function.self_name.as_deref().unwrap_or("fn");
+        validate_user_arity(display_name, &function.param_modes, args.len(), false, 0)?;
         nybl::ref_params::validate_call_modes(
             display_name,
             &function.param_modes,
@@ -6380,7 +6759,67 @@ fn call_mode_error(
             format!("argument {position} to `{callable}` is a value parameter and can't use `ref`"),
             format!("Remove `ref` from argument {position}."),
         ),
+        ParamMode::Rest => error_with_hint(
+            line,
+            format!("argument {position} to `{callable}` is a value parameter and can't use `ref`"),
+            format!("Remove `ref` from argument {position}."),
+        ),
     }
+}
+
+fn validate_user_arity(
+    callable: &str,
+    expected: &[ParamMode],
+    actual: usize,
+    including_self: bool,
+    line: u32,
+) -> Result<(), NyblError> {
+    let has_rest = expected.last() == Some(&ParamMode::Rest);
+    let minimum = expected.len().saturating_sub(usize::from(has_rest));
+    if (has_rest && actual >= minimum) || (!has_rest && actual == minimum) {
+        return Ok(());
+    }
+    let self_suffix = if including_self {
+        " (including `self`)"
+    } else {
+        ""
+    };
+    let expectation = if has_rest {
+        format!(
+            "at least {minimum} argument{}",
+            if minimum == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("{minimum} argument{}", if minimum == 1 { "" } else { "s" })
+    };
+    Err(error(
+        line,
+        format!("`{callable}` expects {expectation}{self_suffix}, but got {actual}"),
+    ))
+}
+
+fn validate_user_call_modes(
+    callable: &str,
+    expected: &[ParamMode],
+    actual: &[ParamMode],
+    line: u32,
+) -> Result<(), NyblError> {
+    validate_user_arity(callable, expected, actual.len(), false, line)?;
+    let fixed = expected
+        .len()
+        .saturating_sub(usize::from(expected.last() == Some(&ParamMode::Rest)));
+    for (index, mode) in actual.iter().enumerate() {
+        let expected_mode = expected.get(index).copied().unwrap_or(ParamMode::Value);
+        let expected_mode = if index >= fixed || expected_mode == ParamMode::Rest {
+            ParamMode::Value
+        } else {
+            expected_mode
+        };
+        if *mode != expected_mode {
+            return Err(call_mode_error(line, callable, index, expected_mode));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_ref_target_error(line: u32, zero_based_position: usize) -> NyblError {

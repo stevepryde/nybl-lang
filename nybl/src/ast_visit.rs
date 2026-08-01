@@ -89,7 +89,10 @@ pub fn visit_declaration_sites(stmts: &[Stmt], visitor: &mut impl DeclarationSit
                 }
             }
             StmtKind::ExprStmt(expr) => visit_expr(expr, visitor),
-            StmtKind::Break | StmtKind::Continue | StmtKind::Use { .. } => {}
+            StmtKind::Break
+            | StmtKind::Continue
+            | StmtKind::Use { .. }
+            | StmtKind::PublicSurface { .. } => {}
         }
     }
 }

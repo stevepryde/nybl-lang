@@ -15,7 +15,7 @@ use nybl::error::NyblError;
 
 use crate::chunk::{
     AssignBack, CaptureSource, Chunk, CodeOffset, Instr, InterpPart, NamespaceIdx, NamespaceRef,
-    RefArgTarget, SlotIdx,
+    PlaceProjectionRecipe, RefArgTarget, SlotIdx,
 };
 use nybl::parser::ParamMode;
 
@@ -74,6 +74,18 @@ impl<'a> Validator<'a> {
                     self.chunk.slot_count, self.available_slots
                 ),
             ));
+        }
+
+        if let Some(surface) = &self.chunk.public_surface {
+            let mut names = BTreeSet::new();
+            for name in surface {
+                if !names.insert(name) {
+                    return Err(self.invalid(
+                        0,
+                        format!("public surface contains duplicate name `{name}`"),
+                    ));
+                }
+            }
         }
 
         // Compiler slot allocation is dense: parameters occupy the prefix and
@@ -209,6 +221,24 @@ impl<'a> Validator<'a> {
                     ),
                 ));
             }
+            if function
+                .param_modes
+                .iter()
+                .enumerate()
+                .any(|(position, mode)| {
+                    *mode == ParamMode::Rest && position + 1 != function.param_modes.len()
+                })
+                || function
+                    .param_modes
+                    .iter()
+                    .filter(|mode| **mode == ParamMode::Rest)
+                    .count()
+                    > 1
+            {
+                return Err(
+                    self.invalid(0, format!("{detail} has invalid rest-parameter metadata"))
+                );
+            }
             if function.chunk.slot_count != function.slot_count {
                 return Err(self.invalid(
                     0,
@@ -275,6 +305,16 @@ impl<'a> Validator<'a> {
             }
         }
 
+        for (index, place) in self.chunk.places.iter().enumerate() {
+            let detail = format!("place {index}");
+            self.namespace_ref(place.root, 0, &detail)?;
+            for projection in &place.projections {
+                if let PlaceProjectionRecipe::Field(field) = projection {
+                    self.pool(field.0, self.chunk.names.len(), 0, "name", &detail)?;
+                }
+            }
+        }
+
         for (index, site) in self.chunk.call_sites.iter().enumerate() {
             let detail = format!("call site {index}");
             if site.arg_modes.len() != site.ref_targets.len() {
@@ -289,7 +329,16 @@ impl<'a> Validator<'a> {
             }
             let mut ref_slots = BTreeSet::new();
             for target in site.ref_targets.iter().flatten() {
-                if let RefArgTarget::Binding(namespace) = target
+                let namespace = match target {
+                    RefArgTarget::Binding(namespace) => Some(*namespace),
+                    RefArgTarget::Place(place) => self
+                        .chunk
+                        .places
+                        .get(place.0 as usize)
+                        .map(|place| place.root),
+                    RefArgTarget::Invalid => None,
+                };
+                if let Some(namespace) = namespace
                     && let Some(slot) = namespace.slot_idx()
                     && !ref_slots.insert(slot.0)
                 {
@@ -317,6 +366,18 @@ impl<'a> Validator<'a> {
                             0,
                             &format!("{detail} argument {}", position + 1),
                         )?;
+                    }
+                    (ParamMode::Ref, Some(RefArgTarget::Place(place))) => {
+                        self.pool(place.0, self.chunk.places.len(), 0, "place", &detail)?;
+                    }
+                    (ParamMode::Rest, _) => {
+                        return Err(self.invalid(
+                            0,
+                            format!(
+                                "{detail} argument {} illegally uses declaration-only rest mode",
+                                position + 1
+                            ),
+                        ));
                     }
                     _ => {
                         return Err(self.invalid(
@@ -358,6 +419,9 @@ impl<'a> Validator<'a> {
             }
             Instr::CompoundAssign { target, .. } => self.assign_back(target, line, &at)?,
             Instr::SetIndexInPlace { target, .. } => self.assign_back(target, line, &at)?,
+            Instr::AssignPlace { place, .. } => {
+                self.pool(place.0, self.chunk.places.len(), line, "place", &at)?;
+            }
             Instr::StringInterp(index) => self.pool(
                 index.0,
                 self.chunk.interps.len(),
@@ -386,6 +450,15 @@ impl<'a> Validator<'a> {
                 site,
             } => {
                 self.namespace_ref(target, line, &at)?;
+                self.pool(method.0, self.chunk.names.len(), line, "name", &at)?;
+                self.pool(site.0, self.chunk.call_sites.len(), line, "call site", &at)?;
+            }
+            Instr::PrepareMethodPlace {
+                place,
+                method,
+                site,
+            } => {
+                self.pool(place.0, self.chunk.places.len(), line, "place", &at)?;
                 self.pool(method.0, self.chunk.names.len(), line, "name", &at)?;
                 self.pool(site.0, self.chunk.call_sites.len(), line, "call site", &at)?;
             }

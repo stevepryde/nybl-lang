@@ -17,8 +17,12 @@ Hand your users or your AI a real programming language at runtime, without shipp
   remain live
 - **`NyblHost` trait** — the only thing embedders need to implement to wire Nybl into their Rust app
 - **`Value` type + builtin operators** — the shared runtime surface every Nybl engine uses
+- **Opaque `HostValue` handles** — retain host resources in Nybl and dispatch
+  methods through `NyblHost::call_method` without exposing their Rust payloads
 - **Transactional `ref` parameters** — explicit copy-in/copy-out updates to
-  mutable caller variables, with rollback on errors
+  deep mutable caller places, with rollback on errors
+- **Variadic functions and explicit module surfaces** — final `..rest`
+  parameters and `pub { ... }` export allow-lists
 - **Resource limits** (`NyblLimits`) — step and tracked-memory budgets, plus a fixed function-call depth cap
 
 For a faster runtime (2–3× this crate's tree-walker, same semantics), add [`nybl-vm`](https://crates.io/crates/nybl-vm). For an AOT path to native Rust, see [`nybl-compile`](https://crates.io/crates/nybl-compile).
@@ -108,6 +112,12 @@ Host arguments support borrowed or owned typed extraction through
 `Value::to_rust` (`&str`, integers, `Vec<T>`, `Option<T>`, `Result<T, E>`, and
 deterministic `BTreeMap<String, T>`). Use the fallible, JSON-like `nybl_value!`
 macro to construct nested values while retaining Nybl's depth checks.
+
+Hosts can also return `Value::new_host("type", payload)` for an opaque resource
+handle and implement `NyblHost::call_method`. Handles clone cheaply, compare by
+identity, display as `<host type>`, and keep host-side mutations outside Nybl's
+transaction and memory-accounting semantics. See the [embedding
+guide](https://nybl-lang.com/docs/embedding/#opaque-host-values-and-methods).
 
 ## Features
 

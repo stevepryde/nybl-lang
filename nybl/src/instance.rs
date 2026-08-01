@@ -16,13 +16,28 @@ use core::cell::Cell;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntryPoint {
     pub(crate) name: String,
+    /// Required positional count. Variadic entries accept any larger count.
     pub(crate) arity: usize,
+    pub(crate) variadic: bool,
 }
 
 impl EntryPoint {
     #[doc(hidden)]
     pub fn __new(name: String, arity: usize) -> Self {
-        Self { name, arity }
+        Self {
+            name,
+            arity,
+            variadic: false,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn __new_variadic(name: String, required_arity: usize) -> Self {
+        Self {
+            name,
+            arity: required_arity,
+            variadic: true,
+        }
     }
 
     /// Source name of the public root function.
@@ -30,9 +45,35 @@ impl EntryPoint {
         &self.name
     }
 
-    /// Number of positional arguments accepted by the entry point.
+    /// Required positional arguments. For a variadic entry this is the
+    /// minimum; use [`Self::is_variadic`] or [`Self::accepts_arity`] when
+    /// validating a call.
     pub const fn arity(&self) -> usize {
         self.arity
+    }
+
+    /// Whether this entry accepts arbitrarily many arguments after its fixed
+    /// positional prefix.
+    pub const fn is_variadic(&self) -> bool {
+        self.variadic
+    }
+
+    /// Maximum accepted arity, or `None` for a variadic entry.
+    pub const fn max_arity(&self) -> Option<usize> {
+        if self.variadic {
+            None
+        } else {
+            Some(self.arity)
+        }
+    }
+
+    /// Whether `count` positional arguments satisfy this entry's arity.
+    pub const fn accepts_arity(&self, count: usize) -> bool {
+        if self.variadic {
+            count >= self.arity
+        } else {
+            count == self.arity
+        }
     }
 }
 
@@ -93,16 +134,25 @@ impl NyblInstance {
             .iter()
             .find(|entry| entry.name == name)
             .ok_or_else(|| error(0, format!("Public entry point `{name}` was not found")))?;
-        if args.len() != entry.arity {
+        if !entry.accepts_arity(args.len()) {
             return Err(error(
                 0,
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    name,
-                    entry.arity,
-                    if entry.arity == 1 { "" } else { "s" },
-                    args.len(),
-                ),
+                if entry.variadic {
+                    format!(
+                        "`{}` expects at least {} arguments, but got {}",
+                        name,
+                        entry.arity,
+                        args.len(),
+                    )
+                } else {
+                    format!(
+                        "`{}` expects {} argument{}, but got {}",
+                        name,
+                        entry.arity,
+                        if entry.arity == 1 { "" } else { "s" },
+                        args.len(),
+                    )
+                },
             ));
         }
         if self.memory.__exceeded() {

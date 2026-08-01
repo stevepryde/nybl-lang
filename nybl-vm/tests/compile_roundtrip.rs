@@ -643,7 +643,7 @@ fn index_get_and_set() {
         3: DefineLocal a
         4: LoadConst 99
         5: LoadConst 0
-        6: SetIndexInPlace (target a)
+        6: AssignPlace a[?]
         7: PrepareCall print/#0
         8: LoadVar a
         9: LoadConst 1
@@ -659,7 +659,7 @@ fn index_get_and_set() {
 fn compound_assign_on_index_is_target_aware() {
     let d = disasm("let a = [1]\na[0] += 1");
     assert!(
-        d.contains("SetIndexInPlace += (target a)"),
+        d.contains("AssignPlace += a[?]"),
         "should mutate the live binding:\n{d}"
     );
     assert!(!d.contains("LoadVar a"), "must not clone receiver:\n{d}");
@@ -677,7 +677,7 @@ let c = Counter { n: 1 }
 c.n += 2"#,
     );
     assert!(
-        d.contains("FieldSetInPlace += .n (target c)"),
+        d.contains("AssignPlace += c.n"),
         "should mutate the live binding:\n{d}"
     );
     assert!(!d.contains("LoadVar c"), "must not clone receiver:\n{d}");
@@ -697,7 +697,7 @@ fn function_assignment_targets_use_slots_in_place() {
 print(update([1]))"#,
     );
     assert!(
-        d.contains("SetIndexInPlace (target @0)"),
+        d.contains("AssignPlace @0[?]"),
         "function local should use direct slot target:\n{d}"
     );
 }

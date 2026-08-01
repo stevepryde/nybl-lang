@@ -4,7 +4,7 @@ use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use std::{collections::BTreeMap, format, string::String, vec::Vec};
 
 use crate::value::BUILTIN_MODULE_PATH;
-use crate::{Value, ValueConversionError};
+use crate::{HostValue, Value, ValueConversionError};
 
 use super::IntoValue;
 
@@ -61,6 +61,12 @@ impl From<&str> for Value {
 impl From<&String> for Value {
     fn from(value: &String) -> Self {
         Value::from(value.as_str())
+    }
+}
+
+impl From<HostValue> for Value {
+    fn from(value: HostValue) -> Self {
+        Value::Host(value)
     }
 }
 
@@ -125,6 +131,18 @@ impl IntoValue for Value {
 impl IntoValue for &Value {
     fn into_value(self) -> Result<Value, ValueConversionError> {
         Ok(self.clone())
+    }
+}
+
+impl IntoValue for HostValue {
+    fn into_value(self) -> Result<Value, ValueConversionError> {
+        Ok(Value::Host(self))
+    }
+}
+
+impl IntoValue for &HostValue {
+    fn into_value(self) -> Result<Value, ValueConversionError> {
+        Ok(Value::Host(self.clone()))
     }
 }
 

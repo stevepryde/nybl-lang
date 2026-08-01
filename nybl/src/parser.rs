@@ -190,6 +190,9 @@ pub enum ParamMode {
     Value,
     /// A transactional copy-in/copy-out argument marked with `ref`.
     Ref,
+    /// The final declaration parameter collecting remaining value arguments.
+    /// This mode never appears on a call-site [`CallArg`].
+    Rest,
 }
 
 /// One declared function parameter, including its call-site passing mode.
@@ -649,6 +652,11 @@ pub enum StmtKind {
         /// name rather than in the caller's scope directly.
         alias: Option<String>,
     },
+    /// Explicit module export allow-list. Multiple statements are unioned.
+    /// At a directly executed root this statement is intentionally inert.
+    PublicSurface {
+        names: Vec<String>,
+    },
     /// `struct Point { x, y }` — registers a user-defined struct
     /// type with the listed field names. Field values get their
     /// types from the construction site (`Point { x: 1, y: 2 }`).
@@ -708,9 +716,9 @@ pub enum AssignTarget {
         object: Expr,
         index: Expr,
     },
-    /// Assignment to a struct field: `obj.field = v`. Like
-    /// `Index`, only a bare `Ident` for `object` is currently
-    /// assignable — the runtime mutates directly through that binding.
+    /// Assignment to a struct field: `obj.field = v`. The object may itself
+    /// be a field/index chain so long as the complete place is rooted in a
+    /// mutable binding.
     Field {
         object: Expr,
         field: String,
@@ -1046,7 +1054,10 @@ impl Parser {
         let mut params = Vec::new();
         if !matches!(self.peek(), Token::RParen) {
             loop {
-                let mode = if matches!(self.peek(), Token::Ref) {
+                let mode = if matches!(self.peek(), Token::DotDot) {
+                    self.advance();
+                    ParamMode::Rest
+                } else if matches!(self.peek(), Token::Ref) {
                     self.advance();
                     ParamMode::Ref
                 } else {
@@ -1055,10 +1066,23 @@ impl Parser {
                 let (_, column) = self.peek_pos();
                 let (param, line) = self.expect_ident()?;
                 ensure_value_name_at(&param, site, line, column)?;
+                if mode == ParamMode::Rest
+                    && params
+                        .iter()
+                        .any(|existing: &Parameter| existing.name == param)
+                {
+                    return Err(self.error(
+                        line,
+                        format!("rest parameter `{param}` must have a distinct name"),
+                    ));
+                }
                 params.push(Parameter { name: param, mode });
 
                 if !matches!(self.peek(), Token::Comma) {
                     break;
+                }
+                if mode == ParamMode::Rest {
+                    return Err(self.error(line, "a rest parameter must be the final parameter"));
                 }
                 self.advance();
             }
@@ -1099,9 +1123,21 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<Vec<Stmt>, NyblError> {
         let mut stmts = Vec::new();
+        let mut public_names = BTreeSet::new();
         self.skip_semicolons();
         while !self.is_at_end() {
-            stmts.push(self.parse_statement()?);
+            let stmt = self.parse_statement()?;
+            if let StmtKind::PublicSurface { names } = &stmt.kind {
+                for name in names {
+                    if !public_names.insert(name.clone()) {
+                        return Err(self.error(
+                            stmt.line,
+                            format!("duplicate public name `{name}` across `pub` lists"),
+                        ));
+                    }
+                }
+            }
+            stmts.push(stmt);
             self.skip_semicolons();
         }
         Ok(stmts)
@@ -1146,6 +1182,7 @@ impl Parser {
             {
                 self.parse_fn_decl(Visibility::Private)
             }
+            Token::Pub if matches!(self.peek_at(1), Token::LBrace) => self.parse_public_surface(),
             Token::Pub => self.parse_public_fn_decl(),
             Token::Return => self.parse_return(),
             Token::Break => {
@@ -1339,6 +1376,38 @@ impl Parser {
         })
     }
 
+    fn parse_public_surface(&mut self) -> Result<Stmt, NyblError> {
+        let (line, column) = self.peek_pos();
+        self.advance(); // consume `pub`
+        if self.block_depth != 0 {
+            return Err(self.error(line, "`pub { ... }` is only valid at the module root"));
+        }
+        self.expect(&Token::LBrace)?;
+        let mut names = Vec::new();
+        if !matches!(self.peek(), Token::RBrace) {
+            loop {
+                let (name, _) = self.expect_ident()?;
+                if names.iter().any(|existing| existing == &name) {
+                    return Err(self.error(line, format!("duplicate public name `{name}`")));
+                }
+                names.push(name);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance();
+                if matches!(self.peek(), Token::RBrace) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RBrace)?;
+        Ok(Stmt {
+            kind: StmtKind::PublicSurface { names },
+            line,
+            column,
+        })
+    }
+
     fn parse_let(&mut self) -> Result<Stmt, NyblError> {
         let (line, column) = self.peek_pos();
         self.advance(); // consume 'let'
@@ -1497,6 +1566,12 @@ impl Parser {
             let (method_name, method_line) = self.expect_ident()?;
             ensure_value_name(&method_name, "method name", method_line)?;
             let params = self.parse_parameters("method parameter")?;
+            if params
+                .first()
+                .is_some_and(|param| param.mode == ParamMode::Rest)
+            {
+                return Err(self.error(line, "a method receiver cannot be a rest parameter"));
+            }
             let body = self.parse_block()?;
             if let Some(receiver) = params
                 .first()
@@ -2948,6 +3023,7 @@ fn value_receiver_mutation_line(
             | StmtKind::Break
             | StmtKind::Continue
             | StmtKind::Use { .. }
+            | StmtKind::PublicSurface { .. }
             | StmtKind::StructDecl { .. }
             | StmtKind::EnumDecl { .. } => {}
         }

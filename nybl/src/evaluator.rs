@@ -1,12 +1,13 @@
 #[cfg(all(feature = "no_std", not(feature = "std")))]
 use alloc::{
+    boxed::Box,
     format,
     string::{String, ToString},
     vec,
     vec::Vec,
 };
 
-use alloc_import::collections::BTreeMap;
+use alloc_import::collections::{BTreeMap, BTreeSet};
 
 #[cfg(all(feature = "no_std", not(feature = "std")))]
 use alloc as alloc_import;
@@ -41,11 +42,13 @@ use crate::{NyblHost, NyblLimits};
 /// halts with a clear error.
 enum ImportSlot {
     Loading,
-    Loaded(ModuleBindings),
+    Loaded(Box<ModuleBindings>),
 }
 
 #[derive(Clone)]
 struct ModuleBindings {
+    /// Whether this module opted into an explicit `pub { ... }` allow-list.
+    explicit_surface: bool,
     /// `(name, value)` pairs for every top-level `let` in the
     /// module (fns are handled separately — they also need to
     /// land in `self.functions` so cross-fn calls within the
@@ -276,9 +279,33 @@ struct BindingIdentity {
     name: String,
 }
 
+#[derive(Clone)]
+enum PlaceProjectionExpr {
+    Index(Expr),
+    Field(String),
+}
+
+#[derive(Clone)]
+enum PlaceProjection {
+    Index(Value),
+    Field(String),
+}
+
+#[derive(Clone)]
+struct PlacePlan {
+    target: BindingIdentity,
+    projections: Vec<PlaceProjectionExpr>,
+}
+
+struct ResolvedPlace {
+    target: BindingIdentity,
+    root: Value,
+    projections: Vec<PlaceProjection>,
+}
+
 struct MethodReceiver {
     value: Value,
-    target: Option<BindingIdentity>,
+    place: Option<ResolvedPlace>,
 }
 
 /// Lexical free-variable analysis for walker-created lambdas.
@@ -397,6 +424,7 @@ impl FreeVariableCollector {
             StmtKind::ExprStmt(expr) => self.visit_expr(expr),
             StmtKind::Break
             | StmtKind::Continue
+            | StmtKind::PublicSurface { .. }
             | StmtKind::StructDecl { .. }
             | StmtKind::EnumDecl { .. } => {}
         }
@@ -994,48 +1022,293 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         })
     }
 
-    fn preflight_ref_targets(
+    fn decompose_place_expr(
+        expr: &Expr,
+        projections: &mut Vec<PlaceProjectionExpr>,
+    ) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(name) => Some(name.clone()),
+            ExprKind::Index { object, index } => {
+                let root = Self::decompose_place_expr(object, projections)?;
+                projections.push(PlaceProjectionExpr::Index((**index).clone()));
+                Some(root)
+            }
+            ExprKind::FieldAccess { object, field } => {
+                let root = Self::decompose_place_expr(object, projections)?;
+                projections.push(PlaceProjectionExpr::Field(field.clone()));
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+
+    fn preflight_place_expr(
+        &self,
+        expr: &Expr,
+        position: usize,
+        line: u32,
+    ) -> Result<PlacePlan, NyblError> {
+        let mut projections = Vec::new();
+        let root = Self::decompose_place_expr(expr, &mut projections)
+            .ok_or_else(|| crate::ref_params::invalid_ref_target(position, line))?;
+        self.preflight_place_parts(root, projections, position, line)
+    }
+
+    fn read_place_plan(&self, expr: &Expr) -> Option<PlacePlan> {
+        let mut projections = Vec::new();
+        let root = Self::decompose_place_expr(expr, &mut projections)?;
+        let target = self.resolve_binding_identity(&root)?;
+        Some(PlacePlan {
+            target,
+            projections,
+        })
+    }
+
+    fn validate_mutable_place(
+        &self,
+        place: &ResolvedPlace,
+        position: usize,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        if crate::naming::is_constant_name(&place.target.name) {
+            return Err(crate::error_messages::constant_mutation_error(
+                &place.target.name,
+                line,
+            ));
+        }
+        if self.active_capture_bindings.contains(&place.target) {
+            return Err(crate::ref_params::captured_ref_target(position, line));
+        }
+        Ok(())
+    }
+
+    fn preflight_place_parts(
+        &self,
+        root: String,
+        projections: Vec<PlaceProjectionExpr>,
+        position: usize,
+        line: u32,
+    ) -> Result<PlacePlan, NyblError> {
+        if crate::naming::is_constant_name(&root) {
+            return Err(crate::error_messages::constant_mutation_error(&root, line));
+        }
+        let target = self
+            .resolve_binding_identity(&root)
+            .ok_or_else(|| crate::ref_params::invalid_ref_target(position, line))?;
+        if self.active_capture_bindings.contains(&target) {
+            return Err(crate::ref_params::captured_ref_target(position, line));
+        }
+        Ok(PlacePlan {
+            target,
+            projections,
+        })
+    }
+
+    fn assignment_place_parts(
+        &self,
+        root: String,
+        projections: Vec<PlaceProjectionExpr>,
+        line: u32,
+    ) -> Result<PlacePlan, NyblError> {
+        if crate::naming::is_constant_name(&root) {
+            return Err(crate::error_messages::constant_mutation_error(&root, line));
+        }
+        let target = self.resolve_binding_identity(&root).ok_or_else(|| {
+            error_with_hint(
+                line,
+                format!("Variable `{root}` doesn't exist yet"),
+                format!("Use `let` to create a new variable: let {root} = ..."),
+            )
+        })?;
+        // Unlike a `ref` call boundary, ordinary assignment may update the
+        // closure's local captured snapshot during that invocation.
+        Ok(PlacePlan {
+            target,
+            projections,
+        })
+    }
+
+    fn preflight_ref_places(
         &self,
         args: &[CallArg],
         line: u32,
-    ) -> Result<Vec<BindingIdentity>, NyblError> {
-        let mut targets = Vec::new();
+    ) -> Result<Vec<PlacePlan>, NyblError> {
+        let mut places = Vec::new();
         let mut unique = alloc_import::collections::BTreeSet::new();
         for (index, arg) in args.iter().enumerate() {
             if arg.mode != ParamMode::Ref {
                 continue;
             }
-            let ExprKind::Ident(name) = &arg.value.kind else {
-                return Err(crate::ref_params::invalid_ref_target(index + 1, line));
-            };
-            if crate::naming::is_constant_name(name) {
-                return Err(crate::error_messages::constant_mutation_error(name, line));
-            }
-            let target = self
-                .resolve_binding_identity(name)
-                .ok_or_else(|| crate::ref_params::invalid_ref_target(index + 1, line))?;
-            if self.active_capture_bindings.contains(&target) {
-                return Err(crate::ref_params::captured_ref_target(index + 1, line));
-            }
-            if !unique.insert(target.clone()) {
+            let place = self.preflight_place_expr(&arg.value, index + 1, line)?;
+            // A call stages and commits each root once. Rejecting two paths
+            // into the same root keeps copy-out deterministic without an
+            // alias analysis (`ref rows[0], ref rows[1]` is therefore an
+            // intentional error).
+            if !unique.insert(place.target.clone()) {
                 return Err(crate::ref_params::duplicate_ref_target(line));
             }
-            targets.push(target);
+            places.push(place);
         }
-        Ok(targets)
+        Ok(places)
     }
 
-    fn commit_ref_targets(
+    fn resolve_place(
         &mut self,
-        targets: &[BindingIdentity],
+        plan: PlacePlan,
+        position: usize,
+        line: u32,
+    ) -> Result<ResolvedPlace, NyblError> {
+        let mut projections = Vec::with_capacity(plan.projections.len());
+        for projection in plan.projections {
+            projections.push(match projection {
+                PlaceProjectionExpr::Index(index) => {
+                    PlaceProjection::Index(self.eval_expr(&index)?)
+                }
+                PlaceProjectionExpr::Field(field) => PlaceProjection::Field(field),
+            });
+        }
+        // Projection expressions may mutate the root. Snapshot only after
+        // each projection has been evaluated so the resolved leaf observes
+        // those effects (and so every expression still runs exactly once).
+        let root = self
+            .binding_value(&plan.target)
+            .ok_or_else(|| crate::ref_params::invalid_ref_target(position, line))?;
+        Ok(ResolvedPlace {
+            target: plan.target,
+            root,
+            projections,
+        })
+    }
+
+    fn place_value_from(
+        &self,
+        root: &Value,
+        projections: &[PlaceProjection],
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        let mut value = root.clone();
+        for projection in projections {
+            value = match projection {
+                PlaceProjection::Index(index) => {
+                    ops::index_get_in(&value, index, line, &self.memory)?
+                }
+                PlaceProjection::Field(field) => match &value {
+                    Value::Struct(struct_value) => {
+                        struct_value.field(field).cloned().ok_or_else(|| {
+                            error(
+                                line,
+                                crate::error_messages::struct_has_no_field(
+                                    struct_value.type_name(),
+                                    field,
+                                ),
+                            )
+                        })?
+                    }
+                    other => {
+                        return Err(error(
+                            line,
+                            crate::error_messages::cant_assign_field(field, other.type_name()),
+                        ));
+                    }
+                },
+            };
+        }
+        Ok(value)
+    }
+
+    fn write_place_value(
+        &self,
+        root: &mut Value,
+        projections: &[PlaceProjection],
+        value: Value,
+        line: u32,
+    ) -> Result<(), NyblError> {
+        let Some((projection, tail)) = projections.split_first() else {
+            *root = value;
+            return Ok(());
+        };
+        if tail.is_empty() {
+            return match projection {
+                PlaceProjection::Index(index) => {
+                    ops::index_set_in(root, index, value, line, &self.memory)
+                }
+                PlaceProjection::Field(field) => match root {
+                    Value::Struct(struct_value) => {
+                        let type_name = struct_value.type_name().to_string();
+                        if struct_value.__try_set_field_in(field, value, line, &self.memory)? {
+                            Ok(())
+                        } else {
+                            Err(error(
+                                line,
+                                crate::error_messages::struct_has_no_field(&type_name, field),
+                            ))
+                        }
+                    }
+                    other => Err(error(
+                        line,
+                        crate::error_messages::cant_assign_field(field, other.type_name()),
+                    )),
+                },
+            };
+        }
+        let mut child = match projection {
+            PlaceProjection::Index(index) => ops::index_get_in(root, index, line, &self.memory)?,
+            PlaceProjection::Field(field) => match root {
+                Value::Struct(struct_value) => {
+                    struct_value.field(field).cloned().ok_or_else(|| {
+                        error(
+                            line,
+                            crate::error_messages::struct_has_no_field(
+                                struct_value.type_name(),
+                                field,
+                            ),
+                        )
+                    })?
+                }
+                other => {
+                    return Err(error(
+                        line,
+                        crate::error_messages::cant_assign_field(field, other.type_name()),
+                    ));
+                }
+            },
+        };
+        self.write_place_value(&mut child, tail, value, line)?;
+        match projection {
+            PlaceProjection::Index(index) => {
+                ops::index_set_in(root, index, child, line, &self.memory)
+            }
+            PlaceProjection::Field(field) => match root {
+                Value::Struct(struct_value) => {
+                    let type_name = struct_value.type_name().to_string();
+                    if struct_value.__try_set_field_in(field, child, line, &self.memory)? {
+                        Ok(())
+                    } else {
+                        Err(error(
+                            line,
+                            crate::error_messages::struct_has_no_field(&type_name, field),
+                        ))
+                    }
+                }
+                other => Err(error(
+                    line,
+                    crate::error_messages::cant_assign_field(field, other.type_name()),
+                )),
+            },
+        }
+    }
+
+    fn commit_ref_places(
+        &mut self,
+        places: &[ResolvedPlace],
         values: Vec<Value>,
         line: u32,
     ) -> Result<(), NyblError> {
-        if targets.len() != values.len()
-            || targets.iter().any(|target| {
+        if places.len() != values.len()
+            || places.iter().any(|place| {
                 self.scopes
-                    .get(target.scope)
-                    .is_none_or(|scope| !scope.contains_key(&target.name))
+                    .get(place.target.scope)
+                    .is_none_or(|scope| !scope.contains_key(&place.target.name))
             })
         {
             return Err(error(
@@ -1043,8 +1316,14 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 "a `ref` target stopped being available before commit",
             ));
         }
-        for (target, value) in targets.iter().zip(values) {
-            self.scopes[target.scope].insert(target.name.clone(), value);
+        let mut candidates = Vec::with_capacity(places.len());
+        for (place, value) in places.iter().zip(values) {
+            let mut root = place.root.clone();
+            self.write_place_value(&mut root, &place.projections, value, line)?;
+            candidates.push(root);
+        }
+        for (place, root) in places.iter().zip(candidates) {
+            self.scopes[place.target.scope].insert(place.target.name.clone(), root);
         }
         Ok(())
     }
@@ -1084,6 +1363,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     }
 
     fn module_binding(&self, module: &crate::value::NyblModule, name: &str) -> Option<Value> {
+        // Establish export membership before consulting the defining module's
+        // full live environment, which also contains private bindings.
+        let exported = module.__binding(name)?;
         if module.path == self.active_value_module
             && let Some(value) = self
                 .scopes
@@ -1117,22 +1399,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         {
             return Some(value.clone());
         }
-        module.__binding(name)
-    }
-
-    fn get_var_mut(&mut self, name: &str) -> Option<&mut Value> {
-        for scope in self.scopes.iter_mut().rev() {
-            if let Some(value) = scope.get_mut(name) {
-                return Some(value);
-            }
-        }
-        None
-    }
-
-    fn has_active_declaration_alias(&self, name: &str) -> bool {
-        self.active_lexical_contexts
-            .last()
-            .is_some_and(|context| context.module_aliases.contains_key(name))
+        Some(exported)
     }
 
     fn set_var(&mut self, name: &str, value: Value) -> bool {
@@ -1648,6 +1915,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 self.eval_expr(expr)?;
                 Ok(Signal::None)
             }
+
+            // Module export validation and filtering are handled by the
+            // module surface pass. The declaration itself has no runtime
+            // side effect.
+            StmtKind::PublicSurface { .. } => Ok(Signal::None),
         }
     }
 
@@ -1836,7 +2108,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             None => bindings
                 .type_exports
                 .iter()
-                .filter(|(name, _)| alias.is_some() || !crate::naming::is_private(name))
+                .filter(|(name, _)| {
+                    alias.is_some() || bindings.explicit_surface || !crate::naming::is_private(name)
+                })
                 .map(|(name, origin)| (name.clone(), origin.clone()))
                 .collect(),
         };
@@ -1915,7 +2189,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             // Privacy: glob-only drops `_`-prefixed names.
             // Selective lets the user reach into private
             // bindings explicitly.
-            let skip_private = items.is_none();
+            let skip_private = items.is_none() && !bindings.explicit_surface;
             let module_top_scope = self.is_module_top_scope();
             for (name, mut value) in exports {
                 if skip_private && crate::naming::is_private(&name) {
@@ -2027,7 +2301,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         {
             let cache = self.imports.borrow();
             if let Some(ImportSlot::Loaded(bindings)) = cache.get(path) {
-                return Ok(bindings.clone());
+                return Ok((**bindings).clone());
             }
             if let Some(ImportSlot::Loading) = cache.get(path) {
                 return Err(error(
@@ -2059,9 +2333,10 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
 
         match result {
             Ok(bindings) => {
-                self.imports
-                    .borrow_mut()
-                    .insert(path.to_string(), ImportSlot::Loaded(bindings.clone()));
+                self.imports.borrow_mut().insert(
+                    path.to_string(),
+                    ImportSlot::Loaded(Box::new(bindings.clone())),
+                );
                 Ok(bindings)
             }
             Err(e) => {
@@ -2088,6 +2363,17 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     ) -> Result<ModuleBindings, NyblError> {
         let _ = line;
         let stmts = crate::parse(source)?;
+        let public_surface: Option<BTreeSet<String>> = {
+            let mut names = BTreeSet::new();
+            let mut explicit = false;
+            for stmt in &stmts {
+                if let StmtKind::PublicSurface { names: listed } = &stmt.kind {
+                    explicit = true;
+                    names.extend(listed.iter().cloned());
+                }
+            }
+            explicit.then_some(names)
+        };
         let imports = Rc::clone(&self.imports);
         let live_value_environments = Rc::clone(&self.live_value_environments);
         let live_binding_origins = Rc::clone(&self.live_binding_origins);
@@ -2157,7 +2443,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             .first_mut()
             .map(core::mem::take)
             .unwrap_or_default();
-        let bindings = match snapshot_module_bindings(
+        let mut bindings = match snapshot_module_bindings(
             &top_scope,
             &sub.binding_origins,
             module_path,
@@ -2179,7 +2465,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 return Err(snapshot_error);
             }
         };
-        let binding_origins = sub.binding_origins;
+        let mut binding_origins = sub.binding_origins;
         put_live_environment(
             &self.live_value_environments,
             module_path,
@@ -2189,7 +2475,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         self.live_binding_origins
             .borrow_mut()
             .insert(module_path.to_string(), binding_origins.clone());
-        let fn_decls: Vec<(String, FunctionDefinition)> = sub.functions.into_iter().collect();
+        let mut fn_decls: Vec<(String, FunctionDefinition)> = sub.functions.into_iter().collect();
         // Type decls and methods transfer with their full
         // identity. Engine builtins (`<builtin>` module path)
         // are seeded into every evaluator anyway, so we filter
@@ -2212,7 +2498,8 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 methods.push((type_key.clone(), method_name, fn_def));
             }
         }
-        let module_exports: BTreeMap<String, Rc<crate::value::NyblModule>> = bindings
+        let mut type_exports = sub.type_exports;
+        let all_module_exports: BTreeMap<String, Rc<crate::value::NyblModule>> = bindings
             .iter()
             .filter_map(|(name, value)| match value {
                 Value::Module(module) => Some((name.clone(), Rc::clone(module))),
@@ -2224,16 +2511,31 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         // Only exported module values are valid protected aliases after the
         // loading evaluator is gone. Type and function maps already reflect
         // every reached top-level publication incrementally.
-        lexical_context.module_aliases = Rc::new(module_exports.clone());
+        lexical_context.module_aliases = Rc::new(all_module_exports);
         let lexical_context = Rc::new(lexical_context);
+        let explicit_surface = public_surface.is_some();
+        if let Some(names) = public_surface {
+            bindings.retain(|(name, _)| names.contains(name));
+            binding_origins.retain(|name, _| names.contains(name));
+            fn_decls.retain(|(name, _)| names.contains(name));
+            type_exports.retain(|name, _| names.contains(name));
+        }
+        let module_exports: BTreeMap<String, Rc<crate::value::NyblModule>> = bindings
+            .iter()
+            .filter_map(|(name, value)| match value {
+                Value::Module(module) => Some((name.clone(), Rc::clone(module))),
+                _ => None,
+            })
+            .collect();
         Ok(ModuleBindings {
+            explicit_surface,
             bindings,
             binding_origins,
             fn_decls,
             struct_defs,
             enum_defs,
             methods,
-            type_exports: sub.type_exports,
+            type_exports,
             module_exports,
             lexical_context,
         })
@@ -2480,133 +2782,48 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 Ok(())
             }
             AssignTarget::Index { object, index } => {
-                let idx = self.eval_expr(index)?;
+                let mut projections = Vec::new();
+                let root =
+                    Self::decompose_place_expr(object, &mut projections).ok_or_else(|| {
+                        error(
+                            line,
+                            "Can only assign through a mutable place rooted in a variable",
+                        )
+                    })?;
+                projections.push(PlaceProjectionExpr::Index(index.clone()));
+                let plan = self.assignment_place_parts(root, projections, line)?;
+                let place = self.resolve_place(plan, 1, line)?;
                 let val_to_set = match op {
                     AssignOp::Eq => new_val,
                     _ => {
-                        let name = match &object.kind {
-                            ExprKind::Ident(name) => name,
-                            _ => {
-                                return Err(error(
-                                    line,
-                                    "Can only assign to indexed variables (like `arr[0] = val`)",
-                                ));
-                            }
-                        };
-                        let current = if let Some(obj) = self.get_var(name) {
-                            ops::index_get_in(obj, &idx, line, &self.memory)?
-                        } else if self.has_active_declaration_alias(name) {
-                            return Err(error(
-                                line,
-                                crate::error_messages::variable_not_found(name),
-                            ));
-                        } else {
-                            // Preserve the identifier evaluator's existing
-                            // not-found hint / named-function fallback on the
-                            // error path without cloning ordinary receivers.
-                            let obj = self.eval_expr(object)?;
-                            ops::index_get_in(&obj, &idx, line, &self.memory)?
-                        };
+                        let current =
+                            self.place_value_from(&place.root, &place.projections, line)?;
                         self.apply_compound_op(&current, op, &new_val, line)?
                     }
                 };
-                if let ExprKind::Ident(name) = &object.kind {
-                    let memory = self.memory.clone();
-                    let declaration_alias = self.has_active_declaration_alias(name);
-                    let obj = self.get_var_mut(name).ok_or_else(|| {
-                        if declaration_alias {
-                            error(line, crate::error_messages::variable_not_found(name))
-                        } else {
-                            error(line, format!("Variable `{name}` doesn't exist"))
-                        }
-                    })?;
-                    // Mutate through the live binding. Cloning the receiver
-                    // first would temporarily raise its CoW refcount and force
-                    // an otherwise-unnecessary full backing-store detach.
-                    ops::index_set_in(obj, &idx, val_to_set, line, &memory)?;
-                    Ok(())
-                } else {
-                    Err(error(
-                        line,
-                        "Can only assign to indexed variables (like `arr[0] = val`)",
-                    ))
-                }
+                self.commit_ref_places(&[place], vec![val_to_set], line)
             }
             AssignTarget::Field { object, field } => {
-                // Support assignment into a named struct field.
-                // Only bare-`Ident` objects are assignable — the
-                // writeback goes through `set_var`, so chains like
-                // `foo().x = 1` or `arr[0].x = 1` aren't
-                // supported yet (matches index-assign behaviour).
-                let name = match &object.kind {
-                    ExprKind::Ident(n) => n.clone(),
-                    _ => {
-                        return Err(error(
+                let mut projections = Vec::new();
+                let root =
+                    Self::decompose_place_expr(object, &mut projections).ok_or_else(|| {
+                        error(
                             line,
-                            "Can only assign to fields of named variables (like `p.x = val`)",
-                        ));
-                    }
-                };
-                let memory = self.memory.clone();
-                let declaration_alias = self.has_active_declaration_alias(&name);
+                            "Can only assign through a mutable place rooted in a variable",
+                        )
+                    })?;
+                projections.push(PlaceProjectionExpr::Field(field.clone()));
+                let plan = self.assignment_place_parts(root, projections, line)?;
+                let place = self.resolve_place(plan, 1, line)?;
                 let val_to_set = match op {
                     AssignOp::Eq => new_val,
                     _ => {
-                        let obj = self.get_var(&name).ok_or_else(|| {
-                            if declaration_alias {
-                                error(line, crate::error_messages::variable_not_found(&name))
-                            } else {
-                                error(line, format!("Variable `{name}` doesn't exist"))
-                            }
-                        })?;
-                        let current = match obj {
-                            Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
-                                error(
-                                    line,
-                                    crate::error_messages::struct_has_no_field(
-                                        s.type_name(),
-                                        field,
-                                    ),
-                                )
-                            })?,
-                            other => {
-                                return Err(error(
-                                    line,
-                                    crate::error_messages::cant_assign_field(
-                                        field,
-                                        other.type_name(),
-                                    ),
-                                ));
-                            }
-                        };
+                        let current =
+                            self.place_value_from(&place.root, &place.projections, line)?;
                         self.apply_compound_op(&current, op, &new_val, line)?
                     }
                 };
-                let obj = self.get_var_mut(&name).ok_or_else(|| {
-                    if declaration_alias {
-                        error(line, crate::error_messages::variable_not_found(&name))
-                    } else {
-                        error(line, format!("Variable `{name}` doesn't exist"))
-                    }
-                })?;
-                match obj {
-                    Value::Struct(s) => {
-                        let struct_type = s.type_name().to_string();
-                        if !s.__try_set_field_in(field, val_to_set, line, &memory)? {
-                            return Err(error(
-                                line,
-                                crate::error_messages::struct_has_no_field(&struct_type, field),
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(error(
-                            line,
-                            crate::error_messages::cant_assign_field(field, other.type_name()),
-                        ));
-                    }
-                }
-                Ok(())
+                self.commit_ref_places(&[place], vec![val_to_set], line)
             }
         }
     }
@@ -2841,10 +3058,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             } => {
                 let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
 
-                // A named built-in mutating receiver is a staged implicit-ref
-                // place. Classify it without cloning its value; ordinary
-                // arguments run first, then copy-in observes their side
-                // effects, and only a successful method result writes back.
+                // Keep the direct-binding fast path for a bare array. It
+                // avoids manufacturing a second CoW owner immediately before
+                // mutation, which preserves exact instance memory accounting.
                 if methods::is_mutating_method(method)
                     && let ExprKind::Ident(name) = &object.kind
                     && matches!(self.get_var(name), Some(Value::Array(_)))
@@ -2891,9 +3107,73 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                     );
                 }
 
-                // Every other receiver expression is the callee expression:
-                // evaluate it once before mode/arity preflight and arguments.
-                let obj_val = self.eval_expr(object)?;
+                // Preserve a resolved place while evaluating an index/field
+                // receiver exactly once. Read-only methods use only the leaf;
+                // mutating built-ins and `ref self` methods can later commit a
+                // replacement leaf through the retained projection chain.
+                let mut receiver_place = if let Some(plan) = self.read_place_plan(object) {
+                    Some(self.resolve_place(plan, 1, expr.line)?)
+                } else {
+                    None
+                };
+                let obj_val = if let Some(place) = &receiver_place {
+                    self.place_value_from(&place.root, &place.projections, expr.line)?
+                } else {
+                    self.eval_expr(object)?
+                };
+
+                if methods::is_mutating_method(method)
+                    && matches!(obj_val, Value::Array(_))
+                    && receiver_place.is_some()
+                {
+                    crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
+                    let expected = methods::builtin_method_arity(method)
+                        .expect("mutating built-in has arity metadata");
+                    if args.len() != expected {
+                        return Err(error(
+                            expr.line,
+                            format!(
+                                "`.{}()` needs {} argument{}",
+                                method,
+                                expected,
+                                if expected == 1 { "" } else { "s" }
+                            ),
+                        ));
+                    }
+                    let place = receiver_place
+                        .take()
+                        .expect("place presence checked for mutating receiver");
+                    self.validate_mutable_place(&place, 1, expr.line)?;
+                    let mut eval_args = Vec::with_capacity(args.len());
+                    for arg in args {
+                        eval_args.push(self.eval_expr(&arg.value)?);
+                    }
+                    if let Some(error) = self.pending_memory_error(expr.line) {
+                        return Err(error);
+                    }
+                    // Arguments may mutate the same root. Copy-in therefore
+                    // occurs after argument evaluation, using the already
+                    // evaluated projection values.
+                    let current_root = self
+                        .binding_value(&place.target)
+                        .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
+                    let mut leaf =
+                        self.place_value_from(&current_root, &place.projections, expr.line)?;
+                    let result = methods::transactional_array_method_in(
+                        &mut leaf,
+                        method,
+                        eval_args,
+                        expr.line,
+                        &self.memory,
+                    )?;
+                    let committed = ResolvedPlace {
+                        target: place.target,
+                        root: current_root,
+                        projections: place.projections,
+                    };
+                    self.commit_ref_places(&[committed], vec![leaf], expr.line)?;
+                    return Ok(result);
+                }
                 let type_key: Option<(String, String)> = match &obj_val {
                     Value::Struct(s) => {
                         Some((s.module_path().to_string(), s.type_name().to_string()))
@@ -2910,51 +3190,31 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                         .and_then(|ms| ms.get(method))
                         .cloned();
                     if let Some(m) = user {
-                        let receiver_target = if m
+                        let receiver_place = if m
                             .param_modes
                             .first()
                             .is_some_and(|mode| *mode == ParamMode::Ref)
                         {
-                            let ExprKind::Ident(name) = &object.kind else {
+                            let Some(place) = receiver_place.take() else {
                                 let mut error = NyblError::runtime(
-                                    "a `ref` method receiver must be a variable",
+                                    "a `ref` method receiver must be a mutable place",
                                     expr.line,
                                 );
                                 error.friendly_hint = Some(
-                                    "Store the value in a `let` binding before calling this method."
+                                    "Store the value in a `let` binding, or call through one of its fields or indexes."
                                         .to_string(),
                                 );
                                 return Err(error);
                             };
-                            if crate::naming::is_constant_name(name) {
-                                return Err(crate::error_messages::constant_mutation_error(
-                                    name, expr.line,
-                                ));
-                            }
-                            let target = self
-                                .resolve_binding_identity(name)
-                                .ok_or_else(|| {
-                                    let mut error = NyblError::runtime(
-                                        "a `ref` method receiver must be a variable",
-                                        expr.line,
-                                    );
-                                    error.friendly_hint = Some(
-                                        "Store the value in a `let` binding before calling this method."
-                                            .to_string(),
-                                    );
-                                    error
-                                })?;
-                            if self.active_capture_bindings.contains(&target) {
-                                return Err(crate::ref_params::captured_ref_target(1, expr.line));
-                            }
-                            Some(target)
+                            self.validate_mutable_place(&place, 1, expr.line)?;
+                            Some(place)
                         } else {
                             None
                         };
                         return self.eval_user_method_call(
                             MethodReceiver {
                                 value: obj_val,
-                                target: receiver_target,
+                                place: receiver_place,
                             },
                             &key.1,
                             method,
@@ -3000,7 +3260,8 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 }
 
                 crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
-                if let Some(expected) = methods::builtin_method_arity(method)
+                if !matches!(&obj_val, Value::Host(_))
+                    && let Some(expected) = methods::builtin_method_arity(method)
                     && args.len() != expected
                 {
                     return Err(error(
@@ -3425,21 +3686,28 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 "This function was compiled for another engine and can't be run in the tree-walker",
             ));
         }
-        if args.len() != func.params.len() {
+        if !crate::ref_params::accepts_arity(&func.param_modes, args.len()) {
+            let required = crate::ref_params::required_arity(&func.param_modes);
+            let variadic = matches!(func.param_modes.last(), Some(ParamMode::Rest));
             return Err(error(
                 line,
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    callable,
-                    func.params.len(),
-                    if func.params.len() == 1 { "" } else { "s" },
-                    args.len()
-                ),
+                if variadic {
+                    format!(
+                        "`{callable}` expects at least {required} arguments, but got {}",
+                        args.len()
+                    )
+                } else {
+                    format!(
+                        "`{callable}` expects {required} argument{}, but got {}",
+                        if required == 1 { "" } else { "s" },
+                        args.len()
+                    )
+                },
             ));
         }
         let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
         crate::validate_call_modes(callable, &func.param_modes, &actual_modes, line)?;
-        let targets = self.preflight_ref_targets(args, line)?;
+        let plans = self.preflight_ref_places(args, line)?;
 
         // Ordinary argument expressions run left-to-right. Ref places are
         // intentionally not read yet: side effects here must be visible in
@@ -3449,10 +3717,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             evaluated.push(match arg.mode {
                 ParamMode::Value => Some(self.eval_expr(&arg.value)?),
                 ParamMode::Ref => None,
+                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
             });
         }
 
-        let mut target_iter = targets.iter();
+        let mut plan_iter = plans.into_iter();
+        let mut places = Vec::new();
         let mut ref_positions = Vec::new();
         let mut call_args = Vec::with_capacity(args.len());
         for (index, (arg, value)) in args.iter().zip(evaluated).enumerate() {
@@ -3461,25 +3731,26 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                     call_args.push(value.expect("value argument was evaluated"));
                 }
                 ParamMode::Ref => {
-                    let target = target_iter.next().expect("target preflight matched modes");
-                    let snapshot = self
-                        .binding_value(target)
-                        .ok_or_else(|| crate::ref_params::invalid_ref_target(index + 1, line))?;
+                    let plan = plan_iter.next().expect("place preflight matched modes");
+                    let place = self.resolve_place(plan, index + 1, line)?;
+                    let snapshot = self.place_value_from(&place.root, &place.projections, line)?;
                     call_args.push(snapshot);
+                    places.push(place);
                     ref_positions.push(index);
                 }
+                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
             }
         }
 
         let (value, staged) =
             self.call_nybl_fn_with_refs(&func, call_args, &ref_positions, line)?;
-        self.commit_ref_targets(&targets, staged, line)?;
+        self.commit_ref_places(&places, staged, line)?;
         Ok(value)
     }
 
     fn eval_user_method_call(
         &mut self,
-        receiver: MethodReceiver,
+        mut receiver: MethodReceiver,
         receiver_type: &str,
         method: &str,
         definition: FunctionDefinition,
@@ -3487,21 +3758,21 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         line: u32,
     ) -> Result<Value, NyblError> {
         let actual_arity = args.len() + 1;
-        if definition.params.len() != actual_arity {
+        if !crate::ref_params::accepts_arity(&definition.param_modes, actual_arity) {
+            let required = crate::ref_params::required_arity(&definition.param_modes);
+            let variadic = matches!(definition.param_modes.last(), Some(ParamMode::Rest));
             return Err(error(
                 line,
-                format!(
-                    "`{}.{}` expects {} argument{} (including `self`), but got {}",
-                    receiver_type,
-                    method,
-                    definition.params.len(),
-                    if definition.params.len() == 1 {
-                        ""
-                    } else {
-                        "s"
-                    },
-                    actual_arity
-                ),
+                if variadic {
+                    format!(
+                        "`{receiver_type}.{method}` expects at least {required} arguments (including `self`), but got {actual_arity}"
+                    )
+                } else {
+                    format!(
+                        "`{receiver_type}.{method}` expects {required} argument{} (including `self`), but got {actual_arity}",
+                        if required == 1 { "" } else { "s" }
+                    )
+                },
             ));
         }
         // The exact total-arity check above guarantees the implicit receiver
@@ -3510,9 +3781,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         let expected_modes = &definition.param_modes[1..];
         let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
         crate::validate_call_modes(method, expected_modes, &actual_modes, line)?;
-        let explicit_targets = self.preflight_ref_targets(args, line)?;
-        if let Some(receiver_target) = &receiver.target
-            && explicit_targets.contains(receiver_target)
+        let explicit_plans = self.preflight_ref_places(args, line)?;
+        if let Some(receiver_place) = &receiver.place
+            && explicit_plans
+                .iter()
+                .any(|place| place.target == receiver_place.target)
         {
             return Err(crate::ref_params::duplicate_ref_target(line));
         }
@@ -3522,16 +3795,20 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             evaluated.push(match arg.mode {
                 ParamMode::Value => Some(self.eval_expr(&arg.value)?),
                 ParamMode::Ref => None,
+                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
             });
         }
-        let mut target_iter = explicit_targets.iter();
+        let mut plan_iter = explicit_plans.into_iter();
+        let mut explicit_places = Vec::new();
         let mut full_args = Vec::with_capacity(args.len() + 1);
         let mut ref_positions = Vec::new();
-        if let Some(target) = &receiver.target {
-            full_args.push(
-                self.binding_value(target)
-                    .ok_or_else(|| crate::ref_params::invalid_ref_target(1, line))?,
-            );
+        if let Some(place) = &mut receiver.place {
+            // Receiver projections were evaluated before argument preflight,
+            // but copy-in observes argument side effects to the root.
+            place.root = self
+                .binding_value(&place.target)
+                .ok_or_else(|| crate::ref_params::invalid_ref_target(1, line))?;
+            full_args.push(self.place_value_from(&place.root, &place.projections, line)?);
             ref_positions.push(0);
         } else {
             full_args.push(receiver.value);
@@ -3542,25 +3819,24 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                     full_args.push(value.expect("ordinary method argument was evaluated"));
                 }
                 ParamMode::Ref => {
-                    let target = target_iter.next().expect("target count matched ref modes");
-                    full_args.push(
-                        self.binding_value(target).ok_or_else(|| {
-                            crate::ref_params::invalid_ref_target(index + 1, line)
-                        })?,
-                    );
+                    let plan = plan_iter.next().expect("place count matched ref modes");
+                    let place = self.resolve_place(plan, index + 1, line)?;
+                    full_args.push(self.place_value_from(&place.root, &place.projections, line)?);
+                    explicit_places.push(place);
                     ref_positions.push(index + 1);
                 }
+                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
             }
         }
         let (value, staged) =
             self.call_nybl_fn_with_refs(&definition, full_args, &ref_positions, line)?;
-        let mut targets =
-            Vec::with_capacity(explicit_targets.len() + usize::from(receiver.target.is_some()));
-        if let Some(target) = receiver.target {
-            targets.push(target);
+        let mut places =
+            Vec::with_capacity(explicit_places.len() + usize::from(receiver.place.is_some()));
+        if let Some(place) = receiver.place {
+            places.push(place);
         }
-        targets.extend(explicit_targets);
-        self.commit_ref_targets(&targets, staged, line)?;
+        places.extend(explicit_places);
+        self.commit_ref_places(&places, staged, line)?;
         Ok(value)
     }
 
@@ -3629,15 +3905,13 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         args: Vec<Value>,
         line: u32,
     ) -> Result<Value, NyblError> {
-        if args.len() == func.params.len() {
-            let actual_modes = vec![ParamMode::Value; args.len()];
-            crate::validate_call_modes(
-                func.self_name.as_deref().unwrap_or("fn"),
-                &func.param_modes,
-                &actual_modes,
-                line,
-            )?;
-        }
+        let actual_modes = vec![ParamMode::Value; args.len()];
+        crate::validate_call_modes(
+            func.self_name.as_deref().unwrap_or("fn"),
+            &func.param_modes,
+            &actual_modes,
+            line,
+        )?;
         self.call_nybl_fn_with_refs(func, args, &[], line)
             .map(|(value, _)| value)
     }
@@ -3645,7 +3919,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     fn call_nybl_fn_with_refs(
         &mut self,
         func: &Rc<NyblFn>,
-        args: Vec<Value>,
+        mut args: Vec<Value>,
         ref_positions: &[usize],
         line: u32,
     ) -> Result<(Value, Vec<Value>), NyblError> {
@@ -3664,18 +3938,30 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 ));
             }
         };
-        if args.len() != func.params.len() {
+        if !crate::ref_params::accepts_arity(&func.param_modes, args.len()) {
             let name = func.self_name.as_deref().unwrap_or("fn");
+            let required = crate::ref_params::required_arity(&func.param_modes);
+            let variadic = matches!(func.param_modes.last(), Some(ParamMode::Rest));
             return Err(error(
                 line,
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    name,
-                    func.params.len(),
-                    if func.params.len() == 1 { "" } else { "s" },
-                    args.len()
-                ),
+                if variadic {
+                    format!(
+                        "`{name}` expects at least {required} arguments, but got {}",
+                        args.len()
+                    )
+                } else {
+                    format!(
+                        "`{name}` expects {required} argument{}, but got {}",
+                        if required == 1 { "" } else { "s" },
+                        args.len()
+                    )
+                },
             ));
+        }
+        if matches!(func.param_modes.last(), Some(ParamMode::Rest)) {
+            let required = crate::ref_params::required_arity(&func.param_modes);
+            let extras = args.split_off(required);
+            args.push(Value::__try_new_array_in(extras, line, &self.memory)?);
         }
 
         if self.call_depth >= MAX_CALL_DEPTH {
@@ -4034,17 +4320,25 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 .and_then(|ms| ms.get(method))
                 .cloned();
             if let Some(m) = user {
-                if m.params.len() != args.len() + 1 {
+                if !crate::ref_params::accepts_arity(&m.param_modes, args.len() + 1) {
+                    let required = crate::ref_params::required_arity(&m.param_modes);
+                    let variadic = matches!(m.param_modes.last(), Some(ParamMode::Rest));
                     return Err(error(
                         line,
-                        format!(
-                            "`{}.{}` expects {} argument{} (including `self`), but got {}",
-                            key.1,
-                            method,
-                            m.params.len(),
-                            if m.params.len() == 1 { "" } else { "s" },
-                            args.len() + 1
-                        ),
+                        if variadic {
+                            format!(
+                                "`{}.{method}` expects at least {required} arguments (including `self`), but got {}",
+                                key.1,
+                                args.len() + 1
+                            )
+                        } else {
+                            format!(
+                                "`{}.{method}` expects {required} argument{} (including `self`), but got {}",
+                                key.1,
+                                if required == 1 { "" } else { "s" },
+                                args.len() + 1
+                            )
+                        },
                     ));
                 }
                 let mut full_args = Vec::with_capacity(args.len() + 1);
@@ -4059,7 +4353,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     }
 
     fn call_method(
-        &self,
+        &mut self,
         obj: &Value,
         method: &str,
         args: &[Value],
@@ -4091,6 +4385,13 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             Value::Int(_) | Value::Number(_) => methods::numeric_method(obj, method, args, line),
             Value::Bool(_) => methods::bool_method(obj, method, args, line),
             Value::Iter(_) => methods::iter_method_in(obj, method, args, line, &self.memory),
+            Value::Host(value) => match self.host.call_method(value, method, args, line) {
+                Some(result) => result.map(|value| (value, None)),
+                None => Err(error(
+                    line,
+                    crate::error_messages::no_such_method(obj.type_name(), method),
+                )),
+            },
             _ => Err(error(
                 line,
                 crate::error_messages::no_such_method(obj.type_name(), method),
@@ -4703,15 +5004,19 @@ impl ReplSession {
                 "This function belongs to a different Nybl engine instance",
             ));
         }
-        if arg_count != function.params.len() {
+        if !crate::ref_params::accepts_arity(&function.param_modes, arg_count) {
+            let required = crate::ref_params::required_arity(&function.param_modes);
+            let variadic = matches!(function.param_modes.last(), Some(ParamMode::Rest));
             return Err(error(
                 0,
-                format!(
-                    "Function expects {} argument{}, but got {}",
-                    function.params.len(),
-                    if function.params.len() == 1 { "" } else { "s" },
-                    arg_count,
-                ),
+                if variadic {
+                    format!("Function expects at least {required} arguments, but got {arg_count}")
+                } else {
+                    format!(
+                        "Function expects {required} argument{}, but got {arg_count}",
+                        if required == 1 { "" } else { "s" }
+                    )
+                },
             ));
         }
         Ok(())
@@ -4925,7 +5230,14 @@ impl ReplSession {
         self.abi_declarations
             .iter()
             .filter(|(_, visibility, _)| *visibility == Visibility::Public)
-            .map(|(name, _, target)| crate::EntryPoint::__new(name.clone(), target.params.len()))
+            .map(|(name, _, target)| {
+                let required = crate::ref_params::required_arity(&target.param_modes);
+                if matches!(target.param_modes.last(), Some(ParamMode::Rest)) {
+                    crate::EntryPoint::__new_variadic(name.clone(), required)
+                } else {
+                    crate::EntryPoint::__new(name.clone(), required)
+                }
+            })
             .collect()
     }
 
@@ -4945,16 +5257,23 @@ impl ReplSession {
             })
             .map(|(_, _, target)| Rc::clone(target))
             .ok_or_else(|| error(0, format!("Entry point `{name}` is not available")))?;
-        if args.len() != target.params.len() {
+        if !crate::ref_params::accepts_arity(&target.param_modes, args.len()) {
+            let required = crate::ref_params::required_arity(&target.param_modes);
+            let variadic = matches!(target.param_modes.last(), Some(ParamMode::Rest));
             return Err(error(
                 0,
-                format!(
-                    "`{}` expects {} argument{}, but got {}",
-                    name,
-                    target.params.len(),
-                    if target.params.len() == 1 { "" } else { "s" },
-                    args.len(),
-                ),
+                if variadic {
+                    format!(
+                        "`{name}` expects at least {required} arguments, but got {}",
+                        args.len()
+                    )
+                } else {
+                    format!(
+                        "`{name}` expects {required} argument{}, but got {}",
+                        if required == 1 { "" } else { "s" },
+                        args.len()
+                    )
+                },
             ));
         }
         let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());

@@ -71,6 +71,26 @@ print(repeat_string("ha", 3))    // "hahaha"
 
 Parameters are positional. There are no default values or type annotations.
 
+### Rest parameters
+
+A final `..name` parameter collects any remaining positional arguments into an
+array. It accepts zero or more values and works on named functions, function
+expressions, and methods:
+
+```nybl
+fn collect(first, ..rest) {
+  return [first, rest]
+}
+
+print(collect(1))          // [1, []]
+print(collect(1, 2, 3))    // [1, [2, 3]]
+```
+
+The rest parameter must be last and cannot be `ref`. Fixed `ref` parameters
+may precede it, but every collected argument is value-only. Public instance
+entry points with a rest parameter expose their fixed parameter count as the
+minimum accepted arity.
+
 ### Reference parameters
 
 Use a `ref` parameter when a function should replace one of the caller's

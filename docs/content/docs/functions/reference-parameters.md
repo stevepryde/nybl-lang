@@ -41,7 +41,7 @@ is an error with a hint that identifies the argument.
 A reference parameter is a staged local value, not an observable alias into
 the caller's scope:
 
-1. Nybl snapshots the caller variable when the call begins.
+1. Nybl snapshots the caller place when the call begins.
 2. The function reads and changes its staged parameter.
 3. A normal return writes every staged reference parameter back to its caller
    variable.
@@ -87,12 +87,19 @@ print(result.is_err(), items)    // true [1]
 
 ## Valid reference targets
 
-An explicit `ref` argument must name one mutable plain-variable binding:
+An explicit `ref` argument must be a mutable place rooted in a `let` binding.
+Fields and indexes can be chained to any depth:
 
 ```nybl
 let value = 1
 set(ref value)       // valid
 set(ref (value))     // also valid; grouping is transparent
+
+let rows = [[1, 2]]
+set(ref rows[0][1])  // valid nested place
+
+let record = Record { items: [1] }
+set(ref record.items[0])
 ```
 
 These are not valid targets:
@@ -101,21 +108,24 @@ These are not valid targets:
 const FIXED = 1
 // set(ref FIXED)          // constant
 // set(ref 1)              // literal or other expression
-// set(ref values[0])      // index
-// set(ref record.field)   // field
+// set(ref make_record().field) // temporary root
 ```
 
 A variable captured by a closure cannot be a reference target. Pass it through
 an explicit reference parameter instead. A reference parameter itself also
 cannot be captured by a nested function or lambda.
 
-The same binding cannot fill two reference positions in one call:
+The same root binding cannot fill two reference positions in one call, even
+when the projections differ:
 
 ```nybl
 fn pair(ref left, ref right) {}
 
 let value = 1
 // pair(ref value, ref value)   // error
+
+let values = [1, 2]
+// pair(ref values[0], ref values[1]) // same root, also an error
 ```
 
 Use distinct variables. This fence prevents observable aliasing and lets all
@@ -165,7 +175,7 @@ Calls use a deterministic order:
 2. check that it is callable and verify arity, argument modes, and reference
    target shapes that can be rejected immediately;
 3. evaluate ordinary argument expressions from left to right;
-4. resolve and snapshot reference targets in parameter order;
+4. evaluate index expressions and snapshot reference places in parameter order;
 5. execute the function.
 
 Mode or target-shape errors therefore prevent ordinary argument side effects.
@@ -198,9 +208,9 @@ print(counter.amount)    // 7
 ```
 
 Method-call syntax supplies the receiver reference implicitly, so the call is
-`counter.add(4)`, not `ref counter.add(4)`. The receiver must be a mutable
-plain-variable binding. Constants, temporaries, indexes, fields, and captured
-bindings are rejected before ordinary argument side effects.
+`counter.add(4)`, not `ref counter.add(4)`. The receiver may be any mutable
+field/index place rooted in a `let` binding. Constants, temporary roots, and
+captured bindings are rejected.
 
 A method may also declare explicit reference parameters after the receiver:
 
@@ -216,24 +226,28 @@ counter.transfer(ref total)
 print(counter.amount, total)    // 0 7
 ```
 
-The mutable receiver and explicit targets are snapshotted in parameter order
-after ordinary arguments run. They must identify distinct bindings and commit
+Receiver index expressions are evaluated once before call preflight and
+ordinary arguments. The mutable receiver and explicit targets are snapshotted
+in parameter order after ordinary arguments run. They must identify distinct roots and commit
 together on a normal return; any runtime or resource error rolls all of them
 back.
 
 Built-in mutating array methods use the same transaction model implicitly for
-a mutable plain-variable receiver. You do not write `ref` before the receiver:
+a mutable place receiver. You do not write `ref` before the receiver:
 
 ```nybl
 let items = [1]
 items.push(2)
+
+let groups = [[1]]
+groups[0].push(2)    // writes back through the index
 ```
 
 Method arguments run before Nybl snapshots the receiver. A true temporary may
 be mutated, but its mutation is discarded after the method returns:
 `([1, 2]).pop()` returns `2`, while `[1, 2].push(3)` returns `none`.
-Mutating through an index or field receiver is rejected with an
-assign-mutate-reassign hint until those places become referenceable.
+Nested receiver updates rebuild and commit the root atomically; an error leaves
+the complete root unchanged.
 
 See [Methods → Mutating receivers](/docs/reference/methods/#mutating-receivers)
 for the built-in behavior.

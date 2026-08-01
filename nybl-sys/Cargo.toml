@@ -22,7 +22,7 @@ name = "nybl_sys"
 # bundling the `nybl-std` blob at this layer; we forward the
 # feature explicitly below so embedders still get it when they
 # want it. Rust `std` itself is required by this host crate.
-nybl = { version = "0.4.0", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std"] }
+nybl = { version = "0.4.1", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std"] }
 
 [features]
 default = ["nybl-std"]

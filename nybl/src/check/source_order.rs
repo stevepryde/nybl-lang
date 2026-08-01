@@ -154,7 +154,8 @@ where
                 | StmtKind::EnumDecl { .. }
                 | StmtKind::StructDecl { .. }
                 | StmtKind::Break
-                | StmtKind::Continue => {}
+                | StmtKind::Continue
+                | StmtKind::PublicSurface { .. } => {}
             }
         }
         effects
@@ -470,7 +471,7 @@ where
                     env.bind_type(name, TypeBinding::Opaque);
                 }
             }
-            StmtKind::Break | StmtKind::Continue => {}
+            StmtKind::Break | StmtKind::Continue | StmtKind::PublicSurface { .. } => {}
         }
         effects
     }

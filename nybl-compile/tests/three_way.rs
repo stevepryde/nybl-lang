@@ -431,6 +431,59 @@ fn parse_envelope(stdout: &str) -> Vec<(String, Outcome)> {
 
 const CORPUS: &[(&str, &str)] = &[
     (
+        "place_indices_run_before_root_snapshot",
+        r#"let values = [0, 1]
+fn assign() { values[values.pop()] = 9 }
+print(try_call(assign))
+print(values)"#,
+    ),
+    (
+        "rest_parameters_named_lambda_method_and_ref_self",
+        r#"struct Box { value }
+fn Box.join(self, prefix, ..items) { return [self.value, prefix, items] }
+struct Counter { value }
+fn Counter.add(ref self, ..items) { self.value += items.len(); return items }
+fn collect(first, ..items) { return [first, items] }
+let gather = fn(..items) { return items }
+let box = Box { value: 7 }
+let counter = Counter { value: 10 }
+print(collect(1), collect(1, 2, 3))
+print(gather(), gather("a", "b"))
+print(box.join("x", 8, 9))
+print(counter.add(1, 2, 3), counter.value)
+let calls = 0
+fn tick() { calls += 1; return calls }
+fn invalid_rest_ref() { let target = 0; return collect(0, tick(), ref target) }
+print(try_call(invalid_rest_ref), calls)"#,
+    ),
+    (
+        "nested_places_assignment_ref_and_mutating_receivers",
+        r#"struct Bucket { items }
+struct State { buckets }
+let state = State { buckets: [Bucket { items: [1, 2] }] }
+state.buckets[0].items[1] += 5
+state.buckets[0].items.push(8)
+fn replace(ref value) { value = 11 }
+replace(ref state.buckets[0].items[0])
+print(state.buckets[0].items)"#,
+    ),
+    (
+        "nested_ref_self_order_rollback_and_duplicate_root",
+        r#"struct Counter { value }
+struct Holder { counters, other }
+fn Counter.add(ref self, amount) { self.value += amount; return self.value }
+fn Counter.fail(ref self) { self.value = 99; panic("rollback") }
+fn Counter.copy(ref self, ref other) { self.value = other; other += 1 }
+let holder = Holder { counters: [Counter { value: 1 }], other: 5 }
+fn index() { print("index"); return 0 }
+fn amount() { print("arg"); return 2 }
+print(holder.counters[index()].add(amount()), holder.counters[0].value)
+fn fail() { holder.counters[0].fail() }
+print(try_call(fail), holder.counters[0].value)
+fn duplicate() { holder.counters[0].copy(ref holder.other) }
+print(try_call(duplicate), holder.counters[0].value, holder.other)"#,
+    ),
+    (
         "ref_commit_forward_returned_err_and_runtime_rollback",
         r#"fn inner(ref value) { value += 2 }
 fn outer(ref value) { inner(ref value); value *= 3 }
@@ -2094,6 +2147,32 @@ type ImportCase = (
 );
 
 const IMPORTS_CORPUS: &[ImportCase] = &[
+    (
+        "explicit_public_surfaces_filter_globs_aliases_types_and_reexports",
+        r#"use leaf as leaf
+use leaf
+use facade as facade
+print(leaf.visible, visible, _shown, leaf.read_hidden(), facade.visible, facade.read_hidden())
+print(leaf.Visible { value: 4 }, Visible { value: 5 })
+print(facade.gather(6, 7))"#,
+        &[
+            (
+                "leaf",
+                r#"let visible = 1
+let hidden = 2
+let _shown = 3
+struct Visible { value }
+struct Hidden { value }
+fn read_hidden() { return hidden }
+fn gather(..items) { return items }
+pub { visible, _shown, read_hidden, gather, Visible }"#,
+            ),
+            (
+                "facade",
+                "use leaf.{visible, read_hidden, gather}\npub { visible, read_hidden, gather }",
+            ),
+        ],
+    ),
     (
         "incremental_type_publication_preserves_source_order_and_module_context",
         r#"fn make_later() { return Later {} }
@@ -3829,6 +3908,38 @@ fn three_way_incremental_type_publication_semantics() {
         })
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), NAMES.len());
+    assert_three_way(&entries);
+}
+
+#[test]
+#[ignore]
+fn three_way_rest_surfaces_and_place_snapshot_order() {
+    const FLAT_NAMES: &[&str] = &[
+        "rest_parameters_named_lambda_method_and_ref_self",
+        "place_indices_run_before_root_snapshot",
+    ];
+    const IMPORT_NAMES: &[&str] =
+        &["explicit_public_surfaces_filter_globs_aliases_types_and_reexports"];
+    let mut entries = CORPUS
+        .iter()
+        .filter(|(name, _)| FLAT_NAMES.contains(name))
+        .map(|(name, source)| CorpusEntry {
+            name,
+            source,
+            modules: &[],
+        })
+        .collect::<Vec<_>>();
+    entries.extend(
+        IMPORTS_CORPUS
+            .iter()
+            .filter(|(name, _, _)| IMPORT_NAMES.contains(name))
+            .map(|(name, source, modules)| CorpusEntry {
+                name,
+                source,
+                modules,
+            }),
+    );
+    assert_eq!(entries.len(), FLAT_NAMES.len() + IMPORT_NAMES.len());
     assert_three_way(&entries);
 }
 

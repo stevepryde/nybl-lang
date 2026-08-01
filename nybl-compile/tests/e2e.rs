@@ -85,6 +85,14 @@ fn write_scratch_project(test_name: &str, rust_src: &str) -> PathBuf {
     let nybl_path = root.join("nybl");
     let nybl_sys_path = root.join("nybl-sys");
     let nybl_vm_path = root.join("nybl-vm");
+    let nybl_vm_dependency = if rust_src.contains("::nybl_vm") {
+        format!(
+            "nybl-vm = {{ path = {:?} }}\n",
+            nybl_vm_path.to_string_lossy()
+        )
+    } else {
+        String::new()
+    };
     let manifest = format!(
         r#"[package]
 name = "nybl-e2e-{name}"
@@ -95,7 +103,7 @@ publish = false
 [dependencies]
 nybl = {{ path = "{nybl}", package = "nybl-lang" }}
 nybl-sys = {{ path = "{nybl_sys}" }}
-nybl-vm = {{ path = "{nybl_vm}" }}
+{nybl_vm_dependency}
 
 [[bin]]
 name = "program"
@@ -106,7 +114,6 @@ path = "src/main.rs"
         name = test_name,
         nybl = nybl_path.display(),
         nybl_sys = nybl_sys_path.display(),
-        nybl_vm = nybl_vm_path.display(),
     );
     std::fs::write(dir.join("Cargo.toml"), manifest).expect("write Cargo.toml");
     std::fs::write(src_dir.join("main.rs"), rust_src).expect("write main.rs");
@@ -1824,63 +1831,6 @@ fn main() {
     assert_eq!(run.stdout, "1\ncalls=0");
 }
 
-fn assert_aot_nested_mutation_error(code: &str, test_name: &str, expected_line: u32) {
-    let mut rust_src = transpile(
-        code,
-        &Options {
-            emit_main: false,
-            use_nybl_sys: false,
-            ..Options::default()
-        },
-    )
-    .expect("transpile");
-    rust_src.push_str(&format!(
-        r#"
-struct ErrorHost;
-impl ::nybl::NyblHost for ErrorHost {{
-    fn call(
-        &mut self,
-        _name: &str,
-        _args: &[::nybl::Value],
-        _line: u32,
-    ) -> Option<Result<::nybl::Value, ::nybl::NyblError>> {{
-        None
-    }}
-}}
-
-fn main() {{
-    let mut host = ErrorHost;
-    let err = run(&mut host).expect_err("nested mutation should fail");
-    assert_eq!(err.message, ::nybl::error_messages::NESTED_MUTATION_ERROR_MESSAGE);
-    assert_eq!(
-        err.friendly_hint.as_deref(),
-        Some(::nybl::error_messages::NESTED_MUTATION_HINT),
-    );
-    assert_eq!(err.line, Some({expected_line}));
-    assert!(!err.is_fatal);
-}}
-"#,
-    ));
-    let dir = write_scratch_project(test_name, &rust_src);
-    let output = Command::new("cargo")
-        .arg("run")
-        .arg("--quiet")
-        .arg("--release")
-        .current_dir(&dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run cargo");
-    assert!(
-        output.status.success(),
-        "AOT diagnostic assertion failed for {}:\n--- stdout ---\n{}\n--- stderr ---\n{}\n--- generated ---\n{}",
-        test_name,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-        rust_src,
-    );
-}
-
 fn assert_aot_matches(test_name: &str, code: &str) {
     let expected = walker_output(code);
     let actual = run_aot(code, test_name);
@@ -2215,7 +2165,8 @@ print(unchanged)"#,
 #[test]
 #[ignore]
 fn e2e_nested_array_mutation_receiver_contract() {
-    let output = run_aot(
+    assert_aot_matches(
+        "nested_array_mutation_receiver_contract",
         r#"struct Holder { items }
 let indexed = {"items": [1]}
 let fielded = Holder { items: [1, 2] }
@@ -2241,30 +2192,24 @@ let wrapper = Wrapper { item: Gadget { n: 10 } }
 let dynamic = {"item": Gadget { n: 20 }}
 print(wrapper.item.push(2))
 print(dynamic["item"].push(3))"#,
-        "nested_array_mutation_receiver_contract",
-    );
-    let message = nybl::error_messages::NESTED_MUTATION_ERROR_MESSAGE;
-    assert_eq!(
-        output,
-        format!("true\n{message}\n5\ntrue\n{message}\n8\nnone\n7\n12\n23")
     );
 }
 
 #[test]
 #[ignore]
-fn e2e_nested_array_mutation_diagnostic_and_grouped_receivers() {
-    assert_aot_nested_mutation_error(
+fn e2e_nested_array_mutation_grouped_receivers() {
+    assert_aot_matches(
+        "nested_array_mutation_grouped_index",
         r#"let indexed = {"items": [1]}
-(indexed["items"]).push(2)"#,
-        "nested_array_mutation_grouped_index_diagnostic",
-        2,
+(indexed["items"]).push(2)
+print(indexed["items"])"#,
     );
-    assert_aot_nested_mutation_error(
+    assert_aot_matches(
+        "nested_array_mutation_grouped_field",
         r#"struct Holder { items }
 let fielded = Holder { items: [1] }
-(fielded.items).pop()"#,
-        "nested_array_mutation_grouped_field_diagnostic",
-        3,
+(fielded.items).push(2)
+print(fielded.items)"#,
     );
 }
 
@@ -2297,6 +2242,43 @@ d["hp"] = 50
 d["mp"] = 20
 print(d["hp"])
 print(d["mp"])"#,
+    );
+}
+
+#[test]
+#[ignore]
+fn e2e_nested_mutable_places_assignment_ref_and_methods() {
+    assert_aot_modes_match_walker(
+        r#"struct Bucket { items }
+struct State { buckets }
+let state = State { buckets: [Bucket { items: [1, 2] }] }
+state.buckets[0].items[1] += 5
+state.buckets[0].items.push(8)
+fn replace(ref value) { value = 11 }
+replace(ref state.buckets[0].items[0])
+print(state.buckets[0].items)
+fn Bucket.add(ref self, amount) { self.items.push(amount) }
+state.buckets[0].add(13)
+print(state.buckets[0].items)"#,
+        "nested_mutable_places",
+    );
+}
+
+#[test]
+#[ignore]
+fn e2e_nested_place_receiver_order_and_rollback() {
+    assert_aot_modes_match_walker(
+        r#"struct Counter { value }
+struct Holder { counters }
+fn Counter.add(ref self, amount) { self.value += amount; return self.value }
+fn Counter.fail(ref self) { self.value = 99; panic("rollback") }
+let holder = Holder { counters: [Counter { value: 1 }] }
+fn index() { print("index"); return 0 }
+fn amount() { print("arg"); return 2 }
+print(holder.counters[index()].add(amount()), holder.counters[0].value)
+fn fail() { holder.counters[0].fail() }
+print(try_call(fail), holder.counters[0].value)"#,
+        "nested_place_receiver_order_rollback",
     );
 }
 
@@ -3837,6 +3819,234 @@ print(apply(fn(n) { return n + 1 }, 4))"#,
 #[ignore]
 fn e2e_iife() {
     assert_aot_matches("iife", "print((fn(x) { return x * 3 })(4))");
+}
+
+#[test]
+#[ignore]
+fn e2e_aot_rest_parameters_cover_named_lambda_method_and_ref_self_calls() {
+    assert_aot_modes_match_walker(
+        r#"struct Box { value }
+fn Box.join(self, prefix, ..items) { return [self.value, prefix, items] }
+struct Counter { value }
+fn Counter.add(ref self, ..items) { self.value += items.len(); return items }
+fn collect(first, ..items) { return [first, items] }
+let gather = fn(..items) { return items }
+let box = Box { value: 7 }
+let counter = Counter { value: 10 }
+print(collect(1), collect(1, 2, 3))
+print(gather(), gather("a", "b"))
+print(box.join("x", 8, 9))
+print(counter.add(1, 2, 3), counter.value)
+let calls = 0
+fn tick() { calls += 1; return calls }
+fn invalid_rest_ref() { let target = 0; return collect(0, tick(), ref target) }
+print(try_call(invalid_rest_ref), calls)"#,
+        "rest_named_lambda_method_ref_self",
+    );
+}
+
+#[test]
+#[ignore]
+fn e2e_aot_place_indices_run_before_root_snapshot() {
+    assert_aot_modes_match_walker(
+        r#"let values = [0, 1]
+fn assign() { values[values.pop()] = 9 }
+print(try_call(assign))
+print(values)"#,
+        "place_index_before_root_snapshot",
+    );
+}
+
+#[test]
+#[ignore]
+fn e2e_aot_explicit_public_surfaces_filter_and_reexport_all_import_forms() {
+    let source = r#"use leaf as leaf
+use leaf
+use facade as facade
+print(leaf.visible, visible, _shown, leaf.read_hidden(), facade.visible, facade.read_hidden())
+print(leaf.Visible { value: 4 }, Visible { value: 5 })
+print(facade.gather(6, 7))"#;
+    let modules = [
+        (
+            "leaf",
+            r#"let visible = 1
+let hidden = 2
+let _shown = 3
+struct Visible { value }
+struct Hidden { value }
+fn read_hidden() { return hidden }
+fn gather(..items) { return items }
+pub { visible, _shown, read_hidden, gather, Visible }"#,
+        ),
+        (
+            "facade",
+            "use leaf.{visible, read_hidden, gather}\npub { visible, read_hidden, gather }",
+        ),
+    ];
+    for sandbox in [false, true] {
+        let run = run_aot_with_modules_and_opts(
+            source,
+            if sandbox {
+                "sandbox_explicit_public_surfaces"
+            } else {
+                "native_explicit_public_surfaces"
+            },
+            &modules,
+            &Options {
+                sandbox,
+                ..Options::default()
+            },
+        );
+        assert_eq!(
+            run.status,
+            Some(0),
+            "generated program failed: {}",
+            run.stderr
+        );
+        assert_eq!(
+            run.stdout,
+            "1 1 3 2 1 2\nVisible { value: 4 } Visible { value: 5 }\n[6, 7]"
+        );
+
+        let denied = transpile(
+            "use leaf.{hidden}\nprint(hidden)",
+            &Options {
+                sandbox,
+                module_resolver: Some(modules_from_map(modules)),
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            denied.message.contains("has no export `hidden`"),
+            "{denied}"
+        );
+
+        let legacy = run_aot_with_modules_and_opts(
+            "use legacy.{_private}\nprint(_private)",
+            if sandbox {
+                "sandbox_legacy_selective_private"
+            } else {
+                "native_legacy_selective_private"
+            },
+            &[("legacy", "let _private = 9")],
+            &Options {
+                sandbox,
+                ..Options::default()
+            },
+        );
+        assert_eq!(legacy.status, Some(0), "{}", legacy.stderr);
+        assert_eq!(legacy.stdout, "9");
+    }
+}
+
+#[test]
+#[ignore]
+fn e2e_sandbox_variadic_instance_entry_and_callback_pack_tracked_arrays() {
+    let mut rust_src = transpile(
+        r#"pub fn variadic(first, ..items) { return [first, items] }
+pub fn callback() { return fn(..items) { return items } }"#,
+        &Options {
+            sandbox: true,
+            emit_main: false,
+            use_nybl_sys: false,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    rust_src.push_str(
+        r#"
+struct Host;
+impl ::nybl::NyblHost for Host {
+    fn call(&mut self, _name: &str, _args: &[::nybl::Value], _line: u32) -> Option<Result<::nybl::Value, ::nybl::NyblError>> { None }
+}
+fn main() {
+    let limits = ::nybl::NyblLimits::standard();
+    let mut host = Host;
+    let mut instance = NyblInstance::load(&mut host, &limits).unwrap();
+    let entry = instance.entry_points().iter().find(|entry| entry.name() == "variadic").unwrap();
+    println!("{} {} {}", entry.arity(), entry.is_variadic(), entry.accepts_arity(3));
+    let value = instance.call("variadic", &[::nybl::Value::Int(1), ::nybl::Value::Int(2), ::nybl::Value::Int(3)], &mut host).unwrap();
+    println!("{}", value.inspect());
+    let callback = instance.call("callback", &[], &mut host).unwrap();
+    let value = instance.call_value(&callback, &[::nybl::Value::Int(4), ::nybl::Value::Int(5)], &mut host).unwrap();
+    println!("{}", value.inspect());
+    println!("{}", instance.call("variadic", &[], &mut host).unwrap_err().message);
+}
+"#,
+    );
+    let run = run_generated_source("sandbox_variadic_instance", rust_src);
+    assert_eq!(run.status, Some(0), "{}", run.stderr);
+    assert_eq!(
+        run.stdout,
+        "1 true true\n[1, [2, 3]]\n[4, 5]\n`variadic` expects at least 1 argument, but got 0"
+    );
+}
+
+#[test]
+#[ignore]
+fn e2e_aot_opaque_host_values_dispatch_custom_and_common_methods() {
+    for sandbox in [false, true] {
+        let mut rust_src = transpile(
+            r#"let widget = make_widget()
+print(widget.type(), widget.inspect(), widget.bump(1, 2))
+fn missing() { return widget.missing() }
+print(try_call(missing))"#,
+            &Options {
+                sandbox,
+                emit_main: false,
+                use_nybl_sys: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let run_call = if sandbox {
+            "run(&mut host, &limits)"
+        } else {
+            "run(&mut host)"
+        };
+        rust_src.push_str(&format!(
+            r#"
+struct Host {{ method_calls: usize }}
+impl ::nybl::NyblHost for Host {{
+    fn call(&mut self, name: &str, _args: &[::nybl::Value], _line: u32) -> Option<Result<::nybl::Value, ::nybl::NyblError>> {{
+        (name == "make_widget").then(|| Ok(::nybl::Value::new_host("widget", 40_i64)))
+    }}
+    fn call_method(&mut self, receiver: &::nybl::HostValue, method: &str, args: &[::nybl::Value], _line: u32) -> Option<Result<::nybl::Value, ::nybl::NyblError>> {{
+        if method != "bump" {{ return None; }}
+        self.method_calls += 1;
+        let start = *receiver.downcast_ref::<i64>().unwrap();
+        let sum = args.iter().map(|value| match value {{ ::nybl::Value::Int(value) => *value, _ => 0 }}).sum::<i64>();
+        Some(Ok(::nybl::Value::Int(start + sum)))
+    }}
+    fn on_print(&mut self, message: &str) {{ println!("{{}}", message); }}
+}}
+fn main() {{
+    let limits = ::nybl::NyblLimits::standard();
+    let mut host = Host {{ method_calls: 0 }};
+    {run_call}.unwrap();
+    println!("calls={{}}", host.method_calls);
+}}
+"#
+        ));
+        let run = run_generated_source(
+            if sandbox {
+                "sandbox_opaque_host_methods"
+            } else {
+                "native_opaque_host_methods"
+            },
+            rust_src,
+        );
+        assert_eq!(run.status, Some(0), "{}", run.stderr);
+        let lines = run.stdout.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "widget <host widget> 43");
+        assert!(
+            lines[1].contains("doesn't have a .missing() method"),
+            "{}",
+            lines[1]
+        );
+        assert_eq!(lines[2], "calls=1");
+    }
 }
 
 #[test]

@@ -41,9 +41,11 @@
 //! engines. Seeded RNG, deterministic, 100 programs per run. The
 //! extended budget is behind `#[ignore]` for local / nightly use.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
-use nybl::{NyblError, NyblHost, NyblLimits, Value};
+use nybl::{HostValue, NyblError, NyblHost, NyblLimits, Value};
+use nybl_vm::NyblInstance;
 
 // ─── Harness ───────────────────────────────────────────────────────
 
@@ -1714,7 +1716,7 @@ fn ref_method_receiver_must_be_a_unique_mutable_binding_diff() {
 fn Counter.bump(ref self) { self.n = self.n + 1 }
 Counter { n: 1 }.bump()"#,
     );
-    assert!(temporary.contains("a `ref` method receiver must be a variable"));
+    assert!(temporary.contains("a `ref` method receiver must be a mutable place"));
 
     let duplicate = run_err(
         r#"struct Counter { n }
@@ -4554,6 +4556,71 @@ both(ref target, ref target)"#,
 }
 
 #[test]
+fn explicit_ref_arguments_commit_through_nested_places_diff() {
+    let outcome = run_both(
+        r#"struct Holder { values }
+fn add(ref value, amount) { value += amount }
+let rows = [[1, 2], [3, 4]]
+let holder = Holder { values: {"answer": 40} }
+add(ref rows[1][0], 5)
+add(ref holder.values["answer"], 2)
+print(rows)
+print(holder.values["answer"])"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "outcome: {outcome:?}");
+    assert_eq!(outcome.prints, ["[[1, 2], [8, 4]]", "42"]);
+}
+
+#[test]
+fn nested_ref_aliases_are_rejected_by_root_before_value_arguments_diff() {
+    let outcome = run_both(
+        r#"fn combine(ref left, value, ref right) {
+    left = value
+    right = value
+}
+fn side() { print("side"); return 9 }
+let rows = [[1], [2]]
+combine(ref rows[0], side(), ref rows[1])"#,
+        &standard(),
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("same variable")),
+        "outcome: {outcome:?}"
+    );
+    assert!(outcome.prints.is_empty());
+}
+
+#[test]
+fn nested_ref_self_rereads_after_arguments_and_rolls_back_diff() {
+    let outcome = run_both(
+        r#"struct Counter { n }
+fn Counter.bump(ref self, amount) {
+    self.n += amount
+    return self.n
+}
+fn Counter.fail(ref self) {
+    self.n = 99
+    panic("stop")
+}
+let rows = [Counter { n: 1 }]
+fn side() {
+    rows[0].n = 10
+    return 2
+}
+print(rows[0].bump(side()), rows[0].n)
+fn attempt() { rows[0].fail() }
+print(try_call(attempt).is_err(), rows[0].n)"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "outcome: {outcome:?}");
+    assert_eq!(outcome.prints, ["12 12", "true 12"]);
+}
+
+#[test]
 fn any_duplicate_ref_position_prevents_closure_capture() {
     for source in [
         "fn bad(ref value, value) { return fn() { return value } }\nlet target = 1\nbad(ref target, 2)",
@@ -5194,109 +5261,70 @@ print(values)"#,
 }
 
 #[test]
-fn nested_array_mutation_errors_are_nonfatal_and_line_aware_diff() {
+fn nested_array_mutation_commits_through_places_diff() {
     let outcome = run_both(
         r#"struct Holder { items }
 let indexed = {"items": [1]}
 let fielded = Holder { items: [1, 2] }
-let index_result = try_call(fn() {
-    indexed["items"].push(2)
-})
-let field_result = try_call(fn() {
-    fielded.items.pop()
-})
-print(index_result.is_err())
-print(match index_result { Result::Err(e) => e.message, _ => "missing" })
-print(match index_result { Result::Err(e) => e.line, _ => -1 })
-print(field_result.is_err())
-print(match field_result { Result::Err(e) => e.message, _ => "missing" })
-print(match field_result { Result::Err(e) => e.line, _ => -1 })"#,
+indexed["items"].push(2)
+fielded.items.pop()
+print(indexed["items"])
+print(fielded.items)"#,
         &standard(),
     );
     assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
-    let message = nybl::error_messages::NESTED_MUTATION_ERROR_MESSAGE;
-    assert_eq!(
-        outcome.prints,
-        [
-            "true".to_string(),
-            message.to_string(),
-            "5".to_string(),
-            "true".to_string(),
-            message.to_string(),
-            "8".to_string(),
-        ]
-    );
+    assert_eq!(outcome.prints, ["[1, 2]", "[1]"]);
 }
 
 #[test]
-fn every_array_mutator_rejects_nested_places_diff() {
-    for call in [
-        "push(3)",
-        "pop()",
-        "insert(0, 3)",
-        "remove(0)",
-        "reverse()",
-        "sort()",
+fn every_array_mutator_commits_through_nested_places_diff() {
+    for (call, expected) in [
+        ("push(3)", "[2, 1, 3]"),
+        ("pop()", "[2]"),
+        ("insert(0, 3)", "[3, 2, 1]"),
+        ("remove(0)", "[1]"),
+        ("reverse()", "[1, 2]"),
+        ("sort()", "[1, 2]"),
     ] {
-        let source = format!("let d = {{\"items\": [2, 1]}}\nd[\"items\"].{call}");
-        assert_eq!(
-            run_err(&source),
-            nybl::error_messages::NESTED_MUTATION_ERROR_MESSAGE,
-            "call: {call}"
-        );
+        let source =
+            format!("let d = {{\"items\": [2, 1]}}\nd[\"items\"].{call}\nprint(d[\"items\"])");
+        assert_eq!(say(&source), expected, "call: {call}");
     }
 }
 
 #[test]
-fn nested_array_mutation_direct_errors_include_hint_and_grouped_receivers_diff() {
+fn nested_array_mutation_supports_grouped_receivers_diff() {
     let cases = [
         (
             r#"let d = {"items": [1]}
-d["items"].push(2)"#,
-            2,
+d["items"].push(2)
+print(d["items"])"#,
+            "[1, 2]",
         ),
         (
             r#"struct Holder { items }
 let holder = Holder { items: [1] }
-holder.items.pop()"#,
-            3,
+holder.items.pop()
+print(holder.items)"#,
+            "[]",
         ),
         (
             r#"let d = {"items": [1]}
-(d["items"]).push(2)"#,
-            2,
+(d["items"]).push(2)
+print(d["items"])"#,
+            "[1, 2]",
         ),
         (
             r#"struct Holder { items }
 let holder = Holder { items: [1] }
-(holder.items).pop()"#,
-            3,
+(holder.items).pop()
+print(holder.items)"#,
+            "[]",
         ),
     ];
 
-    for (source, expected_line) in cases {
-        for engine in ["tree-walker", "bytecode vm"] {
-            let mut host = RecordHost::new();
-            let result = if engine == "tree-walker" {
-                nybl::run(source, &mut host, &standard())
-            } else {
-                nybl_vm::run(source, &mut host, &standard())
-            };
-            assert!(host.prints.borrow().is_empty(), "{engine} printed");
-            let err = result.unwrap_err();
-            assert_eq!(
-                err.message,
-                nybl::error_messages::NESTED_MUTATION_ERROR_MESSAGE,
-                "{engine} message"
-            );
-            assert_eq!(
-                err.friendly_hint.as_deref(),
-                Some(nybl::error_messages::NESTED_MUTATION_HINT),
-                "{engine} hint"
-            );
-            assert_eq!(err.line, Some(expected_line), "{engine} line");
-            assert!(!err.is_fatal, "{engine} returned a fatal error");
-        }
+    for (source, expected) in cases {
+        assert_eq!(say(source), expected);
     }
 }
 
@@ -6384,6 +6412,122 @@ fn host_function_hint() {
     let vm_err = nybl_vm::run(code, &mut vm_host, &standard()).unwrap_err();
     assert_eq!(tw_err.message, vm_err.message);
     assert!(tw_err.message.contains("not found"));
+}
+
+#[derive(Default)]
+struct OpaqueHost {
+    prints: Vec<String>,
+    method_calls: usize,
+}
+
+impl NyblHost for OpaqueHost {
+    fn call(&mut self, name: &str, args: &[Value], _line: u32) -> Option<Result<Value, NyblError>> {
+        if name != "make_counter" {
+            return None;
+        }
+        let initial = match args {
+            [Value::Int(value)] => *value,
+            _ => return Some(Err(NyblError::runtime("make_counter() needs one int", 0))),
+        };
+        Some(Ok(Value::new_host("counter", Rc::new(Cell::new(initial)))))
+    }
+
+    fn call_method(
+        &mut self,
+        receiver: &HostValue,
+        method: &str,
+        args: &[Value],
+        line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        self.method_calls += 1;
+        let state = receiver
+            .downcast_ref::<Rc<Cell<i64>>>()
+            .expect("counter payload");
+        match (method, args) {
+            ("add", [Value::Int(amount)]) => {
+                state.set(state.get() + amount);
+                Some(Ok(Value::Int(state.get())))
+            }
+            ("same", [Value::Host(other)]) => Some(Ok(Value::Bool(receiver.ptr_eq(other)))),
+            // Common methods must win before host dispatch reaches this arm.
+            ("type", []) => Some(Ok(Value::new_str("host override".to_string()))),
+            ("add", _) | ("same", _) => Some(Err(NyblError::runtime(
+                "invalid host method arguments",
+                line,
+            ))),
+            _ => None,
+        }
+    }
+
+    fn on_print(&mut self, message: &str) {
+        self.prints.push(message.to_string());
+    }
+}
+
+#[test]
+fn opaque_host_methods_match_walker_dispatch_and_common_precedence() {
+    let code = r#"let counter = make_counter(3)
+print(counter.type())
+print(counter.add(4))
+print(counter.same(counter))"#;
+    let mut walker = OpaqueHost::default();
+    nybl::run(code, &mut walker, &standard()).unwrap();
+    let mut vm = OpaqueHost::default();
+    nybl_vm::run(code, &mut vm, &standard()).unwrap();
+    assert_eq!(vm.prints, walker.prints);
+    assert_eq!(vm.prints, ["counter", "7", "true"]);
+    assert_eq!(walker.method_calls, 2);
+    assert_eq!(vm.method_calls, 2);
+}
+
+#[test]
+fn opaque_host_methods_are_value_only_and_use_normal_unknown_errors() {
+    let ref_source = r#"let counter = make_counter(1)
+let value = 2
+counter.add(ref value)"#;
+    let mut walker = OpaqueHost::default();
+    let walker_ref = nybl::run(ref_source, &mut walker, &standard()).unwrap_err();
+    let mut vm = OpaqueHost::default();
+    let vm_ref = nybl_vm::run(ref_source, &mut vm, &standard()).unwrap_err();
+    assert_eq!(vm_ref.message, walker_ref.message);
+    assert_eq!(walker.method_calls, 0);
+    assert_eq!(vm.method_calls, 0);
+
+    let unknown_source = "make_counter(1).missing()";
+    let mut walker = OpaqueHost::default();
+    let walker_unknown = nybl::run(unknown_source, &mut walker, &standard()).unwrap_err();
+    let mut vm = OpaqueHost::default();
+    let vm_unknown = nybl_vm::run(unknown_source, &mut vm, &standard()).unwrap_err();
+    assert_eq!(vm_unknown.message, walker_unknown.message);
+    assert_eq!(
+        vm_unknown.message,
+        "counter doesn't have a .missing() method"
+    );
+}
+
+#[test]
+fn opaque_host_handles_survive_persistent_instance_calls() {
+    let mut host = OpaqueHost::default();
+    let mut instance = NyblInstance::load(
+        r#"let counter = make_counter(10)
+pub fn bump() { return counter.add(1) }
+pub fn same() { return counter.same(counter) }"#,
+        &mut host,
+        &standard(),
+    )
+    .unwrap();
+    assert_eq!(
+        instance.call("bump", &[], &mut host).unwrap().inspect(),
+        "11"
+    );
+    assert_eq!(
+        instance.call("bump", &[], &mut host).unwrap().inspect(),
+        "12"
+    );
+    assert_eq!(
+        instance.call("same", &[], &mut host).unwrap().inspect(),
+        "true"
+    );
 }
 
 // ─── Fuzzer ───────────────────────────────────────────────────────
