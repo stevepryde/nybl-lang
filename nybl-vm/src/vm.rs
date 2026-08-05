@@ -2929,8 +2929,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 line,
             );
         }
-        if matches!(receiver, Value::Array(_))
-            && methods::is_mutating_method(&method)
+        if methods::is_mutating_collection_receiver(&receiver, &method)
             && let Some(place) = receiver_place
         {
             return self.preflight_call(
@@ -3034,7 +3033,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
         };
 
-        if matches!(receiver, Value::Array(_)) && methods::is_mutating_method(&method) {
+        if methods::is_mutating_collection_receiver(&receiver, &method) {
             return self.preflight_call(
                 PreparedCallable::NamedMethodInPlace {
                     target,
@@ -4204,9 +4203,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let receiver_name = chunk.name(receiver_idx);
         // The compiler only emits this instruction for a bare identifier and
         // a built-in mutating method name. Resolve the binding after argument
-        // evaluation, matching the walker/AOT order. Arrays take the direct
-        // path; every other value is cloned once for ordinary dispatch so a
-        // user type is still free to define a method named `push`, `pop`, etc.
+        // evaluation, matching the walker/AOT order. Arrays and dicts take
+        // the direct path; every other value is cloned once for ordinary
+        // dispatch so a user type is still free to define a method named
+        // `push`, `pop`, etc.
         let (fallback, assign_back) = match target.slot_idx() {
             Some(slot) => {
                 let value = self
@@ -4216,10 +4216,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     .slots
                     .get_mut(slot.0 as usize)
                     .ok_or_else(|| error(line, "VM: local slot out of range"))?;
-                if matches!(value, Value::Array(_)) {
+                if methods::is_mutating_collection_receiver(value, method) {
                     methods::reject_constant_array_mutation(receiver_name, method, line)?;
-                    let result =
-                        methods::transactional_array_method_in(value, method, args, line, &memory)?;
+                    let result = methods::transactional_collection_method_in(
+                        value, method, args, line, &memory,
+                    )?;
                     self.push_value(result);
                     return Ok(Next::Continue);
                 }
@@ -4249,10 +4250,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 let value = self
                     .lookup_var_mut_by_idx(receiver_idx)
                     .expect("binding checked above");
-                if matches!(value, Value::Array(_)) {
+                if methods::is_mutating_collection_receiver(value, method) {
                     methods::reject_constant_array_mutation(receiver_name, method, line)?;
-                    let result =
-                        methods::transactional_array_method_in(value, method, args, line, &memory)?;
+                    let result = methods::transactional_collection_method_in(
+                        value, method, args, line, &memory,
+                    )?;
                     self.push_value(result);
                     return Ok(Next::Continue);
                 }
@@ -4273,7 +4275,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let place = self.refresh_resolved_place(place, line)?;
         let mut receiver = self.place_value_from(&place.root, &place.projections, line)?;
         methods::reject_constant_array_mutation(&place.root_name, method, line)?;
-        let result = methods::transactional_array_method_in(
+        let result = methods::transactional_collection_method_in(
             &mut receiver,
             method,
             args,

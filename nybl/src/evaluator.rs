@@ -3058,12 +3058,14 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             } => {
                 let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
 
-                // Keep the direct-binding fast path for a bare array. It
-                // avoids manufacturing a second CoW owner immediately before
-                // mutation, which preserves exact instance memory accounting.
-                if methods::is_mutating_method(method)
-                    && let ExprKind::Ident(name) = &object.kind
-                    && matches!(self.get_var(name), Some(Value::Array(_)))
+                // Keep the direct-binding fast path for a bare array or dict.
+                // It avoids manufacturing a second CoW owner immediately
+                // before mutation, which preserves exact instance memory
+                // accounting.
+                if let ExprKind::Ident(name) = &object.kind
+                    && self
+                        .get_var(name)
+                        .is_some_and(|value| methods::is_mutating_collection_receiver(value, method))
                 {
                     crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
                     let expected = methods::builtin_method_arity(method)
@@ -3098,7 +3100,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                         .get_mut(target.scope)
                         .and_then(|scope| scope.get_mut(&target.name))
                         .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
-                    return methods::transactional_array_method_in(
+                    return methods::transactional_collection_method_in(
                         binding,
                         method,
                         eval_args,
@@ -3122,8 +3124,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                     self.eval_expr(object)?
                 };
 
-                if methods::is_mutating_method(method)
-                    && matches!(obj_val, Value::Array(_))
+                if methods::is_mutating_collection_receiver(&obj_val, method)
                     && receiver_place.is_some()
                 {
                     crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
@@ -3159,7 +3160,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                         .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
                     let mut leaf =
                         self.place_value_from(&current_root, &place.projections, expr.line)?;
-                    let result = methods::transactional_array_method_in(
+                    let result = methods::transactional_collection_method_in(
                         &mut leaf,
                         method,
                         eval_args,

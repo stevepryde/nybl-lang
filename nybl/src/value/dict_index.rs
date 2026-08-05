@@ -132,6 +132,73 @@ impl DictKeyIndex {
         Ok(())
     }
 
+    /// Remove `key`'s slot and re-point every later entry index.
+    ///
+    /// Linear probing without tombstones means simply emptying the slot could
+    /// break the probe chain for later keys in the same cluster, so removal
+    /// performs the classic backward shift: each subsequent occupied slot
+    /// whose home position does not lie cyclically inside the gap moves back
+    /// into the vacated slot. The entry vector removes by shifting, so every
+    /// stored index greater than the removed entry's is decremented in a full
+    /// table scan. The whole operation is allocation-free and infallible —
+    /// removal must never fail with a memory error.
+    ///
+    /// Call this *before* removing the entry from the owning vector: home
+    /// positions are recomputed from `entries` keys during the shift.
+    ///
+    /// Returns the removed key's entry index, or `None` when absent.
+    pub(super) fn remove(&mut self, entries: &[(String, Value)], key: &str) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut vacated = hash(key) & mask;
+        let mut removed_entry = None;
+        for _ in 0..self.slots.len() {
+            let entry_index = self.slots[vacated];
+            if entry_index == EMPTY {
+                return None;
+            }
+            if entries[entry_index].0 == key {
+                removed_entry = Some(entry_index);
+                break;
+            }
+            vacated = (vacated + 1) & mask;
+        }
+        let removed_entry = removed_entry?;
+
+        let mut probe = (vacated + 1) & mask;
+        loop {
+            let entry_index = self.slots[probe];
+            if entry_index == EMPTY {
+                break;
+            }
+            let home = hash(&entries[entry_index].0) & mask;
+            // Keep the entry only when its home lies cyclically in
+            // (vacated, probe]; otherwise the vacated slot sits on its
+            // probe path, so shift it back to keep lookups reachable.
+            let stays = if vacated <= probe {
+                vacated < home && home <= probe
+            } else {
+                vacated < home || home <= probe
+            };
+            if !stays {
+                self.slots[vacated] = entry_index;
+                vacated = probe;
+            }
+            probe = (probe + 1) & mask;
+        }
+        self.slots[vacated] = EMPTY;
+
+        for slot in self.slots.iter_mut() {
+            if *slot != EMPTY && *slot > removed_entry {
+                *slot -= 1;
+            }
+        }
+        self.len -= 1;
+        Some(removed_entry)
+    }
+
     /// Insert a key already proven absent after capacity has been prepared.
     pub(super) fn insert_new(&mut self, key: &str, entry_index: usize) {
         Self::insert_into_slots(&mut self.slots, key, entry_index);

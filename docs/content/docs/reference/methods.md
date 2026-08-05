@@ -184,6 +184,7 @@ unchanged.
 | `arr.index_of(v)` | int | Index of first match, or `-1`. |
 | `arr.insert(i, v)` | none | Insert at a signed index, shifting right. Negative indices count from the end; `len` appends. |
 | `arr.remove(i)` | value | Remove at a signed index, returning the removed value. Negative indices count from the end. |
+| `arr.truncate(n)` | none | Shorten to at most `n` elements, dropping the tail. Negative lengths count from the end like a `slice` bound; no-op when already short enough. |
 | `arr.slice(start, end)` | array | Half-open sub-array. Negative bounds count from the end; out-of-range bounds clamp. |
 | `arr.reverse()` | none | In-place. |
 | `arr.sort()` | none | In-place, numeric or lexicographic depending on element types. |
@@ -194,12 +195,18 @@ unchanged.
 
 See [Dictionaries](/docs/data/dictionaries/) for worked examples.
 
+`d.remove(key)` mutates its receiver with the same write-back rules as the
+mutating array methods above: mutable places rooted in a `let` binding write
+back atomically, constants are rejected, and a genuine temporary is mutated
+and then discarded.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `d.len()` | int | Number of entries. |
 | `d.keys()` | array | All keys as strings. |
 | `d.values()` | array | All values. |
 | `d.has(key)` | bool | Whether `key` exists. |
+| `d.remove(key)` | value | Remove `key`, returning its value, or `none` when absent. The key must be a string. |
 | `d.iter()` | iter | Lazy iterator over keys, in declaration order. See [Iter methods](#iter-methods-iter). |
 
 ## Result methods — `Result`

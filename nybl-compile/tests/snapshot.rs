@@ -820,6 +820,7 @@ fn const_array_mutation_emits_the_shared_runtime_guard() {
         "VALUES.pop()",
         "VALUES.insert(0, 4)",
         "VALUES.remove(0)",
+        "VALUES.truncate(1)",
         "VALUES.reverse()",
         "VALUES.sort()",
     ] {
@@ -860,9 +861,14 @@ print(ACCUMULATOR.push(5))"#,
         ],
     );
 
-    compile(
+    // Dict `.remove()` mutates, so the constant guard is emitted for it too.
+    let output = compile(
         r#"const LOOKUP = {"n": 1}
 LOOKUP.remove("n")"#,
+    );
+    assert!(
+        output.contains("::nybl::methods::reject_constant_array_mutation(\"LOOKUP\", \"remove\""),
+        "output: {output}"
     );
 }
 

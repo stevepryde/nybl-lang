@@ -56,8 +56,8 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **RUN-012 — Constant bindings are immutable assignment roots.** No assignment
   target whose base binding is a constant may mutate that value, including
   direct, index, field, compound, grouped, and syntactically nested place
-  forms. A built-in mutating method cannot mutate an Array through a named
-  constant receiver either. Reads through a constant, pure user-defined methods
+  forms. A built-in mutating method cannot mutate an Array or Dict through a
+  named constant receiver either. Reads through a constant, pure user-defined methods
   (including names that collide with built-in mutators), and writes through
   lowercase mutable bindings remain valid. A new `const` declaration is a
   declaration, not an assignment target.
@@ -118,7 +118,8 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   successful return and commits. Host-to-script `NyblInstance::call` and
   `call_value` remain value-only and reject ref-bearing callables before
   execution because host values do not identify Nybl bindings.
-- **RUN-021 — Unified mutating receivers.** A built-in mutating method on a
+- **RUN-021 — Unified mutating receivers.** A built-in mutating method (the
+  Array mutators and Dict `.remove`) on a
   mutable field/index place rooted in a `let` binding uses the same snapshot/commit model
   implicitly, with method arguments evaluated before the receiver snapshot.
   True temporary receivers mutate and discard their owned value while
@@ -174,10 +175,10 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **AC-RUN-007:** Parser and cross-engine tests reject direct and compound
   Array, Dict, and Struct writes rooted at constants with the canonical
   constant diagnostic and hint, including grouped/nested targets. Cross-engine
-  and native AOT tests reject built-in Array mutators on named constants after
-  receiver-aware dispatch, preserve pure user-defined name collisions and
-  ordinary non-Array method errors, and keep the corresponding mutable-binding
-  programs identical.
+  and native AOT tests reject built-in Array mutators and Dict `.remove` on
+  named constants after receiver-aware dispatch, preserve pure user-defined
+  name collisions and ordinary non-collection method errors, and keep the
+  corresponding mutable-binding programs identical.
 - **AC-RUN-008:** Reserved-word binding diagnostics derive from the lexer's
   current keyword vocabulary, including `const`, while keyword-shaped text in
   strings and comments remains ordinary source content. The compatibility

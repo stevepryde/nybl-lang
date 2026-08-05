@@ -1166,6 +1166,29 @@ let accumulator = Accumulator { total: 7 }
 print(accumulator.push(5))"#,
     ),
     (
+        "array_truncate_and_dict_remove",
+        r#"let a = [1, 2, 3, 4]
+a.truncate(2)
+print(a)
+a.truncate(-1)
+print(a)
+a.truncate(99)
+print(a)
+print(try_call(fn() { return a.truncate("x") }).is_err())
+let d = {"a": 1, "b": 2, "c": 3}
+print(d.remove("b"))
+print(d.remove("zzz"))
+print([d.len(), d.keys()])
+print(try_call(fn() { return d.remove(0) }).is_err())
+let nested = {"inner": {"x": 1, "y": 2}, "items": [2, 1]}
+print(nested["inner"].remove("x"))
+nested["items"].truncate(1)
+print([nested["inner"].keys(), nested["items"]])
+let snapshot = d
+d.remove("a")
+print([d.len(), snapshot.len(), snapshot.has("a")])"#,
+    ),
+    (
         "array_sort_reverse",
         r#"let a = [3, 1, 2]
 a.sort()
@@ -3908,6 +3931,22 @@ fn three_way_incremental_type_publication_semantics() {
         })
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), NAMES.len());
+    assert_three_way(&entries);
+}
+
+#[test]
+#[ignore]
+fn three_way_array_truncate_and_dict_remove() {
+    let entries = CORPUS
+        .iter()
+        .filter(|(name, _)| *name == "array_truncate_and_dict_remove")
+        .map(|(name, source)| CorpusEntry {
+            name,
+            source,
+            modules: &[],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
     assert_three_way(&entries);
 }
 
