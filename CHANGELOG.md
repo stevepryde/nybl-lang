@@ -3,7 +3,11 @@
 All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
-## Unreleased
+## 0.4.2
+
+`0.4.2` rounds out the built-in collection surface with mutating dict methods
+and in-place array shrinking, consistent across the walker, VM, and AOT
+engines.
 
 ### Language
 
