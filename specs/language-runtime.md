@@ -119,7 +119,7 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   `call_value` remain value-only and reject ref-bearing callables before
   execution because host values do not identify Nybl bindings.
 - **RUN-021 — Unified mutating receivers.** A built-in mutating method (the
-  Array mutators and Dict `.remove`) on a
+  Array mutators and Dict `.remove` / `.clear`) on a
   mutable field/index place rooted in a `let` binding uses the same snapshot/commit model
   implicitly, with method arguments evaluated before the receiver snapshot.
   True temporary receivers mutate and discard their owned value while
@@ -175,7 +175,8 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **AC-RUN-007:** Parser and cross-engine tests reject direct and compound
   Array, Dict, and Struct writes rooted at constants with the canonical
   constant diagnostic and hint, including grouped/nested targets. Cross-engine
-  and native AOT tests reject built-in Array mutators and Dict `.remove` on
+  and native AOT tests reject built-in Array mutators and the mutating Dict
+  methods on
   named constants after receiver-aware dispatch, preserve pure user-defined
   name collisions and ordinary non-collection method errors, and keep the
   corresponding mutable-binding programs identical.

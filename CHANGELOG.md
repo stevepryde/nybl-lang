@@ -15,6 +15,9 @@ publishable workspace crates unless a section says otherwise.
 - Add array `.truncate(n)`: shortens the array to at most `n` elements in
   place. Negative lengths count from the end like a `.slice()` bound;
   already-short arrays are untouched.
+- Add `.clear()` on arrays and dicts: removes every element/entry in place
+  under the same mutating-method rules, so it also works through `ref`
+  parameters and `ref self`, where reassigning the callee's binding would not.
 
 ## 0.4.1
 

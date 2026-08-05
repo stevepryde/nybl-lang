@@ -1186,7 +1186,16 @@ nested["items"].truncate(1)
 print([nested["inner"].keys(), nested["items"]])
 let snapshot = d
 d.remove("a")
-print([d.len(), snapshot.len(), snapshot.has("a")])"#,
+print([d.len(), snapshot.len(), snapshot.has("a")])
+fn wipe(ref target) { target.clear() }
+let cleared = {"p": 1, "q": 2}
+wipe(ref cleared)
+let emptied = [1, 2, 3]
+emptied.clear()
+nested["inner"].clear()
+print([cleared.len(), emptied, nested["inner"].len()])
+cleared["r"] = 3
+print(cleared.keys())"#,
     ),
     (
         "array_sort_reverse",

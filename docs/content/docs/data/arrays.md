@@ -49,7 +49,7 @@ print(items)    // [99, 20, 30]
 ## Methods
 
 Mutating methods such as `push`, `pop`, `insert`, `remove`, `truncate`,
-`reverse`, and `sort` write their updated array back to a mutable variable
+`clear`, `reverse`, and `sort` write their updated array back to a mutable variable
 receiver using the same transactional copy-in/copy-out mechanism as a [`ref`
 parameter](/docs/functions/reference-parameters/). Method
 arguments run before the receiver snapshot. Nested index and field receivers
@@ -71,6 +71,7 @@ discards it, and returns `none`.
 | `arr.insert(i, val)` | none | Insert at a signed index, shifting right. Negative indices count from the end; `len` appends |
 | `arr.remove(i)` | value | Remove at a signed index. Negative indices count from the end |
 | `arr.truncate(n)` | none | Shorten to at most `n` elements, dropping the tail. Negative lengths count from the end like a `slice` bound |
+| `arr.clear()` | none | Remove every element |
 | `arr.slice(start, end)` | array | Half-open sub-array. Negative bounds count from the end; out-of-range bounds clamp |
 | `arr.reverse()` | none | Reverse in place |
 | `arr.sort()` | none | Sort in place |

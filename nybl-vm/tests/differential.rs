@@ -748,6 +748,7 @@ fn const_array_mutating_methods_are_rejected_by_both_engines_diff() {
         "VALUES.insert(0, 4)",
         "VALUES.remove(0)",
         "VALUES.truncate(1)",
+        "VALUES.clear()",
         "VALUES.reverse()",
         "(VALUES).sort()",
     ] {
@@ -5287,6 +5288,7 @@ fn every_array_mutator_commits_through_nested_places_diff() {
         ("insert(0, 3)", "[3, 2, 1]"),
         ("remove(0)", "[1]"),
         ("truncate(1)", "[2]"),
+        ("clear()", "[]"),
         ("reverse()", "[1, 2]"),
         ("sort()", "[1, 2]"),
     ] {
@@ -5655,6 +5657,53 @@ d.remove("a")
 print([d.len(), snapshot.len(), snapshot.has("a")])"#),
         "[1, 2, true]"
     );
+}
+
+#[test]
+fn collection_clear_semantics_diff() {
+    let outcome = run_both(
+        r#"let a = [1, 2, 3]
+a.clear()
+let d = {"x": 1, "y": 2}
+d.clear()
+print([a, a.len(), d.len(), d.has("x")])
+d["z"] = 9
+print([d.len(), d["z"]])"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, ["[[], 0, 0, false]", "[1, 9]"]);
+
+    assert_eq!(
+        run_err("let d = {\"a\": 1}\nd.clear(1)"),
+        "`.clear()` needs 0 arguments"
+    );
+}
+
+#[test]
+fn collection_mutators_commit_through_ref_params_and_ref_self_diff() {
+    // Reassignment inside a callee only rebinds its local; `ref` receivers
+    // must observe the mutating built-ins themselves.
+    let outcome = run_both(
+        r#"fn wipe(ref d) { d.clear() }
+fn prune(ref d, key) { return d.remove(key) }
+fn shorten(ref a, n) { a.truncate(n) }
+let state = {"a": 1, "b": 2}
+wipe(ref state)
+let scores = {"x": 1, "y": 2}
+let pruned = prune(ref scores, "x")
+let items = [1, 2, 3, 4]
+shorten(ref items, 2)
+print([state.len(), pruned, scores.keys(), items])
+struct Cache { entries }
+fn Cache.reset(ref self) { self.entries.clear() }
+let cache = Cache { entries: {"k": 1} }
+cache.reset()
+print(cache.entries.len())"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, [r#"[0, 1, ["y"], [1, 2]]"#, "0"]);
 }
 
 #[test]

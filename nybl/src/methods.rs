@@ -127,6 +127,13 @@ pub fn array_method_in(
                 Some(Value::__try_new_array_in(new_arr, line, memory)?),
             ))
         }
+        "clear" => {
+            crate::builtins::expect_args("clear", args, 0, line)?;
+            Ok((
+                Value::None,
+                Some(Value::__try_new_array_in(Vec::new(), line, memory)?),
+            ))
+        }
         "reverse" => {
             let mut new_arr = arr.to_vec();
             new_arr.reverse();
@@ -236,6 +243,13 @@ pub fn array_method_mut_in(
             let n = expect_method_index("truncate", &length, line)?;
             let keep = normalize_slice_bound(n, arr.len());
             arr.__truncate_in(keep, memory);
+            Ok(Value::None)
+        }
+        "clear" => {
+            if !args.is_empty() {
+                return Err(error(line, "`clear` takes no arguments"));
+            }
+            arr.__truncate_in(0, memory);
             Ok(Value::None)
         }
         "reverse" => {
@@ -715,6 +729,13 @@ pub fn dict_method_in(
                 Some(Value::__try_new_dict_in(new_entries, line, memory)?),
             ))
         }
+        "clear" => {
+            crate::builtins::expect_args("clear", args, 0, line)?;
+            Ok((
+                Value::None,
+                Some(Value::__try_new_dict_in(Vec::new(), line, memory)?),
+            ))
+        }
         _ => Err(error(
             line,
             format!("Dict doesn't have a .{method}() method"),
@@ -757,6 +778,13 @@ pub fn dict_method_mut_in(
             let key = expect_dict_remove_key(&args, line)?;
             // Absent keys return `none`, matching missing-key reads.
             Ok(dict.__remove_key_in(key, memory).unwrap_or(Value::None))
+        }
+        "clear" => {
+            if !args.is_empty() {
+                return Err(error(line, "`clear` takes no arguments"));
+            }
+            dict.__clear_in(memory);
+            Ok(Value::None)
         }
         _ => Err(error(
             line,
@@ -1132,7 +1160,7 @@ fn pair_pick(
 pub fn is_mutating_method(method: &str) -> bool {
     matches!(
         method,
-        "push" | "pop" | "insert" | "remove" | "reverse" | "sort" | "truncate"
+        "push" | "pop" | "insert" | "remove" | "reverse" | "sort" | "truncate" | "clear"
     )
 }
 
@@ -1141,7 +1169,7 @@ pub fn is_mutating_method(method: &str) -> bool {
 /// type: `remove` mutates both arrays (by index) and dicts (by key), while
 /// the rest of the array set stays read-only-or-missing on dicts.
 pub fn is_mutating_dict_method(method: &str) -> bool {
-    matches!(method, "remove")
+    matches!(method, "remove" | "clear")
 }
 
 /// True when `receiver` is a built-in collection and `method` is one of its
@@ -1161,8 +1189,8 @@ pub fn is_mutating_collection_receiver(receiver: &Value, method: &str) -> bool {
 /// reuse one of these names with a different signature.
 pub fn builtin_method_arity(method: &str) -> Option<usize> {
     match method {
-        "len" | "pop" | "reverse" | "sort" | "iter" | "keys" | "values" | "upper" | "lower"
-        | "trim" | "to_int" | "to_float" | "type" | "to_str" | "inspect" | "is_none"
+        "len" | "pop" | "reverse" | "sort" | "clear" | "iter" | "keys" | "values" | "upper"
+        | "lower" | "trim" | "to_int" | "to_float" | "type" | "to_str" | "inspect" | "is_none"
         | "is_some" | "abs" | "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil"
         | "round" | "is_ok" | "is_err" | "unwrap" | "next" => Some(0),
         "push" | "has" | "index_of" | "remove" | "truncate" | "join" | "contains"

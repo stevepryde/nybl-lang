@@ -821,6 +821,7 @@ fn const_array_mutation_emits_the_shared_runtime_guard() {
         "VALUES.insert(0, 4)",
         "VALUES.remove(0)",
         "VALUES.truncate(1)",
+        "VALUES.clear()",
         "VALUES.reverse()",
         "VALUES.sort()",
     ] {

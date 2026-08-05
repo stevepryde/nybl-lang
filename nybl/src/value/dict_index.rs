@@ -199,6 +199,14 @@ impl DictKeyIndex {
         Some(removed_entry)
     }
 
+    /// Forget every key while keeping the slot allocation, mirroring the
+    /// owning vector's capacity-preserving clear. Allocation-free and
+    /// infallible for the same reason as [`Self::remove`].
+    pub(super) fn clear(&mut self) {
+        self.slots.fill(EMPTY);
+        self.len = 0;
+    }
+
     /// Insert a key already proven absent after capacity has been prepared.
     pub(super) fn insert_new(&mut self, key: &str, entry_index: usize) {
         Self::insert_into_slots(&mut self.slots, key, entry_index);

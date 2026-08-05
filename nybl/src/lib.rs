@@ -1784,6 +1784,46 @@ print([d.len(), snapshot.len(), snapshot.has("a")])"#),
     }
 
     #[test]
+    fn collection_clear_semantics() {
+        assert_eq!(
+            say(r#"let a = [1, 2, 3]
+a.clear()
+let d = {"x": 1, "y": 2}
+d.clear()
+d["z"] = 9
+print([a, a.len(), d.len(), d.has("x"), d["z"]])"#),
+            "[[], 0, 1, false, 9]"
+        );
+        assert_eq!(
+            run_err("let d = {\"a\": 1}\nd.clear(1)"),
+            "`.clear()` needs 0 arguments"
+        );
+    }
+
+    #[test]
+    fn collection_mutators_commit_through_ref_params_and_ref_self() {
+        // Reassignment inside a callee only rebinds its local; `ref`
+        // receivers must observe the mutating built-ins themselves.
+        assert_eq!(
+            say(r#"fn wipe(ref d) { d.clear() }
+fn prune(ref d, key) { return d.remove(key) }
+fn shorten(ref a, n) { a.truncate(n) }
+let state = {"a": 1, "b": 2}
+wipe(ref state)
+let scores = {"x": 1, "y": 2}
+let pruned = prune(ref scores, "x")
+let items = [1, 2, 3, 4]
+shorten(ref items, 2)
+struct Cache { entries }
+fn Cache.reset(ref self) { self.entries.clear() }
+let cache = Cache { entries: {"k": 1} }
+cache.reset()
+print([state.len(), pruned, scores.keys(), items, cache.entries.len()])"#),
+            r#"[0, 1, ["y"], [1, 2], 0]"#
+        );
+    }
+
+    #[test]
     fn array_truncate_semantics() {
         for (call, expected) in [
             ("truncate(2)", "[1, 2]"),
@@ -4557,6 +4597,7 @@ print(leak())"#,
             "VALUES.insert(0, 4)",
             "VALUES.remove(0)",
             "VALUES.truncate(1)",
+            "VALUES.clear()",
             "VALUES.reverse()",
             "(VALUES).sort()",
         ];

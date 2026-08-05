@@ -2811,6 +2811,28 @@ impl NyblDict {
         data.sync_receipt();
         Some(value)
     }
+
+    /// Remove every entry, keeping allocated capacity. Infallible for the
+    /// same reason as [`Self::remove_key`]: clearing frees memory, so it must
+    /// never be the operation that reports a memory error.
+    pub fn clear(&mut self) {
+        self.__clear_in(&MemoryContext::__legacy_current());
+    }
+
+    #[doc(hidden)]
+    pub fn __clear_in(&mut self, memory: &MemoryContext) {
+        if self.is_empty() {
+            return;
+        }
+        self.ensure_owner(memory);
+        let data = Rc::get_mut(&mut self.0).expect("dict backing was made unique");
+        data.entries.clear();
+        data.key_bytes = 0;
+        data.key_index.clear();
+        data.depth_counts.clear();
+        data.depth = 1;
+        data.sync_receipt();
+    }
 }
 
 // ─── Equality ──────────────────────────────────────────────────────────────
@@ -3569,6 +3591,45 @@ mod depth_tests {
         assert!(dict.0.depth_counts.nested.is_empty());
         assert_eq!(dict.0.key_bytes, 0);
         assert_eq!(dict.0.key_index.entry_count(), 0);
+    }
+
+    #[test]
+    fn dict_clear_resets_metadata_and_detaches_shared_backing() {
+        let mut value = Value::try_new_dict(
+            vec![
+                ("flat".into(), Value::Int(1)),
+                ("deep".into(), nested_array(4)),
+            ],
+            1,
+        )
+        .unwrap();
+        let snapshot = value.clone();
+        let Value::Dict(dict) = &mut value else {
+            unreachable!()
+        };
+
+        dict.clear();
+        assert!(dict.is_empty());
+        assert_eq!(dict.0.depth, 1);
+        assert_eq!(dict.0.depth_counts.flat, 0);
+        assert!(dict.0.depth_counts.nested.is_empty());
+        assert!(dict.0.depth_counts.child_depths.is_empty());
+        assert_eq!(dict.0.key_bytes, 0);
+        assert_eq!(dict.0.key_index.entry_count(), 0);
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "flat"), None);
+
+        let Value::Dict(shared) = &snapshot else {
+            unreachable!()
+        };
+        assert!(!Rc::ptr_eq(&dict.0, &shared.0));
+        assert_eq!(shared.len(), 2);
+
+        // Cleared dicts accept fresh keys and clearing empty is a no-op.
+        dict.try_set_key("again", Value::Int(7), 1).unwrap();
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "again"), Some(0));
+        dict.clear();
+        dict.clear();
+        assert!(dict.is_empty());
     }
 
     #[test]
