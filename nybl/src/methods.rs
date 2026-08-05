@@ -12,7 +12,7 @@ use crate::memory::MemoryContext;
 use crate::ops::{
     normalize_element_index, normalize_insert_index, normalize_slice_bound, numeric_index,
 };
-use crate::value::{NyblArray, Value, values_equal};
+use crate::value::{NyblArray, NyblDict, Value, values_equal};
 
 fn expect_method_index(name: &str, value: &Value, line: u32) -> Result<i64, NyblError> {
     numeric_index(value).ok_or_else(|| {
@@ -115,6 +115,25 @@ pub fn array_method_in(
             let slice = arr[start..end].to_vec();
             Ok((Value::__try_new_array_in(slice, line, memory)?, None))
         }
+        "truncate" => {
+            if args.len() != 1 {
+                return Err(error(line, ".truncate() needs exactly 1 argument (length)"));
+            }
+            let n = expect_method_index("truncate", &args[0], line)?;
+            let keep = normalize_slice_bound(n, arr.len());
+            let new_arr = arr[..keep].to_vec();
+            Ok((
+                Value::None,
+                Some(Value::__try_new_array_in(new_arr, line, memory)?),
+            ))
+        }
+        "clear" => {
+            crate::builtins::expect_args("clear", args, 0, line)?;
+            Ok((
+                Value::None,
+                Some(Value::__try_new_array_in(Vec::new(), line, memory)?),
+            ))
+        }
         "reverse" => {
             let mut new_arr = arr.to_vec();
             new_arr.reverse();
@@ -215,6 +234,23 @@ pub fn array_method_mut_in(
             let actual = normalize_element_index(index, arr.len())
                 .ok_or_else(|| error(line, format!("Remove index {index} is out of bounds")))?;
             Ok(arr.__remove_in(actual, memory))
+        }
+        "truncate" => {
+            if args.len() != 1 {
+                return Err(error(line, ".truncate() needs exactly 1 argument (length)"));
+            }
+            let length = args.into_iter().next().expect("length checked");
+            let n = expect_method_index("truncate", &length, line)?;
+            let keep = normalize_slice_bound(n, arr.len());
+            arr.__truncate_in(keep, memory);
+            Ok(Value::None)
+        }
+        "clear" => {
+            if !args.is_empty() {
+                return Err(error(line, "`clear` takes no arguments"));
+            }
+            arr.__truncate_in(0, memory);
+            Ok(Value::None)
         }
         "reverse" => {
             arr.__reverse_in(memory);
@@ -681,10 +717,168 @@ pub fn dict_method_in(
             let keys: Vec<String> = entries.iter().map(|(k, _)| k.clone()).collect();
             Ok((Value::__new_dict_iter_in(keys, memory), None))
         }
+        "remove" => {
+            let key = expect_dict_remove_key(args, line)?;
+            let Some(index) = entries.iter().position(|(k, _)| k == key) else {
+                return Ok((Value::None, None));
+            };
+            let mut new_entries = entries.to_vec();
+            let (_, removed) = new_entries.remove(index);
+            Ok((
+                removed,
+                Some(Value::__try_new_dict_in(new_entries, line, memory)?),
+            ))
+        }
+        "clear" => {
+            crate::builtins::expect_args("clear", args, 0, line)?;
+            Ok((
+                Value::None,
+                Some(Value::__try_new_dict_in(Vec::new(), line, memory)?),
+            ))
+        }
         _ => Err(error(
             line,
             format!("Dict doesn't have a .{method}() method"),
         )),
+    }
+}
+
+fn expect_dict_remove_key(args: &[Value], line: u32) -> Result<&str, NyblError> {
+    if args.len() != 1 {
+        return Err(error(line, ".remove() needs 1 argument (key)"));
+    }
+    match &args[0] {
+        Value::Str(s) => Ok(s.as_str()),
+        _ => Err(error(line, ".remove() needs a string key")),
+    }
+}
+
+/// Execute one of the built-in mutating dict methods directly on its owned
+/// receiver. Mirrors [`array_method_mut`]: engines call this only after
+/// proving the receiver is a write-back place bound to a dict.
+pub fn dict_method_mut(
+    dict: &mut NyblDict,
+    method: &str,
+    args: Vec<Value>,
+    line: u32,
+) -> Result<Value, NyblError> {
+    dict_method_mut_in(dict, method, args, line, &MemoryContext::__legacy_current())
+}
+
+#[doc(hidden)]
+pub fn dict_method_mut_in(
+    dict: &mut NyblDict,
+    method: &str,
+    args: Vec<Value>,
+    line: u32,
+    memory: &MemoryContext,
+) -> Result<Value, NyblError> {
+    match method {
+        "remove" => {
+            let key = expect_dict_remove_key(&args, line)?;
+            // Absent keys return `none`, matching missing-key reads.
+            Ok(dict.__remove_key_in(key, memory).unwrap_or(Value::None))
+        }
+        "clear" => {
+            if !args.is_empty() {
+                return Err(error(line, "`clear` takes no arguments"));
+            }
+            dict.__clear_in(memory);
+            Ok(Value::None)
+        }
+        _ => Err(error(
+            line,
+            format!("Dict doesn't have a .{method}() method"),
+        )),
+    }
+}
+
+/// Run a mutating built-in dict method transactionally against a named
+/// binding, mirroring [`transactional_array_method`]. Dict mutation only
+/// removes entries, so the sole way memory can overrun is the CoW detach of
+/// a shared receiver — checked after the call like the array path.
+pub fn transactional_dict_method(
+    binding: &mut Value,
+    method: &str,
+    args: Vec<Value>,
+    line: u32,
+) -> Result<Value, NyblError> {
+    transactional_dict_method_in(binding, method, args, line, &MemoryContext::__legacy_current())
+}
+
+#[doc(hidden)]
+pub fn transactional_dict_method_in(
+    binding: &mut Value,
+    method: &str,
+    args: Vec<Value>,
+    line: u32,
+    memory: &MemoryContext,
+) -> Result<Value, NyblError> {
+    let mut staged = core::mem::replace(binding, Value::None);
+    let Value::Dict(dict) = &mut staged else {
+        *binding = staged;
+        return Err(error(line, "mutating dict receiver is no longer a dict"));
+    };
+    let result = dict_method_mut_in(dict, method, args, line, memory);
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            *binding = staged;
+            return Err(error);
+        }
+    };
+    *binding = staged;
+    if memory.__exceeded() {
+        return Err(crate::builtins::error_fatal_with_hint(
+            line,
+            "Memory limit exceeded",
+            "Your code is using too much memory. Check for large strings or arrays growing in loops.",
+        ));
+    }
+    Ok(value)
+}
+
+/// Route a mutating built-in collection method to the matching transactional
+/// helper by the binding's live type. Engines call this after a receiver
+/// guard proved a mutating collection method at preflight; re-deriving the
+/// type here keeps the call correct even if argument side effects rebound
+/// the receiver between preflight and execution.
+pub fn transactional_collection_method(
+    binding: &mut Value,
+    method: &str,
+    args: Vec<Value>,
+    line: u32,
+) -> Result<Value, NyblError> {
+    transactional_collection_method_in(
+        binding,
+        method,
+        args,
+        line,
+        &MemoryContext::__legacy_current(),
+    )
+}
+
+#[doc(hidden)]
+pub fn transactional_collection_method_in(
+    binding: &mut Value,
+    method: &str,
+    args: Vec<Value>,
+    line: u32,
+    memory: &MemoryContext,
+) -> Result<Value, NyblError> {
+    match binding {
+        Value::Array(_) if is_mutating_method(method) => {
+            transactional_array_method_in(binding, method, args, line, memory)
+        }
+        Value::Dict(_) if is_mutating_dict_method(method) => {
+            transactional_dict_method_in(binding, method, args, line, memory)
+        }
+        Value::Dict(_) => Err(error(
+            line,
+            format!("Dict doesn't have a .{method}() method"),
+        )),
+        // Keeps the canonical receiver-changed diagnostic for arrays.
+        _ => transactional_array_method_in(binding, method, args, line, memory),
     }
 }
 
@@ -966,8 +1160,27 @@ fn pair_pick(
 pub fn is_mutating_method(method: &str) -> bool {
     matches!(
         method,
-        "push" | "pop" | "insert" | "remove" | "reverse" | "sort"
+        "push" | "pop" | "insert" | "remove" | "reverse" | "sort" | "truncate" | "clear"
     )
+}
+
+/// The built-in dict methods that mutate their receiver. Kept separate from
+/// [`is_mutating_method`] because engines gate mutation dispatch on receiver
+/// type: `remove` mutates both arrays (by index) and dicts (by key), while
+/// the rest of the array set stays read-only-or-missing on dicts.
+pub fn is_mutating_dict_method(method: &str) -> bool {
+    matches!(method, "remove" | "clear")
+}
+
+/// True when `receiver` is a built-in collection and `method` is one of its
+/// mutating built-ins — the shared preflight guard for the engines' in-place
+/// dispatch fast paths.
+pub fn is_mutating_collection_receiver(receiver: &Value, method: &str) -> bool {
+    match receiver {
+        Value::Array(_) => is_mutating_method(method),
+        Value::Dict(_) => is_mutating_dict_method(method),
+        _ => false,
+    }
 }
 
 /// Positional arity for every built-in method name. Engines use this during
@@ -976,13 +1189,13 @@ pub fn is_mutating_method(method: &str) -> bool {
 /// reuse one of these names with a different signature.
 pub fn builtin_method_arity(method: &str) -> Option<usize> {
     match method {
-        "len" | "pop" | "reverse" | "sort" | "iter" | "keys" | "values" | "upper" | "lower"
-        | "trim" | "to_int" | "to_float" | "type" | "to_str" | "inspect" | "is_none"
+        "len" | "pop" | "reverse" | "sort" | "clear" | "iter" | "keys" | "values" | "upper"
+        | "lower" | "trim" | "to_int" | "to_float" | "type" | "to_str" | "inspect" | "is_none"
         | "is_some" | "abs" | "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil"
         | "round" | "is_ok" | "is_err" | "unwrap" | "next" => Some(0),
-        "push" | "has" | "index_of" | "remove" | "join" | "contains" | "starts_with"
-        | "ends_with" | "split" | "pow" | "min" | "max" | "expect" | "unwrap_or" | "map"
-        | "map_err" | "and_then" => Some(1),
+        "push" | "has" | "index_of" | "remove" | "truncate" | "join" | "contains"
+        | "starts_with" | "ends_with" | "split" | "pow" | "min" | "max" | "expect"
+        | "unwrap_or" | "map" | "map_err" | "and_then" => Some(1),
         "insert" | "slice" | "replace" => Some(2),
         _ => None,
     }
@@ -1009,7 +1222,7 @@ pub fn reject_constant_array_mutation(
     Ok(())
 }
 
-/// Reject a built-in array mutation whose receiver was evaluated
+/// Reject a built-in array or dict mutation whose receiver was evaluated
 /// from an index or field access. Those syntactic forms are not yet
 /// write-back places, so accepting the call would mutate a detached
 /// value and silently discard the result.
@@ -1017,13 +1230,13 @@ pub fn reject_constant_array_mutation(
 /// Call this only after user-defined method dispatch. A struct or
 /// enum method named `push`, `pop`, etc. remains a regular dynamic
 /// method call; the restriction is specifically the combination of
-/// a nested-place syntax form and the built-in array receiver type.
+/// a nested-place syntax form and a built-in collection receiver type.
 pub fn reject_nested_array_mutation(
     receiver: &Value,
     method: &str,
     line: u32,
 ) -> Result<(), NyblError> {
-    if matches!(receiver, Value::Array(_)) && is_mutating_method(method) {
+    if is_mutating_collection_receiver(receiver, method) {
         return Err(error_with_hint(
             line,
             crate::error_messages::NESTED_MUTATION_ERROR_MESSAGE,

@@ -1738,6 +1738,110 @@ print(d.len())"#),
         assert_eq!(say(r#"print({"a": 1, "b": 2}.values())"#), "[1, 2]");
     }
 
+    #[test]
+    fn dict_remove_mutates_named_binding() {
+        assert_eq!(
+            say(r#"let d = {"a": 1, "b": 2, "c": 3}
+let gone = d.remove("b")
+print([gone, d.len(), d.has("b"), d.keys()])"#),
+            r#"[2, 2, false, ["a", "c"]]"#
+        );
+        // Missing keys return `none`, matching missing-key reads.
+        assert_eq!(
+            say(r#"let d = {"a": 1}
+print([d.remove("zzz"), d.len()])"#),
+            "[none, 1]"
+        );
+        assert_eq!(
+            run_err(
+                r#"let d = {"a": 1}
+d.remove(0)"#
+            ),
+            ".remove() needs a string key"
+        );
+    }
+
+    #[test]
+    fn dict_remove_commits_through_nested_places() {
+        assert_eq!(
+            say(r#"struct Holder { config }
+let holder = Holder { config: {"x": 1, "y": 2} }
+let d = {"inner": {"a": 1, "b": 2}}
+print([holder.config.remove("x"), d["inner"].remove("b"), holder.config.keys(), d["inner"].keys()])"#),
+            r#"[1, 2, ["y"], ["a"]]"#
+        );
+    }
+
+    #[test]
+    fn dict_remove_on_shared_backing_preserves_value_semantics() {
+        assert_eq!(
+            say(r#"let d = {"a": 1, "b": 2}
+let snapshot = d
+d.remove("a")
+print([d.len(), snapshot.len(), snapshot.has("a")])"#),
+            "[1, 2, true]"
+        );
+    }
+
+    #[test]
+    fn collection_clear_semantics() {
+        assert_eq!(
+            say(r#"let a = [1, 2, 3]
+a.clear()
+let d = {"x": 1, "y": 2}
+d.clear()
+d["z"] = 9
+print([a, a.len(), d.len(), d.has("x"), d["z"]])"#),
+            "[[], 0, 1, false, 9]"
+        );
+        assert_eq!(
+            run_err("let d = {\"a\": 1}\nd.clear(1)"),
+            "`.clear()` needs 0 arguments"
+        );
+    }
+
+    #[test]
+    fn collection_mutators_commit_through_ref_params_and_ref_self() {
+        // Reassignment inside a callee only rebinds its local; `ref`
+        // receivers must observe the mutating built-ins themselves.
+        assert_eq!(
+            say(r#"fn wipe(ref d) { d.clear() }
+fn prune(ref d, key) { return d.remove(key) }
+fn shorten(ref a, n) { a.truncate(n) }
+let state = {"a": 1, "b": 2}
+wipe(ref state)
+let scores = {"x": 1, "y": 2}
+let pruned = prune(ref scores, "x")
+let items = [1, 2, 3, 4]
+shorten(ref items, 2)
+struct Cache { entries }
+fn Cache.reset(ref self) { self.entries.clear() }
+let cache = Cache { entries: {"k": 1} }
+cache.reset()
+print([state.len(), pruned, scores.keys(), items, cache.entries.len()])"#),
+            r#"[0, 1, ["y"], [1, 2], 0]"#
+        );
+    }
+
+    #[test]
+    fn array_truncate_semantics() {
+        for (call, expected) in [
+            ("truncate(2)", "[1, 2]"),
+            ("truncate(0)", "[]"),
+            ("truncate(99)", "[1, 2, 3, 4]"),
+            // Negative lengths count from the end, matching `.slice()` bounds.
+            ("truncate(-1)", "[1, 2, 3]"),
+            ("truncate(-99)", "[]"),
+        ] {
+            let source = format!("let a = [1, 2, 3, 4]\na.{call}\nprint(a)");
+            assert_eq!(say(&source), expected, "call: {call}");
+        }
+        assert_eq!(
+            run_err("let a = [1, 2]\na.truncate(\"x\")"),
+            "`truncate` expects a number, but got string"
+        );
+    }
+
     // ─── Built-in functions ────────────────────────────────────────
 
     #[test]
@@ -4492,6 +4596,8 @@ print(leak())"#,
             "VALUES.pop()",
             "VALUES.insert(0, 4)",
             "VALUES.remove(0)",
+            "VALUES.truncate(1)",
+            "VALUES.clear()",
             "VALUES.reverse()",
             "(VALUES).sort()",
         ];
@@ -4534,12 +4640,14 @@ print([ACCUMULATOR.push(5), ACCUMULATOR.pop(), LOOKUP.keys()])"#),
             r#"[12, 7, ["n"]]"#
         );
 
+        // `.remove()` is now a mutating dict built-in, so a constant dict
+        // receiver gets the canonical constant error rather than dispatch.
         assert_eq!(
             run_err(
                 r#"const LOOKUP = {"n": 1}
 LOOKUP.remove("n")"#
             ),
-            "Dict doesn't have a .remove() method"
+            "can't reassign `LOOKUP` — it's a constant"
         );
     }
 

@@ -747,6 +747,8 @@ fn const_array_mutating_methods_are_rejected_by_both_engines_diff() {
         "VALUES.pop()",
         "VALUES.insert(0, 4)",
         "VALUES.remove(0)",
+        "VALUES.truncate(1)",
+        "VALUES.clear()",
         "VALUES.reverse()",
         "(VALUES).sort()",
     ] {
@@ -781,12 +783,14 @@ const LOOKUP = {"n": 1}
 print([ACCUMULATOR.push(5), ACCUMULATOR.pop(), LOOKUP.keys()])"#),
         r#"[12, 7, ["n"]]"#
     );
+    // `.remove()` is now a mutating dict built-in, so a constant dict
+    // receiver gets the canonical constant error rather than dispatch.
     assert_eq!(
         run_err(
             r#"const LOOKUP = {"n": 1}
 LOOKUP.remove("n")"#
         ),
-        "Dict doesn't have a .remove() method"
+        "can't reassign `LOOKUP` — it's a constant"
     );
 }
 
@@ -5283,6 +5287,8 @@ fn every_array_mutator_commits_through_nested_places_diff() {
         ("pop()", "[2]"),
         ("insert(0, 3)", "[3, 2, 1]"),
         ("remove(0)", "[1]"),
+        ("truncate(1)", "[2]"),
+        ("clear()", "[]"),
         ("reverse()", "[1, 2]"),
         ("sort()", "[1, 2]"),
     ] {
@@ -5565,6 +5571,163 @@ print(d.len())"#),
 fn dict_keys_values() {
     assert_eq!(say(r#"print({"a": 1, "b": 2}.keys())"#), r#"["a", "b"]"#);
     assert_eq!(say(r#"print({"a": 1, "b": 2}.values())"#), "[1, 2]");
+}
+
+#[test]
+fn dict_remove_mutates_named_binding_diff() {
+    let outcome = run_both(
+        r#"let d = {"a": 1, "b": 2, "c": 3}
+let gone = d.remove("b")
+print([gone, d.len(), d.has("b")])
+print(d.keys())"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, ["[2, 2, false]", r#"["a", "c"]"#]);
+}
+
+#[test]
+fn dict_remove_missing_key_returns_none_diff() {
+    let outcome = run_both(
+        r#"let d = {"a": 1}
+print(d.remove("zzz"))
+print(d.len())"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, ["none", "1"]);
+}
+
+#[test]
+fn dict_remove_requires_a_string_key_diff() {
+    assert_eq!(
+        run_err(
+            r#"let d = {"a": 1}
+d.remove(0)"#
+        ),
+        ".remove() needs a string key"
+    );
+}
+
+#[test]
+fn dict_remove_then_reinsert_keeps_lookup_coherent_diff() {
+    // Exercises the key index's backward-shift deletion: removals in the
+    // middle of a probe cluster must keep every surviving key reachable,
+    // and re-inserting a removed key appends in declaration order.
+    assert_eq!(
+        say(r#"let d = {}
+for i in range(12) {
+    d["k" + i.to_str()] = i
+}
+for i in range(6) {
+    d.remove("k" + (i * 2).to_str())
+}
+d["k0"] = 99
+let total = 0
+for key in d.keys() {
+    total = total + d[key]
+}
+print([d.len(), total, d["k0"], d.has("k4"), d.has("k5")])"#),
+        "[7, 135, 99, false, true]"
+    );
+}
+
+#[test]
+fn dict_remove_commits_through_nested_places_diff() {
+    let outcome = run_both(
+        r#"struct Holder { config }
+let holder = Holder { config: {"x": 1, "y": 2} }
+let d = {"inner": {"a": 1, "b": 2}}
+print([holder.config.remove("x"), d["inner"].remove("b")])
+print([holder.config.keys(), d["inner"].keys()])"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, ["[1, 2]", r#"[["y"], ["a"]]"#]);
+}
+
+#[test]
+fn dict_remove_on_shared_backing_preserves_value_semantics_diff() {
+    // Value semantics: the earlier assignment snapshots the dict, so the
+    // removal must copy-on-write rather than mutate the shared backing.
+    assert_eq!(
+        say(r#"let d = {"a": 1, "b": 2}
+let snapshot = d
+d.remove("a")
+print([d.len(), snapshot.len(), snapshot.has("a")])"#),
+        "[1, 2, true]"
+    );
+}
+
+#[test]
+fn collection_clear_semantics_diff() {
+    let outcome = run_both(
+        r#"let a = [1, 2, 3]
+a.clear()
+let d = {"x": 1, "y": 2}
+d.clear()
+print([a, a.len(), d.len(), d.has("x")])
+d["z"] = 9
+print([d.len(), d["z"]])"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, ["[[], 0, 0, false]", "[1, 9]"]);
+
+    assert_eq!(
+        run_err("let d = {\"a\": 1}\nd.clear(1)"),
+        "`.clear()` needs 0 arguments"
+    );
+}
+
+#[test]
+fn collection_mutators_commit_through_ref_params_and_ref_self_diff() {
+    // Reassignment inside a callee only rebinds its local; `ref` receivers
+    // must observe the mutating built-ins themselves.
+    let outcome = run_both(
+        r#"fn wipe(ref d) { d.clear() }
+fn prune(ref d, key) { return d.remove(key) }
+fn shorten(ref a, n) { a.truncate(n) }
+let state = {"a": 1, "b": 2}
+wipe(ref state)
+let scores = {"x": 1, "y": 2}
+let pruned = prune(ref scores, "x")
+let items = [1, 2, 3, 4]
+shorten(ref items, 2)
+print([state.len(), pruned, scores.keys(), items])
+struct Cache { entries }
+fn Cache.reset(ref self) { self.entries.clear() }
+let cache = Cache { entries: {"k": 1} }
+cache.reset()
+print(cache.entries.len())"#,
+        &standard(),
+    );
+    assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
+    assert_eq!(outcome.prints, [r#"[0, 1, ["y"], [1, 2]]"#, "0"]);
+}
+
+#[test]
+fn array_truncate_semantics_diff() {
+    for (call, expected) in [
+        ("truncate(2)", "[1, 2]"),
+        ("truncate(0)", "[]"),
+        ("truncate(4)", "[1, 2, 3, 4]"),
+        ("truncate(99)", "[1, 2, 3, 4]"),
+        // Negative lengths count from the end, matching `.slice()` bounds.
+        ("truncate(-1)", "[1, 2, 3]"),
+        ("truncate(-99)", "[]"),
+    ] {
+        let source = format!("let a = [1, 2, 3, 4]\na.{call}\nprint(a)");
+        assert_eq!(say(&source), expected, "call: {call}");
+    }
+}
+
+#[test]
+fn array_truncate_rejects_non_numeric_lengths_diff() {
+    assert_eq!(
+        run_err("let a = [1, 2]\na.truncate(\"x\")"),
+        "`truncate` expects a number, but got string"
+    );
 }
 
 // ─── Built-in functions ───────────────────────────────────────────

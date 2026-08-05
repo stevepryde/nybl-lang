@@ -3,6 +3,26 @@
 All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
+## 0.4.2
+
+`0.4.2` rounds out the built-in collection surface with mutating dict methods
+and in-place array shrinking, consistent across the walker, VM, and AOT
+engines.
+
+### Language
+
+- Add dict `.remove(key)`: removes a key and returns its value, or `none` when
+  the key is absent. It follows the same transactional write-back, constant
+  rejection, and nested-place commit rules as the built-in array mutators
+  across all three engines, and removal never raises a memory error — the key
+  index shifts in place without allocating.
+- Add array `.truncate(n)`: shortens the array to at most `n` elements in
+  place. Negative lengths count from the end like a `.slice()` bound;
+  already-short arrays are untouched.
+- Add `.clear()` on arrays and dicts: removes every element/entry in place
+  under the same mutating-method rules, so it also works through `ref`
+  parameters and `ref self`, where reassigning the callee's binding would not.
+
 ## 0.4.1
 
 `0.4.1` is the first coordinated release after `0.3.0`. It expands Nybl from a

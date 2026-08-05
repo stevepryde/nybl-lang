@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-cli"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "nybl-compile",
  "nybl-lang",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-compile"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "nybl-lang",
  "nybl-vm",
@@ -144,7 +144,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-lang"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "libm",
 ]
@@ -160,14 +160,14 @@ dependencies = [
 
 [[package]]
 name = "nybl-sys"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "nybl-lang",
 ]
 
 [[package]]
 name = "nybl-vm"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "nybl-lang",
 ]

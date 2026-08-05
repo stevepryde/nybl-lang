@@ -2468,6 +2468,31 @@ impl NyblArray {
         value
     }
 
+    /// Shorten to at most `len` elements, dropping the tail. No-op when the
+    /// array is already short enough.
+    pub fn truncate(&mut self, len: usize) {
+        self.__truncate_in(len, &MemoryContext::__legacy_current());
+    }
+
+    #[doc(hidden)]
+    pub fn __truncate_in(&mut self, len: usize, memory: &MemoryContext) {
+        if len >= self.len() {
+            return;
+        }
+        self.ensure_owner(memory);
+        let data = Rc::get_mut(&mut self.0).expect("array backing was made unique");
+        while data.items.len() > len {
+            let child_depth = data
+                .depth_counts
+                .child_depths
+                .pop()
+                .expect("child depths track items");
+            data.items.pop();
+            data.depth_counts.remove(child_depth);
+        }
+        Self::refresh_depth(data);
+    }
+
     pub fn reverse(&mut self) {
         self.__reverse_in(&MemoryContext::__legacy_current());
     }
@@ -2758,6 +2783,55 @@ impl NyblDict {
         }
         data.sync_receipt();
         Ok(())
+    }
+
+    /// Remove a key, returning its value, or `None` when absent.
+    pub fn remove_key(&mut self, key: &str) -> Option<Value> {
+        self.__remove_key_in(key, &MemoryContext::__legacy_current())
+    }
+
+    /// Infallible by design: removal frees memory, so it must never be the
+    /// operation that reports a memory error. The key index shifts in place
+    /// without allocating, and the absent-key probe happens before CoW
+    /// detachment so a miss leaves shared backing untouched.
+    #[doc(hidden)]
+    pub fn __remove_key_in(&mut self, key: &str, memory: &MemoryContext) -> Option<Value> {
+        self.0.key_index.get(&self.0.entries, key)?;
+        self.ensure_owner(memory);
+        let data = Rc::get_mut(&mut self.0).expect("dict backing was made unique");
+        let index = data
+            .key_index
+            .remove(&data.entries, key)
+            .expect("present key survives CoW detachment");
+        let (removed_key, value) = data.entries.remove(index);
+        data.key_bytes -= removed_key.capacity();
+        let child_depth = data.depth_counts.child_depths.remove(index);
+        data.depth_counts.remove(child_depth);
+        data.depth = data.depth_counts.owner_depth();
+        data.sync_receipt();
+        Some(value)
+    }
+
+    /// Remove every entry, keeping allocated capacity. Infallible for the
+    /// same reason as [`Self::remove_key`]: clearing frees memory, so it must
+    /// never be the operation that reports a memory error.
+    pub fn clear(&mut self) {
+        self.__clear_in(&MemoryContext::__legacy_current());
+    }
+
+    #[doc(hidden)]
+    pub fn __clear_in(&mut self, memory: &MemoryContext) {
+        if self.is_empty() {
+            return;
+        }
+        self.ensure_owner(memory);
+        let data = Rc::get_mut(&mut self.0).expect("dict backing was made unique");
+        data.entries.clear();
+        data.key_bytes = 0;
+        data.key_index.clear();
+        data.depth_counts.clear();
+        data.depth = 1;
+        data.sync_receipt();
     }
 }
 
@@ -3462,6 +3536,204 @@ mod depth_tests {
             dict.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
             ["flat", "deep", "middle", "tail"]
         );
+    }
+
+    #[test]
+    fn dict_key_removal_keeps_depth_metadata_lookup_and_key_bytes_exact() {
+        let mut value = Value::try_new_dict(
+            vec![
+                ("flat".into(), Value::Int(1)),
+                ("deep".into(), nested_array(4)),
+                ("middle".into(), nested_array(2)),
+            ],
+            1,
+        )
+        .unwrap();
+        let Value::Dict(dict) = &mut value else {
+            unreachable!()
+        };
+        let full_key_bytes = dict.0.key_bytes;
+
+        let removed = dict.remove_key("deep").expect("key present");
+        assert_eq!(removed.ownership_depth(), 4);
+        assert_eq!(dict.0.depth, 3);
+        assert_eq!(dict.0.depth_counts.flat, 1);
+        assert_eq!(dict.0.depth_counts.nested, [(2, 1)]);
+        assert_eq!(dict.0.depth_counts.child_depths, [0, 2]);
+        assert_eq!(dict.0.key_bytes, full_key_bytes - "deep".len());
+        assert_eq!(dict.0.key_index.entry_count(), 2);
+
+        // Surviving keys stay reachable through the shifted index and keep
+        // insertion order; the removed key is gone from both stores.
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "flat"), Some(0));
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "middle"), Some(1));
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "deep"), None);
+        assert!(dict.remove_key("deep").is_none());
+
+        // Re-inserting a removed key appends like a brand-new key.
+        dict.try_set_key("deep", Value::Int(9), 1).unwrap();
+        assert_eq!(
+            dict.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            ["flat", "middle", "deep"]
+        );
+
+        let removed = dict.remove_key("middle").expect("key present");
+        assert_eq!(removed.ownership_depth(), 2);
+        let removed = dict.remove_key("flat").expect("key present");
+        assert!(matches!(removed, Value::Int(1)));
+        assert!(matches!(
+            dict.remove_key("deep"),
+            Some(Value::Int(9))
+        ));
+        assert!(dict.is_empty());
+        assert_eq!(dict.0.depth, 1);
+        assert_eq!(dict.0.depth_counts.flat, 0);
+        assert!(dict.0.depth_counts.nested.is_empty());
+        assert_eq!(dict.0.key_bytes, 0);
+        assert_eq!(dict.0.key_index.entry_count(), 0);
+    }
+
+    #[test]
+    fn dict_clear_resets_metadata_and_detaches_shared_backing() {
+        let mut value = Value::try_new_dict(
+            vec![
+                ("flat".into(), Value::Int(1)),
+                ("deep".into(), nested_array(4)),
+            ],
+            1,
+        )
+        .unwrap();
+        let snapshot = value.clone();
+        let Value::Dict(dict) = &mut value else {
+            unreachable!()
+        };
+
+        dict.clear();
+        assert!(dict.is_empty());
+        assert_eq!(dict.0.depth, 1);
+        assert_eq!(dict.0.depth_counts.flat, 0);
+        assert!(dict.0.depth_counts.nested.is_empty());
+        assert!(dict.0.depth_counts.child_depths.is_empty());
+        assert_eq!(dict.0.key_bytes, 0);
+        assert_eq!(dict.0.key_index.entry_count(), 0);
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "flat"), None);
+
+        let Value::Dict(shared) = &snapshot else {
+            unreachable!()
+        };
+        assert!(!Rc::ptr_eq(&dict.0, &shared.0));
+        assert_eq!(shared.len(), 2);
+
+        // Cleared dicts accept fresh keys and clearing empty is a no-op.
+        dict.try_set_key("again", Value::Int(7), 1).unwrap();
+        assert_eq!(dict.0.key_index.get(&dict.0.entries, "again"), Some(0));
+        dict.clear();
+        dict.clear();
+        assert!(dict.is_empty());
+    }
+
+    #[test]
+    fn dict_key_removal_detaches_shared_backing() {
+        let mut value = Value::try_new_dict(
+            vec![("a".into(), Value::Int(1)), ("b".into(), Value::Int(2))],
+            1,
+        )
+        .unwrap();
+        let snapshot = value.clone();
+        let Value::Dict(dict) = &mut value else {
+            unreachable!()
+        };
+
+        assert!(matches!(dict.remove_key("a"), Some(Value::Int(1))));
+        let Value::Dict(shared) = &snapshot else {
+            unreachable!()
+        };
+        assert!(!Rc::ptr_eq(&dict.0, &shared.0));
+        assert_eq!(shared.len(), 2);
+        assert_eq!(shared.0.key_index.get(&shared.0.entries, "a"), Some(0));
+        assert_eq!(dict.len(), 1);
+    }
+
+    #[test]
+    fn dict_key_removal_churn_keeps_lookup_exact_and_probes_short() {
+        let mut value = Value::try_new_dict(Vec::new(), 1).unwrap();
+        let Value::Dict(dict) = &mut value else {
+            unreachable!()
+        };
+
+        // Insert batches and remove every other key, across several rounds,
+        // so backward-shift deletion has to repair probe clusters that span
+        // removals from different eras.
+        for round in 0..4 {
+            for i in 0..64 {
+                dict.try_set_key(&format!("k{round}_{i}"), Value::Int(i), 1)
+                    .unwrap();
+            }
+            for i in (0..64).step_by(2) {
+                assert!(
+                    dict.remove_key(&format!("k{round}_{i}")).is_some(),
+                    "round {round} key {i} should be removable"
+                );
+            }
+            for i in 0..64 {
+                let hit = dict
+                    .0
+                    .key_index
+                    .get(&dict.0.entries, &format!("k{round}_{i}"));
+                assert_eq!(hit.is_some(), i % 2 == 1, "round {round} key {i}");
+            }
+        }
+        assert_eq!(dict.len(), 4 * 32);
+        assert_eq!(dict.0.key_index.entry_count(), 4 * 32);
+
+        // Lookups stay near O(1) after churn.
+        dict.0.key_index.reset_probes();
+        let mut lookups = 0;
+        for round in 0..4 {
+            for i in (1..64).step_by(2) {
+                assert!(
+                    dict.0
+                        .key_index
+                        .get(&dict.0.entries, &format!("k{round}_{i}"))
+                        .is_some()
+                );
+                lookups += 1;
+            }
+        }
+        assert!(
+            dict.0.key_index.probes() < lookups * 8,
+            "expected short probe chains after removal churn, saw {} probes for {} lookups",
+            dict.0.key_index.probes(),
+            lookups
+        );
+    }
+
+    #[test]
+    fn array_truncate_keeps_depth_metadata_exact() {
+        let mut value = Value::try_new_array(vec![Value::Int(1)], 1).unwrap();
+        let Value::Array(array) = &mut value else {
+            unreachable!()
+        };
+        array.try_push(nested_array(4), 1).unwrap();
+        array.try_push(nested_array(2), 1).unwrap();
+        assert_eq!(array.0.depth, 5);
+
+        // No-op when already short enough.
+        array.truncate(3);
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.0.depth, 5);
+
+        array.truncate(2);
+        assert_eq!(array.len(), 2);
+        assert_eq!(array.0.depth, 5);
+        assert_eq!(array.0.depth_counts.child_depths, [0, 4]);
+        assert_eq!(array.0.depth_counts.nested, [(4, 1)]);
+
+        array.truncate(0);
+        assert!(array.is_empty());
+        assert_eq!(array.0.depth, 1);
+        assert_eq!(array.0.depth_counts.flat, 0);
+        assert!(array.0.depth_counts.nested.is_empty());
     }
 
     #[test]

@@ -7866,7 +7866,7 @@ fn __nybl_function_site_value(
             };
             write!(
                 arg_lets,
-                "let ({user_tmp}, {receiver_tmp}, {receiver_is_array_tmp}) = {{ let __nybl_preflight_receiver: &::nybl::value::Value = {receiver}; let __nybl_method_adapter = __nybl_preflight_user_method(ctx, __nybl_preflight_receiver, {}, &[{}], true, {line})?; let __nybl_saved_receiver = if __nybl_method_adapter.is_some() {{ ::std::option::Option::Some(__nybl_preflight_receiver.clone()) }} else {{ ::std::option::Option::None }}; let __nybl_receiver_is_array = matches!(__nybl_preflight_receiver, ::nybl::value::Value::Array(_)); (__nybl_method_adapter, __nybl_saved_receiver, __nybl_receiver_is_array) }}; if {user_tmp}.is_none() && {receiver_is_array_tmp} {{ {captured_guard}::nybl::methods::reject_constant_array_mutation({}, {}, {line})?; if {actual}usize != {expected}usize {{ return Err(::nybl::error::NyblError::runtime({}, {line})); }} }} ",
+                "let ({user_tmp}, {receiver_tmp}, {receiver_is_array_tmp}) = {{ let __nybl_preflight_receiver: &::nybl::value::Value = {receiver}; let __nybl_method_adapter = __nybl_preflight_user_method(ctx, __nybl_preflight_receiver, {}, &[{}], true, {line})?; let __nybl_saved_receiver = if __nybl_method_adapter.is_some() {{ ::std::option::Option::Some(__nybl_preflight_receiver.clone()) }} else {{ ::std::option::Option::None }}; let __nybl_receiver_in_place = ::nybl::methods::is_mutating_collection_receiver(__nybl_preflight_receiver, {method_literal}); (__nybl_method_adapter, __nybl_saved_receiver, __nybl_receiver_in_place) }}; if {user_tmp}.is_none() && {receiver_is_array_tmp} {{ {captured_guard}::nybl::methods::reject_constant_array_mutation({}, {}, {line})?; if {actual}usize != {expected}usize {{ return Err(::nybl::error::NyblError::runtime({}, {line})); }} }} ",
                 rust_string_literal(method),
                 args.iter()
                     .map(|_| "::nybl::parser::ParamMode::Value")
@@ -7881,6 +7881,7 @@ fn __nybl_function_site_value(
                     if expected == 1 { "" } else { "s" }
                 )),
                 actual = args.len(),
+                method_literal = rust_string_literal(method),
             )
             .unwrap();
             let storage =
@@ -7959,9 +7960,10 @@ fn __nybl_function_site_value(
         // current post-argument binding.
         //
         // The receiver is dynamically typed. A struct may define a user method
-        // named `push`, so non-arrays still clone once and go through the full
-        // user-method-before-builtin dispatcher. Only the built-in Array arm
-        // takes the in-place path.
+        // named `push`, so other receivers still clone once and go through the
+        // full user-method-before-builtin dispatcher. Only built-in Array and
+        // Dict receivers whose method actually mutates that type take the
+        // in-place path.
         if let Some(target_name) = ident_target {
             let user_token = named_user_method
                 .clone()
@@ -8002,8 +8004,8 @@ fn __nybl_function_site_value(
                     let mut body = String::new();
                     write!(
                         body,
-                        "{{ {arg_lets}let __ret = if matches!({overlay}.overlay.as_ref(), ::std::option::Option::Some(::nybl::value::Value::Array(_))) {{ \
-                            {constant_guard}::nybl::methods::transactional_array_method_in({overlay}.overlay.as_mut().expect(\"array overlay\"), {method_lit}, {owned_args}, {line}, &ctx.memory)? \
+                        "{{ {arg_lets}let __ret = if {overlay}.overlay.as_ref().is_some_and(|__nybl_overlay_value| ::nybl::methods::is_mutating_collection_receiver(__nybl_overlay_value, {method_lit})) {{ \
+                            {constant_guard}::nybl::methods::transactional_collection_method_in({overlay}.overlay.as_mut().expect(\"collection overlay\"), {method_lit}, {owned_args}, {line}, &ctx.memory)? \
                         }} else if let ::std::option::Option::Some(__nybl_method_adapter) = {user_token} {{ \
                             {user_dispatch} \
                         }} else {{ \
@@ -8038,8 +8040,8 @@ fn __nybl_function_site_value(
                 let mut body = String::new();
                 write!(
                     body,
-                    "{{ {arg_lets}let __nybl_memory = ctx.memory.clone(); let __nybl_receiver_is_array = {{ let {target_tmp}: &mut ::nybl::value::Value = {target_src}; matches!(&*{target_tmp}, ::nybl::value::Value::Array(_)) }}; let __ret = if __nybl_receiver_is_array {{ \
-                        let {target_tmp}: &mut ::nybl::value::Value = {target_src}; {constant_guard}::nybl::methods::transactional_array_method_in({target_tmp}, {method_lit}, {owned_args}, {line}, &__nybl_memory)? \
+                    "{{ {arg_lets}let __nybl_memory = ctx.memory.clone(); let __nybl_receiver_in_place = {{ let {target_tmp}: &mut ::nybl::value::Value = {target_src}; ::nybl::methods::is_mutating_collection_receiver(&*{target_tmp}, {method_lit}) }}; let __ret = if __nybl_receiver_in_place {{ \
+                        let {target_tmp}: &mut ::nybl::value::Value = {target_src}; {constant_guard}::nybl::methods::transactional_collection_method_in({target_tmp}, {method_lit}, {owned_args}, {line}, &__nybl_memory)? \
                     }} else if let ::std::option::Option::Some(__nybl_method_adapter) = {user_token} {{ \
                         {user_dispatch} \
                     }} else {{ \
@@ -8056,8 +8058,8 @@ fn __nybl_function_site_value(
             let mut body = String::new();
             write!(
                 body,
-                "{{ {arg_lets}let __ret = if matches!(&{target}, ::nybl::value::Value::Array(_)) {{ \
-                    {constant_guard}::nybl::methods::transactional_array_method_in(&mut {target}, {method_lit}, {owned_args}, {line}, &ctx.memory)? \
+                "{{ {arg_lets}let __ret = if ::nybl::methods::is_mutating_collection_receiver(&{target}, {method_lit}) {{ \
+                    {constant_guard}::nybl::methods::transactional_collection_method_in(&mut {target}, {method_lit}, {owned_args}, {line}, &ctx.memory)? \
                 }} else if let ::std::option::Option::Some(__nybl_method_adapter) = {user_token} {{ \
                     {user_dispatch} \
                 }} else {{ \
@@ -9269,9 +9271,9 @@ mod tests {
             "missing authoritative mutable Array binding:\n{output}"
         );
         assert!(
-            output.contains("::nybl::methods::transactional_array_method_in(")
+            output.contains("::nybl::methods::transactional_collection_method_in(")
                 && output.contains("\"push\""),
-            "missing shared in-place array dispatch:\n{output}"
+            "missing shared in-place collection dispatch:\n{output}"
         );
         assert!(
             output.contains("__nybl_preflight_user_method(ctx")

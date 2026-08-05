@@ -51,7 +51,18 @@ Two caveats:
 ```nybl
 person["age"] = 31             // update existing key
 person["email"] = "a@b.com"   // add new entry
+let removed = person.remove("email")   // delete a key, returning its value
 ```
+
+`remove` returns `none` when the key is absent. Together with `clear`, it
+mutates its receiver with the same write-back rules as the [mutating array
+methods](/docs/data/arrays/#methods): mutable places rooted in a `let`
+binding write back atomically (including nested places like
+`state["session"].remove("token")`), constants are rejected, and a genuine
+temporary is mutated and then discarded. Because they are mutating methods,
+they also work through `ref` parameters and `ref self` — `fn wipe(ref d) {
+d.clear() }` empties the caller's dict, where `d = {}` would only rebind the
+callee's local.
 
 ## Methods
 
@@ -61,6 +72,8 @@ person["email"] = "a@b.com"   // add new entry
 | `d.keys()` | array | Array of all keys |
 | `d.values()` | array | Array of all values |
 | `d.has(key)` | bool | Whether the key exists |
+| `d.remove(key)` | value | Remove `key`, returning its value, or `none` when absent. The key must be a string |
+| `d.clear()` | none | Remove every entry |
 
 Plus the universal `d.type()`, `d.to_str()`, `d.inspect()`.
 
