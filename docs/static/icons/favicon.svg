@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
-  <title>Nybl</title>
-  <rect width="64" height="64" rx="15" fill="#181a20"/>
-  <path d="M17 15v34h17.5C43 49 49 44.1 49 36.8c0-4.9-2.8-8.5-7.2-10.1A10.4 10.4 0 0 0 32.3 15H17Zm10 8h5c2.8 0 4.5 1.5 4.5 3.8 0 2.4-1.8 3.9-4.8 3.9H27V23Zm0 15h7c3.1 0 4.9 1.4 4.9 3.8 0 2.5-1.9 4-5.1 4H27V38Z" fill="#f6f2e9"/>
-  <circle cx="49" cy="16" r="6" fill="#ee6a4b"/>
-</svg>

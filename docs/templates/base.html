@@ -20,7 +20,10 @@
   {% if site_current_path is starting_with("/docs/") %}
   <link rel="alternate" type="text/markdown" href="{{ current_url | safe }}index.html.md" title="Markdown version">
   {% endif %}
-  <link rel="icon" href="/icons/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/icons/favicon.ico" sizes="any">
+  <link rel="icon" href="/icons/favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="icon" href="/icons/favicon-16.png" type="image/png" sizes="16x16">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" sizes="180x180">
   <link rel="preload" href="/fonts/source-sans-3-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="preload" href="/fonts/jetbrains-mono-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="{{ get_url(path='site.css', cachebust=true) | safe }}">
@@ -37,7 +40,7 @@
   <header class="site-header" data-site-header>
     <div class="site-header-inner">
       <a class="brand" href="/" aria-label="Nybl home">
-        <span class="brand-mark" aria-hidden="true">b</span>
+        <img class="brand-mark" src="/icons/nybl-icon.png" width="32" height="32" alt="" aria-hidden="true">
         <span class="brand-word">nybl</span>
       </a>
 

@@ -262,17 +262,10 @@ samp {
 }
 
 .brand-mark {
-  display: inline-grid;
-  width: 30px;
-  height: 30px;
-  place-items: center;
-  border-radius: 4px;
-  background: var(--color-bg-elevated);
-  color: var(--color-code-text);
-  font-family: var(--font-mono);
-  font-size: 1.08rem;
-  font-weight: 650;
-  line-height: 1;
+  display: block;
+  width: 32px;
+  height: 32px;
+  flex: none;
 }
 
 .brand-word {
