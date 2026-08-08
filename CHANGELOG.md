@@ -37,6 +37,16 @@ publishable workspace crates unless a section says otherwise.
   fatal, `try_call`-proof error the moment they would invoke the builtin.
   Consistent across the walker, VM, and AOT engines; imported modules are
   checked when they load.
+- Align callable shadowing across the walker, VM, and AOT engines: an executed
+  user function declaration now shadows an engine builtin of the same name,
+  while calls before that declaration retain source-ordered builtin behavior.
+  Disabled-builtin checks follow the same rule, so a lexical replacement such
+  as a host-controlled `rand` function remains valid.
+- Add instance-affine `PreparedEntry` handles plus `call_prepared` and
+  `call_batch` to the walker and VM embedding APIs. Host batches reuse one live
+  engine while resetting step and call-depth accounting per item; script-level
+  batch entry points provide the largest measured game-tick improvement while
+  preserving ordinary host dispatch and sandbox semantics.
 - Make `nybl-sys` clock calls safe on freestanding wasm:
   `unix_time()` and `unix_time_ms()` now return an actionable Nybl runtime
   error on `wasm32-unknown-unknown` instead of trapping in
