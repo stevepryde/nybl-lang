@@ -57,7 +57,13 @@ nybl_vm::run(source, &mut host, &NyblLimits::standard())?;
 ## When *not* to use `nybl-sys`
 
 - **Sandboxed embeddings** that need to block filesystem / env access — write a bare `NyblHost` impl and skip this crate entirely.
-- **WASM / no_std builds** — `nybl-sys` depends on `std` for filesystem and time. Use `nybl-lang` (optionally with `nybl-vm`, and with `features = ["nybl-std"]` if you want the stdlib) directly.
+- **WASM / no_std builds** — `nybl-sys` depends on `std` and is an OS-oriented
+  host. On WASI its clock functions use the platform clock. On
+  `wasm32-unknown-unknown`, `unix_time()` and `unix_time_ms()` return a Nybl
+  runtime error instead of panicking because that target has no system clock.
+  Browser and other freestanding wasm embeddings should use `nybl-lang`
+  (optionally with `nybl-vm`) directly and provide time through a custom
+  `NyblHost`.
 - **Anywhere you want a tighter custom host surface** — `NyblHost::call` is the only thing you need to implement; your host can expose exactly the functions your app wants Nybl to reach.
 
 ## Related crates

@@ -48,6 +48,16 @@
 //! untrusted code should implement a narrow [`nybl::NyblHost`] instead and only
 //! expose approved capabilities.
 //!
+//! # WebAssembly clocks
+//!
+//! `StandardHost` remains an OS-oriented host. On WASI, its clock functions use
+//! the platform clock normally. On `wasm32-unknown-unknown`, where Rust's
+//! [`std::time::SystemTime`] has no clock implementation, `unix_time()` and
+//! `unix_time_ms()` return an actionable Nybl runtime error instead of
+//! panicking. Browser and other freestanding wasm embeddings should expose a
+//! clock through a custom [`nybl::NyblHost`] backed by their JavaScript host or
+//! a caller-supplied deterministic tick.
+//!
 //! See the [embedding guide](https://nybl-lang.com/docs/embedding/) for the
 //! complete host-function table and custom-host examples.
 

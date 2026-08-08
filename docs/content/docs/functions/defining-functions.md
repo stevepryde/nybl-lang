@@ -53,6 +53,25 @@ with a `ref` parameter can still be called normally from Nybl source, but
 target. The same value-only rule applies when the host invokes a returned
 function through `call_value`.
 
+### Shadowing engine builtins
+
+An executed lexical function declaration shadows an engine builtin with the
+same name, just like a `let`-bound callable does:
+
+```nybl
+fn rand(max) {
+  return 0
+}
+
+print(rand(10)) // 0, from the user function
+```
+
+This applies to `range`, `rand`, `print`, `try_call`, and `panic`. Declarations
+take effect when execution reaches them, so an earlier call still resolves to
+the builtin. A host deny list therefore allows a shadowing user function but
+still rejects any source-ordered call that actually reaches the disabled
+builtin.
+
 ## Parameters
 
 Functions can take parameters — values you pass in when calling:

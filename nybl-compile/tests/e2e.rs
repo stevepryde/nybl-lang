@@ -4260,3 +4260,19 @@ fn disabled_builtin_backstop_fires_at_runtime_in_generated_code() {
         run.rust_src
     );
 }
+
+#[test]
+fn lexical_function_shadows_disabled_builtin_in_generated_code() {
+    let opts = Options {
+        disabled_builtins: std::collections::BTreeSet::from(["rand".to_string()]),
+        ..Options::default()
+    };
+    let run = run_aot_with_modules_and_opts(
+        "fn rand(n) { return n }\nprint(rand(9))",
+        "disabled_builtin_fn_shadow",
+        &[],
+        &opts,
+    );
+    assert_eq!(run.status, Some(0), "stderr:\n{}", run.stderr);
+    assert_eq!(run.stdout, "9");
+}

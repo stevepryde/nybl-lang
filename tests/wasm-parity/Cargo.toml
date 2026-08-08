@@ -1,0 +1,21 @@
+[package]
+name = "nybl-wasm-parity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "wasm_parity"
+path = "src/main.rs"
+
+[dependencies]
+nybl = { path = "../../nybl", package = "nybl-lang", default-features = false, features = ["nybl-std"] }
+nybl-vm = { path = "../../nybl-vm", default-features = false, features = ["nybl-std"] }
+
+[features]
+default = ["engine-std"]
+engine-std = ["nybl/std", "nybl-vm/std"]
+engine-no-std = ["nybl/no_std", "nybl-vm/no_std"]
+divergence-probe = []

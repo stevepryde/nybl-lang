@@ -575,6 +575,18 @@ type ImportCache = Rc<RefCell<BTreeMap<String, ImportSlot>>>;
 type LiveValueEnvironments = Rc<RefCell<BTreeMap<String, BTreeMap<String, Value>>>>;
 type BindingOrigin = (String, String);
 
+/// Immutable compile-time half of one imported module. Runtime exports and
+/// globals deliberately do not live here: every instance evaluates this
+/// shared code into its own [`ImportCache`] and live environments.
+#[derive(Clone)]
+struct CompiledModule {
+    chunk: Arc<Chunk>,
+    source: Arc<str>,
+    builtin_usage: Arc<BTreeMap<String, u32>>,
+}
+
+type CompiledModuleGraph = Arc<BTreeMap<String, CompiledModule>>;
+
 fn snapshot_module_bindings(
     top_scope: &BTreeMap<String, Value>,
     binding_origins: &BTreeMap<String, BindingOrigin>,
@@ -717,6 +729,10 @@ pub struct Vm<'h, H: NyblHost + ?Sized> {
     step_budget: u64,
     rand_state: u64,
     imports: ImportCache,
+    /// `None` preserves the legacy host-resolved module path. `Some` is a
+    /// complete compile-time-resolved graph and must never consult the host
+    /// for source, including when the graph is empty.
+    compiled_modules: Option<CompiledModuleGraph>,
     imported_here: Vec<BTreeSet<String>>,
     limits: NyblLimits,
     /// Module this VM is running — tags newly declared types
@@ -780,6 +796,7 @@ struct VmState {
     functions: BTreeMap<String, Rc<FnEntry>>,
     rand_state: u64,
     imports: ImportCache,
+    compiled_modules: Option<CompiledModuleGraph>,
     imported_here: Vec<BTreeSet<String>>,
     current_module: String,
     struct_defs: BTreeMap<(String, String), Vec<String>>,
@@ -807,6 +824,51 @@ pub struct NyblInstance {
     limits: NyblLimits,
     in_operation: Cell<bool>,
     memory: nybl::memory::MemoryContext,
+    identity: Rc<()>,
+}
+
+/// An opaque, pre-resolved public entry point for repeated VM dispatch.
+///
+/// A prepared entry is bound to the exact [`NyblInstance`] that created it.
+#[derive(Clone)]
+pub struct PreparedEntry {
+    name: String,
+    arity: usize,
+    variadic: bool,
+    target: Rc<FnEntry>,
+    instance_identity: Rc<()>,
+}
+
+impl PreparedEntry {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    pub const fn is_variadic(&self) -> bool {
+        self.variadic
+    }
+
+    pub const fn accepts_arity(&self, count: usize) -> bool {
+        if self.variadic {
+            count >= self.arity
+        } else {
+            count == self.arity
+        }
+    }
+}
+
+impl core::fmt::Debug for PreparedEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedEntry")
+            .field("name", &self.name)
+            .field("arity", &self.arity)
+            .field("variadic", &self.variadic)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
@@ -821,6 +883,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             host,
             limits,
             ModuleRuntime::empty(),
+            None,
             String::from(nybl::value::ROOT_MODULE_PATH),
             BTreeMap::new(),
             NyblFnOrigin::__instance("vm"),
@@ -834,6 +897,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         host: &'h mut H,
         limits: NyblLimits,
         module_runtime: ModuleRuntime,
+        compiled_modules: Option<CompiledModuleGraph>,
         current_module: String,
         root_function_visibility: BTreeMap<u32, Visibility>,
         function_origin: NyblFnOrigin,
@@ -859,6 +923,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             step_budget,
             rand_state: 0,
             imports: module_runtime.imports,
+            compiled_modules,
             imported_here: vec![BTreeSet::new()],
             limits,
             current_module,
@@ -889,6 +954,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             functions: self.functions,
             rand_state: self.rand_state,
             imports: self.imports,
+            compiled_modules: self.compiled_modules,
             imported_here: self.imported_here,
             current_module: self.current_module,
             struct_defs: self.struct_defs,
@@ -925,6 +991,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             step_budget: limits.max_steps.saturating_mul(STEP_SCALE),
             rand_state: state.rand_state,
             imports: state.imports,
+            compiled_modules: state.compiled_modules,
             imported_here: state.imported_here,
             limits,
             current_module: state.current_module,
@@ -3959,17 +4026,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // the per-call `Vec` cost takes ~500 000 small heap
         // allocations off the table.
         //
-        // SAFETY-of-reorder: we've already ruled out lexical
-        // shadowing above, so moving the user-fn check in front
-        // of builtins / host matches the "let wins over fn; fn
-        // wins over builtin" ordering the walker uses. (Walker:
-        // locals checked at Call site, then call_function
-        // matches builtins — a user-defined `fn print` never
-        // reaches this path because `print` isn't in the
-        // walker's `functions` table before `fn print` runs.
-        // Same here: DefineFn populates `self.functions` only
-        // for user-declared names, so builtins like `range`,
-        // `print` don't collide.)
+        // SAFETY-of-reorder: lexical bindings were checked above. Executed
+        // user declarations intentionally win over engine builtins; the
+        // prepared-call path retains established host-before-named-function
+        // precedence for value-only declarations.
         if let Some(entry) = self.lookup_function_entry(name) {
             // Argc check before we touch the stack so error
             // messages match the walker's `name` wording.
@@ -5831,22 +5891,47 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
         }
 
-        let resolved = self.host.resolve_module(path);
-        let source = match resolved {
-            Some(Ok(s)) => s,
-            Some(Err(e)) => return Err(e),
-            None => {
-                return Err(error(line, format!("Module `{path}` not found")));
+        let compiled = self
+            .compiled_modules
+            .as_ref()
+            .and_then(|modules| modules.get(path))
+            .cloned();
+
+        let source = if compiled.is_none() && self.compiled_modules.is_none() {
+            match self.host.resolve_module(path) {
+                Some(Ok(source)) => Some(source),
+                Some(Err(error)) => return Err(error),
+                None => return Err(error(line, format!("Module `{path}` not found"))),
             }
+        } else {
+            None
         };
+
+        if compiled.is_none() && self.compiled_modules.is_some() {
+            // `compile_with_modules` constructs a closed graph from every
+            // nested chunk's use sites. Reaching this means trusted bytecode
+            // and its artifact disagree; never silently fall back to a host
+            // and compromise the compile-once contract.
+            return Err(error(
+                line,
+                format!("Module `{path}` is missing from the compiled module graph"),
+            ));
+        }
 
         self.imports
             .borrow_mut()
             .insert(path.to_string(), ImportSlot::Loading);
 
-        let result = self
-            .evaluate_module(path, &source)
-            .map_err(|error| error.with_module_source(path, source.as_str()));
+        let result = match compiled {
+            Some(module) => self
+                .evaluate_compiled_module(path, &module)
+                .map_err(|error| error.with_module_source(path, module.source.as_ref())),
+            None => {
+                let source = source.expect("legacy module source resolved");
+                self.evaluate_module(path, &source)
+                    .map_err(|error| error.with_module_source(path, source.as_str()))
+            }
+        };
 
         match result {
             Ok(bindings) => {
@@ -5879,6 +5964,29 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // the module's statements run.
         nybl::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
         let chunk = crate::compile(&stmts)?;
+        self.evaluate_module_chunk(module_path, Arc::new(chunk))
+    }
+
+    fn evaluate_compiled_module(
+        &mut self,
+        module_path: &str,
+        module: &CompiledModule,
+    ) -> Result<ModuleArtifacts, NyblError> {
+        nybl::check::check_disabled_builtins(
+            &module.builtin_usage,
+            &self.limits.disabled_builtins,
+        )?;
+        self.evaluate_module_chunk(module_path, Arc::clone(&module.chunk))
+    }
+
+    /// Execute one module's already-compiled top-level chunk. The resulting
+    /// exports and all mutable environments belong to the current instance;
+    /// only `chunk` is shared with sibling instances.
+    fn evaluate_module_chunk(
+        &mut self,
+        module_path: &str,
+        chunk: Arc<Chunk>,
+    ) -> Result<ModuleArtifacts, NyblError> {
         let public_surface = chunk.public_surface.clone();
         let module_runtime = ModuleRuntime {
             imports: Rc::clone(&self.imports),
@@ -5887,10 +5995,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         };
         let limits = self.limits.clone();
         let mut sub = Vm::new_internal(
-            Arc::new(chunk),
+            chunk,
             self.host,
             limits,
             module_runtime,
+            self.compiled_modules.clone(),
             module_path.to_string(),
             BTreeMap::new(),
             self.function_origin.clone(),
@@ -6478,7 +6587,17 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .last()
             .and_then(|frame| frame.function_module.as_deref())
         {
-            Some(module) => err.with_module(module),
+            Some(module) => {
+                if let Some(compiled) = self
+                    .compiled_modules
+                    .as_ref()
+                    .and_then(|modules| modules.get(module))
+                {
+                    err.with_module_source(module, compiled.source.as_ref())
+                } else {
+                    err.with_module(module)
+                }
+            }
             None => err,
         }
     }
@@ -6622,9 +6741,9 @@ where
 /// the supported cross-thread pattern is create-on-worker from a shared
 /// artifact.
 ///
-/// Compilation covers the root program only. `use` statements keep
-/// their existing per-instance loading path: each instance resolves
-/// modules through its own host at execution time.
+/// [`Self::compile`] covers the root program only, preserving the legacy
+/// host-resolved module path. [`Self::compile_with_modules`] opts into a
+/// closed, immutable graph whose module bytecode is shared as well.
 #[derive(Clone)]
 pub struct CompiledScript {
     chunk: Arc<Chunk>,
@@ -6633,6 +6752,9 @@ pub struct CompiledScript {
     /// deny sets ([`NyblLimits::disabled_builtins`]) can be enforced at
     /// instantiation without the AST.
     builtin_usage: Arc<BTreeMap<String, u32>>,
+    /// `None` preserves lazy per-instance host source resolution. `Some`
+    /// contains every module reachable from any root/module chunk use site.
+    compiled_modules: Option<CompiledModuleGraph>,
 }
 
 impl core::fmt::Debug for CompiledScript {
@@ -6640,6 +6762,13 @@ impl core::fmt::Debug for CompiledScript {
         f.debug_struct("CompiledScript")
             .field("instructions", &self.chunk.code.len())
             .field("functions", &self.chunk.functions.len())
+            .field(
+                "precompiled_modules",
+                &self
+                    .compiled_modules
+                    .as_ref()
+                    .map_or(0, |modules| modules.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -6665,7 +6794,36 @@ impl CompiledScript {
             chunk: Arc::new(compiled.chunk),
             root_function_visibility: Arc::new(compiled.root_function_visibility),
             builtin_usage: Arc::new(builtin_usage),
+            compiled_modules: None,
         })
+    }
+
+    /// Parse, compile, and validate a program plus its complete reachable
+    /// module graph without executing anything.
+    ///
+    /// `resolver` has the same result shape as [`NyblHost::resolve_module`]:
+    /// `None` means not found, `Some(Err(_))` forwards a host-defined error,
+    /// and `Some(Ok(source))` supplies the module source. Every unique module
+    /// path is resolved exactly once, including transitive, diamond, and
+    /// cyclic references. Module top-level code remains lazy and executes
+    /// with fresh state in each [`NyblInstance`].
+    ///
+    /// Unlike [`Self::compile`], instances from this artifact never ask their
+    /// runtime host to resolve module source. Resolver inputs should therefore
+    /// include standard-library modules referenced by the program too.
+    pub fn compile_with_modules<F>(source: &str, mut resolver: F) -> Result<Self, NyblError>
+    where
+        F: FnMut(&str) -> Option<Result<String, NyblError>>,
+    {
+        let mut program = Self::compile(source)?;
+        let mut modules = BTreeMap::new();
+        let mut root_uses = BTreeMap::new();
+        collect_chunk_use_sites(&program.chunk, &mut root_uses);
+        for (path, line) in root_uses {
+            compile_reachable_module(&path, line, None, &mut resolver, &mut modules)?;
+        }
+        program.compiled_modules = Some(Arc::new(modules));
+        Ok(program)
     }
 
     /// Stable identity of the shared root chunk, for tests asserting
@@ -6673,6 +6831,96 @@ impl CompiledScript {
     #[doc(hidden)]
     pub fn __root_chunk_ptr(&self) -> *const u8 {
         Arc::as_ptr(&self.chunk).cast()
+    }
+
+    /// Stable identity of one precompiled module chunk, for tests asserting
+    /// that instantiation shares rather than recreates module bytecode.
+    #[doc(hidden)]
+    pub fn __module_chunk_ptr(&self, path: &str) -> Option<*const u8> {
+        self.compiled_modules
+            .as_ref()?
+            .get(path)
+            .map(|module| Arc::as_ptr(&module.chunk).cast())
+    }
+}
+
+/// Collect the static module paths referenced by one compiled unit and all
+/// nested function/lambda chunks. A map gives deterministic traversal and
+/// preserves the first line for diagnostics when a path is repeated.
+fn collect_chunk_use_sites(chunk: &Chunk, uses: &mut BTreeMap<String, u32>) {
+    for (offset, instruction) in chunk.code.iter().enumerate() {
+        if let Instr::Use(index) = instruction {
+            let spec = chunk.use_spec(*index);
+            uses.entry(spec.path.clone()).or_insert(chunk.lines[offset]);
+        }
+    }
+    for function in &chunk.functions {
+        collect_chunk_use_sites(&function.chunk, uses);
+    }
+}
+
+fn compile_reachable_module<F>(
+    path: &str,
+    use_line: u32,
+    importer: Option<(&str, &str)>,
+    resolver: &mut F,
+    modules: &mut BTreeMap<String, CompiledModule>,
+) -> Result<(), NyblError>
+where
+    F: FnMut(&str) -> Option<Result<String, NyblError>>,
+{
+    // Insert-before-recursing below makes cycles finite and diamonds resolve
+    // only once without suppressing their eventual runtime cycle diagnostic.
+    if modules.contains_key(path) {
+        return Ok(());
+    }
+
+    let source = match resolver(path) {
+        Some(Ok(source)) => source,
+        Some(Err(error)) => return Err(attach_importer_source(error, importer)),
+        None => {
+            return Err(attach_importer_source(
+                error(use_line, format!("Module `{path}` not found")),
+                importer,
+            ));
+        }
+    };
+    let statements =
+        nybl::parse(&source).map_err(|error| error.with_module_source(path, source.as_str()))?;
+    let builtin_usage = nybl::check::collect_builtin_usage(&statements);
+    let compiled = crate::compiler::compile_program(&statements)
+        .map_err(|error| error.with_module_source(path, source.as_str()))?;
+    crate::validate_chunk(&compiled.chunk)
+        .map_err(|error| error.with_module_source(path, source.as_str()))?;
+
+    let mut uses = BTreeMap::new();
+    collect_chunk_use_sites(&compiled.chunk, &mut uses);
+    let module = CompiledModule {
+        chunk: Arc::new(compiled.chunk),
+        source: Arc::from(source),
+        builtin_usage: Arc::new(builtin_usage),
+    };
+    modules.insert(path.to_string(), module);
+
+    // Borrow the retained source only after insertion; recursive calls mutate
+    // the map, so retain a separate Arc handle across the traversal.
+    let importer_source = Arc::clone(&modules[path].source);
+    for (dependency, line) in uses {
+        compile_reachable_module(
+            &dependency,
+            line,
+            Some((path, importer_source.as_ref())),
+            resolver,
+            modules,
+        )?;
+    }
+    Ok(())
+}
+
+fn attach_importer_source(error: NyblError, importer: Option<(&str, &str)>) -> NyblError {
+    match importer {
+        Some((path, source)) => error.with_module_source(path, source),
+        None => error,
     }
 }
 
@@ -6712,6 +6960,7 @@ impl NyblInstance {
             host,
             limits.clone(),
             ModuleRuntime::empty(),
+            program.compiled_modules.clone(),
             nybl::value::ROOT_MODULE_PATH.to_string(),
             (*program.root_function_visibility).clone(),
             NyblFnOrigin::__instance("vm"),
@@ -6741,6 +6990,7 @@ impl NyblInstance {
             limits: limits.clone(),
             in_operation: Cell::new(false),
             memory,
+            identity: Rc::new(()),
         })
     }
 
@@ -6753,8 +7003,138 @@ impl NyblInstance {
         Arc::as_ptr(&frame.chunk).cast()
     }
 
+    /// Stable identity of one executing artifact's precompiled module chunk.
+    #[doc(hidden)]
+    pub fn __module_chunk_ptr(&self, path: &str) -> Option<*const u8> {
+        let state = self.state.as_ref().expect("instance state present");
+        state
+            .compiled_modules
+            .as_ref()?
+            .get(path)
+            .map(|module| Arc::as_ptr(&module.chunk).cast())
+    }
+
     pub fn entry_points(&self) -> &[EntryPoint] {
         &self.entries
+    }
+
+    /// Resolve and validate one public value-only entry for repeated calls.
+    pub fn prepare_entry(&self, name: &str) -> Result<PreparedEntry, NyblError> {
+        let state = self.state.as_ref().expect("instance state present");
+        let target = state
+            .abi_declarations
+            .iter()
+            .find(|(entry_name, _)| entry_name == name)
+            .map(|(_, target)| Rc::clone(target))
+            .ok_or_else(|| error(0, format!("Public entry point `{name}` was not found")))?;
+        if target.param_modes.contains(&ParamMode::Ref) {
+            return Err(error(
+                0,
+                format!(
+                    "Public entry point `{name}` has `ref` parameters and cannot be called from the host"
+                ),
+            ));
+        }
+        let arity = nybl::ref_params::required_arity(&target.param_modes);
+        let variadic = target.param_modes.last() == Some(&ParamMode::Rest);
+        Ok(PreparedEntry {
+            name: name.to_string(),
+            arity,
+            variadic,
+            target,
+            instance_identity: Rc::clone(&self.identity),
+        })
+    }
+
+    /// Invoke a pre-resolved public entry point.
+    pub fn call_prepared(
+        &mut self,
+        entry: &PreparedEntry,
+        args: &[Value],
+        host: &mut dyn NyblHost,
+    ) -> Result<Value, NyblError> {
+        let _operation = VmOperationGuard::begin(&self.in_operation)?;
+        self.validate_prepared_entry(entry)?;
+        validate_prepared_arity(entry, args.len())?;
+        if self.memory.__exceeded() {
+            return Err(instance_memory_error());
+        }
+        let state = self.state.take().expect("instance state present");
+        let mut vm = Vm::from_state(state, host, self.limits.clone(), self.memory.clone());
+        let result = {
+            for argument in args {
+                vm.push_value(argument.clone());
+            }
+            let execution = vm
+                .enter_user_fn(Rc::clone(&entry.target), args.len(), 0)
+                .and_then(|_| vm.run_internal());
+            let value = execution.and_then(|_| vm.pop_value(0));
+            vm.restore_instance_baseline();
+            if self.memory.__exceeded() {
+                Err(instance_memory_error())
+            } else {
+                value
+            }
+        };
+        vm.write_runtime_warnings();
+        self.state = Some(vm.into_state());
+        result
+    }
+
+    /// Invoke a prepared entry for each argument list in order.
+    ///
+    /// One VM remains live for the batch, while its step budget and transient
+    /// execution state are reset after every item. The first error stops the
+    /// batch; effects from completed calls remain visible.
+    pub fn call_batch<A: AsRef<[Value]>>(
+        &mut self,
+        entry: &PreparedEntry,
+        calls: &[A],
+        host: &mut dyn NyblHost,
+    ) -> Result<Vec<Value>, NyblError> {
+        let _operation = VmOperationGuard::begin(&self.in_operation)?;
+        self.validate_prepared_entry(entry)?;
+        if self.memory.__exceeded() {
+            return Err(instance_memory_error());
+        }
+        let state = self.state.take().expect("instance state present");
+        let mut vm = Vm::from_state(state, host, self.limits.clone(), self.memory.clone());
+        let mut values = Vec::with_capacity(calls.len());
+        let result = (|| {
+            for call in calls {
+                let args = call.as_ref();
+                validate_prepared_arity(entry, args.len())?;
+                vm.steps = 0;
+                for argument in args {
+                    vm.push_value(argument.clone());
+                }
+                let execution = vm
+                    .enter_user_fn(Rc::clone(&entry.target), args.len(), 0)
+                    .and_then(|_| vm.run_internal());
+                let value = execution.and_then(|_| vm.pop_value(0));
+                vm.restore_instance_baseline();
+                vm.write_runtime_warnings();
+                if self.memory.__exceeded() {
+                    return Err(instance_memory_error());
+                }
+                values.push(value?);
+            }
+            Ok(values)
+        })();
+        vm.write_runtime_warnings();
+        self.state = Some(vm.into_state());
+        result
+    }
+
+    fn validate_prepared_entry(&self, entry: &PreparedEntry) -> Result<(), NyblError> {
+        if Rc::ptr_eq(&self.identity, &entry.instance_identity) {
+            Ok(())
+        } else {
+            Err(error(
+                0,
+                "This prepared entry belongs to a different Nybl engine instance",
+            ))
+        }
     }
 
     pub fn call(
@@ -6855,6 +7235,28 @@ impl NyblInstance {
         self.state = Some(vm.into_state());
         result
     }
+}
+
+fn validate_prepared_arity(entry: &PreparedEntry, actual: usize) -> Result<(), NyblError> {
+    if entry.accepts_arity(actual) {
+        return Ok(());
+    }
+    Err(error(
+        0,
+        if entry.variadic {
+            format!(
+                "`{}` expects at least {} arguments, but got {actual}",
+                entry.name, entry.arity
+            )
+        } else {
+            format!(
+                "`{}` expects {} argument{}, but got {actual}",
+                entry.name,
+                entry.arity,
+                if entry.arity == 1 { "" } else { "s" }
+            )
+        },
+    ))
 }
 
 fn instance_memory_error() -> NyblError {
@@ -7578,6 +7980,21 @@ let read = fn() { return [missing, present] }"#,
         instance.in_operation.set(true);
         let error = instance
             .call("missing", &[Value::None], &mut host)
+            .unwrap_err();
+        instance.in_operation.set(false);
+        assert_eq!(error.line, Some(0));
+        assert!(error.message.contains("cannot be re-entered"));
+    }
+
+    #[test]
+    fn batch_reentry_rejection_precedes_prepared_validation() {
+        let mut host = SilentHost;
+        let mut instance =
+            NyblInstance::load("pub fn entry() {}", &mut host, &NyblLimits::standard()).unwrap();
+        let entry = instance.prepare_entry("entry").unwrap();
+        instance.in_operation.set(true);
+        let error = instance
+            .call_batch(&entry, &[Vec::<Value>::new()], &mut host)
             .unwrap_err();
         instance.in_operation.set(false);
         assert_eq!(error.line, Some(0));

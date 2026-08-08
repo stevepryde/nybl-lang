@@ -1,12 +1,70 @@
 //! Stateful host-callable tree-walker instances and shared ABI metadata.
 
 #[cfg(all(feature = "no_std", not(feature = "std")))]
-use alloc::{format, string::String, vec::Vec};
+use alloc::{
+    format,
+    rc::Rc,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+#[cfg(any(feature = "std", not(feature = "no_std")))]
+use std::rc::Rc;
 
 use crate::builtins::error;
 use crate::memory::MemoryContext;
 use crate::{NyblError, NyblHost, NyblLimits, ReplSession, Value};
 use core::cell::Cell;
+
+/// An opaque, pre-resolved public entry point for repeated host dispatch.
+///
+/// Prepared entries are bound to the exact [`NyblInstance`] that created
+/// them. Use [`NyblInstance::call_prepared`] for one call or
+/// [`NyblInstance::call_batch`] to amortize dispatch across many calls.
+#[derive(Clone)]
+pub struct PreparedEntry {
+    name: String,
+    arity: usize,
+    variadic: bool,
+    target: Rc<crate::value::NyblFn>,
+    instance_identity: Rc<()>,
+}
+
+impl PreparedEntry {
+    /// Source name of the prepared public function.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Required positional argument count.
+    pub const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    /// Whether the entry accepts additional positional arguments.
+    pub const fn is_variadic(&self) -> bool {
+        self.variadic
+    }
+
+    /// Whether `count` positional arguments satisfy this entry's arity.
+    pub const fn accepts_arity(&self, count: usize) -> bool {
+        if self.variadic {
+            count >= self.arity
+        } else {
+            count == self.arity
+        }
+    }
+}
+
+impl core::fmt::Debug for PreparedEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedEntry")
+            .field("name", &self.name)
+            .field("arity", &self.arity)
+            .field("variadic", &self.variadic)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A public root function exposed by a loaded [`crate::NyblInstance`].
 ///
@@ -89,6 +147,7 @@ pub struct NyblInstance {
     limits: NyblLimits,
     in_operation: Cell<bool>,
     memory: MemoryContext,
+    identity: Rc<()>,
 }
 
 impl NyblInstance {
@@ -114,12 +173,105 @@ impl NyblInstance {
             limits: limits.clone(),
             in_operation: Cell::new(false),
             memory,
+            identity: Rc::new(()),
         })
     }
 
     /// Public root functions in final surviving declaration order.
     pub fn entry_points(&self) -> &[EntryPoint] {
         &self.entries
+    }
+
+    /// Resolve and validate one public value-only entry for repeated calls.
+    pub fn prepare_entry(&self, name: &str) -> Result<PreparedEntry, NyblError> {
+        let target = self
+            .session
+            .prepared_entry_target(name)
+            .ok_or_else(|| error(0, format!("Public entry point `{name}` was not found")))?;
+        if target.param_modes.contains(&crate::ParamMode::Ref) {
+            return Err(error(
+                0,
+                format!(
+                    "Public entry point `{name}` has `ref` parameters and cannot be called from the host"
+                ),
+            ));
+        }
+        let arity = crate::ref_params::required_arity(&target.param_modes);
+        let variadic = matches!(target.param_modes.last(), Some(crate::ParamMode::Rest));
+        Ok(PreparedEntry {
+            name: name.to_string(),
+            arity,
+            variadic,
+            target,
+            instance_identity: Rc::clone(&self.identity),
+        })
+    }
+
+    /// Invoke a pre-resolved public entry point.
+    pub fn call_prepared(
+        &mut self,
+        entry: &PreparedEntry,
+        args: &[Value],
+        host: &mut dyn NyblHost,
+    ) -> Result<Value, NyblError> {
+        let _operation = OperationGuard::begin(&self.in_operation)?;
+        self.validate_prepared_entry(entry)?;
+        validate_prepared_arity(entry, args.len())?;
+        if self.memory.__exceeded() {
+            return Err(memory_limit_error());
+        }
+        let result =
+            self.session
+                .call_prepared_in(&entry.target, args, host, &self.limits, &self.memory);
+        if self.memory.__exceeded() {
+            Err(memory_limit_error())
+        } else {
+            result
+        }
+    }
+
+    /// Invoke a prepared entry for each argument list in order.
+    ///
+    /// The evaluator stays live across the batch, but each item receives a
+    /// fresh step and call-depth budget. Execution stops on the first error;
+    /// effects from completed items remain visible.
+    pub fn call_batch<A: AsRef<[Value]>>(
+        &mut self,
+        entry: &PreparedEntry,
+        calls: &[A],
+        host: &mut dyn NyblHost,
+    ) -> Result<Vec<Value>, NyblError> {
+        let _operation = OperationGuard::begin(&self.in_operation)?;
+        self.validate_prepared_entry(entry)?;
+        if self.memory.__exceeded() {
+            return Err(memory_limit_error());
+        }
+        let result = self.session.call_prepared_batch_in(
+            &entry.target,
+            &entry.name,
+            entry.arity,
+            entry.variadic,
+            calls,
+            host,
+            &self.limits,
+            &self.memory,
+        );
+        if self.memory.__exceeded() {
+            Err(memory_limit_error())
+        } else {
+            result
+        }
+    }
+
+    fn validate_prepared_entry(&self, entry: &PreparedEntry) -> Result<(), NyblError> {
+        if Rc::ptr_eq(&self.identity, &entry.instance_identity) {
+            Ok(())
+        } else {
+            Err(error(
+                0,
+                "This prepared entry belongs to a different Nybl engine instance",
+            ))
+        }
     }
 
     /// Call a public root function by its dedicated ABI name.
@@ -195,6 +347,28 @@ impl NyblInstance {
             result
         }
     }
+}
+
+fn validate_prepared_arity(entry: &PreparedEntry, actual: usize) -> Result<(), NyblError> {
+    if entry.accepts_arity(actual) {
+        return Ok(());
+    }
+    Err(error(
+        0,
+        if entry.variadic {
+            format!(
+                "`{}` expects at least {} arguments, but got {actual}",
+                entry.name, entry.arity
+            )
+        } else {
+            format!(
+                "`{}` expects {} argument{}, but got {actual}",
+                entry.name,
+                entry.arity,
+                if entry.arity == 1 { "" } else { "s" }
+            )
+        },
+    ))
 }
 
 fn memory_limit_error() -> NyblError {
@@ -295,6 +469,100 @@ mod tests {
             instance.call("next", &[], &mut host).unwrap().inspect(),
             "2"
         );
+    }
+
+    #[test]
+    fn prepared_and_batch_calls_preserve_state_limits_and_affinity() {
+        let limits = NyblLimits {
+            max_steps: 20,
+            max_memory: 1024 * 1024,
+            ..NyblLimits::standard()
+        };
+        let source = "let total = 0\npub fn work(n) { repeat 5 { total += 1 }; total += n; return total }\npub fn read() { return total }";
+        let mut host = Host;
+        let mut instance = NyblInstance::load(source, &mut host, &limits).unwrap();
+        let work = instance.prepare_entry("work").unwrap();
+        assert_eq!(work.name(), "work");
+        assert_eq!(work.arity(), 1);
+        assert!(!work.is_variadic());
+        assert_eq!(
+            instance
+                .call_prepared(&work, &[Value::Int(1)], &mut host)
+                .unwrap()
+                .inspect(),
+            "6"
+        );
+        let calls = [[Value::Int(2)], [Value::Int(3)]];
+        let values = instance.call_batch(&work, &calls, &mut host).unwrap();
+        assert_eq!(
+            values.iter().map(Value::inspect).collect::<Vec<_>>(),
+            ["13", "21"]
+        );
+
+        let mut other = NyblInstance::load(source, &mut host, &limits).unwrap();
+        let error = other
+            .call_prepared(&work, &[Value::Int(1)], &mut host)
+            .unwrap_err();
+        assert!(error.message.contains("different Nybl engine instance"));
+    }
+
+    #[test]
+    fn batch_stops_on_error_and_keeps_prior_mutations() {
+        let mut host = Host;
+        let mut instance = NyblInstance::load(
+            "let total = 0\npub fn add(n) { total += n; if n == 2 { panic(\"stop\") }; return total }\npub fn read() { return total }",
+            &mut host,
+            &NyblLimits::standard(),
+        )
+        .unwrap();
+        let add = instance.prepare_entry("add").unwrap();
+        let calls = [[Value::Int(1)], [Value::Int(2)], [Value::Int(4)]];
+        assert_eq!(
+            instance
+                .call_batch(&add, &calls, &mut host)
+                .unwrap_err()
+                .message,
+            "stop"
+        );
+        assert_eq!(
+            instance.call("read", &[], &mut host).unwrap().inspect(),
+            "3"
+        );
+    }
+
+    #[test]
+    fn batch_retains_persistent_memory_accounting() {
+        let limits = NyblLimits {
+            max_steps: 100,
+            max_memory: 64,
+            ..NyblLimits::standard()
+        };
+        let mut host = Host;
+        let mut instance = NyblInstance::load(
+            "let values = []\npub fn keep(value) { values.push(value); return values.len() }",
+            &mut host,
+            &limits,
+        )
+        .unwrap();
+        let keep = instance.prepare_entry("keep").unwrap();
+        let calls = (0..32).map(|n| [Value::Int(n)]).collect::<Vec<_>>();
+        let error = instance.call_batch(&keep, &calls, &mut host).unwrap_err();
+        assert!(error.is_fatal);
+        assert!(error.message.contains("Memory limit"));
+        assert!(instance.memory.__used() > limits.max_memory);
+    }
+
+    #[test]
+    fn preparing_ref_entry_is_rejected_before_execution() {
+        let mut host = Host;
+        let instance = NyblInstance::load(
+            "pub fn update(ref value) { value = 2 }",
+            &mut host,
+            &NyblLimits::standard(),
+        )
+        .unwrap();
+        let error = instance.prepare_entry("update").unwrap_err();
+        assert!(error.message.contains("cannot be called from the host"));
     }
 
     #[test]
@@ -1015,6 +1283,21 @@ mod tests {
         instance.in_operation.set(true);
         let error = instance
             .call("missing", &[Value::None], &mut host)
+            .unwrap_err();
+        instance.in_operation.set(false);
+        assert_eq!(error.line, Some(0));
+        assert!(error.message.contains("cannot be re-entered"));
+    }
+
+    #[test]
+    fn batch_reentry_rejection_precedes_prepared_validation() {
+        let mut host = Host;
+        let mut instance =
+            NyblInstance::load("pub fn entry() {}", &mut host, &NyblLimits::standard()).unwrap();
+        let entry = instance.prepare_entry("entry").unwrap();
+        instance.in_operation.set(true);
+        let error = instance
+            .call_batch(&entry, &[Vec::<Value>::new()], &mut host)
             .unwrap_err();
         instance.in_operation.set(false);
         assert_eq!(error.line, Some(0));

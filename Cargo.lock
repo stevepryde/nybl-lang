@@ -364,6 +364,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nybl-wasm-clock-smoke"
+version = "0.4.2"
+dependencies = [
+ "nybl-lang",
+ "nybl-sys",
+]
+
+[[package]]
+name = "nybl-wasm-parity"
+version = "0.4.2"
+dependencies = [
+ "nybl-lang",
+ "nybl-vm",
+]
+
+[[package]]
 name = "oorandom"
 version = "11.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

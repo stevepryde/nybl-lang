@@ -170,6 +170,55 @@ Use `compile` plus `execute` when you want to reuse bytecode but intentionally
 start with fresh program state on every execution. Use `NyblInstance` when the
 state itself must persist.
 
+## Prepared and batched dispatch
+
+The walker and VM can resolve a hot public entry once and reuse the opaque
+handle. The handle is bound to the exact instance that created it:
+
+```rust
+let tick = instance.prepare_entry("tick")?;
+
+// Drop-in fast path for an existing per-entity loop.
+let value = instance.call_prepared(&tick, &[Value::Int(entity_id)], &mut host)?;
+
+// Host-side batch: one live evaluator/VM, ordered calls and results.
+let calls = [
+    [Value::Int(0)],
+    [Value::Int(1)],
+    [Value::Int(2)],
+];
+let values = instance.call_batch(&tick, &calls, &mut host)?;
+```
+
+`prepare_entry` rejects `ref`-bearing entries because host values do not name
+Nybl bindings. `call_prepared` and `call_batch` reject a handle created by a
+different instance, even if both instances loaded identical source.
+
+`call_batch` preserves repeated-`call` semantics: items run in order, each item
+gets a fresh step and call-depth budget, tracked memory remains persistent, and
+the first error stops the batch. Mutations and host effects from completed
+items remain visible. The host is borrowed once for the operation and is never
+retained. This is why prepared dispatch does not cache host-specific numeric
+function IDs: a later operation may deliberately supply a different compatible
+host.
+
+For the lowest dispatch overhead, expose a script-level batch entry and loop in
+Nybl. It keeps one Nybl function frame for the whole shard while retaining the
+same host calls:
+
+```nybl
+pub fn tick_batch(entity_count) {
+  for entity_id in range(entity_count) {
+    // Read fields, update state, and queue commands for entity_id.
+  }
+}
+```
+
+A script-level batch is one Nybl call, so `max_steps` applies to the complete
+batch. Size that budget for the maximum accepted shard; the batch cannot reset
+or evade it. Use host-side `call_batch` when every entity must instead receive
+the same independent per-call budget as `call`.
+
 ## Compile once, instantiate many
 
 `NyblInstance::load` parses, compiles, and executes in one step. When a host
@@ -191,10 +240,53 @@ let mut b = NyblInstance::from_compiled(&program, &mut host_b, &NyblLimits::stan
 ```
 
 `load` is exactly `CompiledScript::compile` followed by
-`NyblInstance::from_compiled`, so both paths behave identically.
-`from_compiled` never re-parses or re-compiles, and every instance executes
-the artifact's chunks in place — K instances share one copy of the compiled
-program.
+`NyblInstance::from_compiled`, so both paths behave identically. This basic
+artifact shares the root program: `from_compiled` never re-parses or
+re-compiles the root, and K instances execute the same root chunk graph.
+Modules keep their legacy lazy behavior in this mode, so each instance still
+asks its host to resolve, parse, and compile a module the first time execution
+reaches its `use` site.
+
+### Compile the module graph too
+
+Hosts that create many instances of a module-bearing program can opt into a
+closed module artifact with `compile_with_modules`:
+
+```rust
+use std::collections::BTreeMap;
+use nybl::NyblLimits;
+use nybl_vm::{CompiledScript, NyblInstance};
+
+let module_sources = BTreeMap::from([
+    ("game.rules", "use game.math as math\nfn score(n) { return math.double(n) }"),
+    ("game.math", "fn double(n) { return n * 2 }"),
+]);
+
+let program = CompiledScript::compile_with_modules(source, |path| {
+    module_sources.get(path).map(|source| Ok((*source).to_string()))
+})?;
+
+let mut instance = NyblInstance::from_compiled(
+    &program,
+    &mut host,
+    &NyblLimits::standard(),
+)?;
+```
+
+The resolver runs at artifact-build time. Every unique module reachable from
+any root or transitive `use` site — including uses inside functions and
+lambdas — is resolved, parsed, compiled, bytecode-validated, and indexed once.
+Cycles and diamonds are retained in the graph; the normal per-instance import
+cache still provides import idempotency and reports a cycle only if execution
+actually enters it.
+
+This opt-in graph is complete: instances never fall back to
+`NyblHost::resolve_module`. Include every referenced custom or `std.*` module
+in the compile-time resolver. Module source is retained in the immutable
+artifact only so runtime errors can still render the correct module snippet.
+Compiled chunks and source are `Arc`-shared; module globals, imports, RNG,
+callable identity, memory accounting, and all other mutable state remain fresh
+per instance.
 
 `CompiledScript` is immutable, cheap to clone, and `Send + Sync`.
 Instances are deliberately not `Send`: their runtime state is
@@ -230,20 +322,23 @@ sequences produce byte-identical results, including RNG use, because all
 per-instance state (globals, RNG seed, imports, memory accounting) starts
 fresh at `from_compiled` exactly as it does at `load`.
 
-Two details to keep in mind:
+Three details to keep in mind:
 
 - **Per-instance rules still apply.** Re-entry guards and callback affinity
   are per *instance*, not per artifact: a callback created by one instance is
   rejected by its siblings even though they share compiled code.
-- **The artifact covers the root program.** `use` statements keep their
-  per-instance loading path: each instance resolves modules through its own
-  host at execution time and caches them privately. A shared module-artifact
-  cache is possible future work.
+- **Choose module policy explicitly.** `compile` shares only the root and
+  retains lazy per-instance host resolution. `compile_with_modules` shares a
+  complete precompiled module graph and performs no runtime source resolution.
+- **Module execution is still lazy.** Precompiling source and bytecode does not
+  run module top-level statements. Each instance executes a module once when
+  its first live `use` site is reached and caches only that instance's exports.
 
 [Resource limits](/docs/embedding/#resource-limits) stay per-instance too, and
-the builtin deny list (`NyblLimits::disabled_builtins`) is enforced at
-`from_compiled` time with the same load-time error as `load`, so one
-unrestricted artifact can serve hosts with different deny sets.
+the builtin deny list (`NyblLimits::disabled_builtins`) is enforced separately
+for every instance: root usage is checked at `from_compiled`, and precompiled
+module usage is checked when that instance executes the module's first `use`.
+One unrestricted artifact can therefore serve hosts with different deny sets.
 
 ## Sandboxed AOT instances
 

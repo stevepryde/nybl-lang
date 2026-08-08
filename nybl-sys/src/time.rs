@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use nybl::{NyblError, Value};
 
@@ -18,6 +21,15 @@ pub(crate) fn unix_time_ms(args: &[Value], line: u32) -> Result<Value, NyblError
 }
 
 fn unix_duration(line: u32) -> Result<Duration, NyblError> {
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    {
+        Err(runtime(
+            line,
+            "system clock is unavailable on wasm32-unknown-unknown; provide time through a custom NyblHost",
+        ))
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| runtime(line, format!("system clock is before Unix epoch: {e}")))

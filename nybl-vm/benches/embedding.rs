@@ -1,8 +1,9 @@
 //! Embedding hot-path benchmarks (issue #185).
 //!
 //! Measures the costs a host engine pays when it drives Nybl scripts per
-//! entity per tick: `instance.call()` dispatch, `NyblHost::call` round-trips,
-//! a representative game-tick workload, Rust <-> `Value` conversion, and
+//! entity per tick: ordinary and prepared `instance.call()` dispatch,
+//! `NyblHost::call` round-trips, host-side and script-side batching of a
+//! representative game-tick workload, Rust <-> `Value` conversion, and
 //! one-shot `load` cost. Every engine-sensitive benchmark runs on both the
 //! tree-walker (`nybl::NyblInstance`) and the bytecode VM
 //! (`nybl_vm::NyblInstance`).
@@ -84,6 +85,72 @@ pub fn tick(id) {
 }
 ";
 
+/// Module-bearing equivalent used to measure K-instance startup. The root is
+/// intentionally small while the helper carries enough real bytecode that
+/// repeated module parsing and compilation is visible in the baseline.
+const MODULE_BEARING_ROOT: &str = "
+use bench.tick as behavior
+pub fn tick(id) { return behavior.tick(id) }
+";
+
+const MODULE_TICK_SRC: &str = "
+fn clamp(value, low, high) {
+    if value < low { return low }
+    if value > high { return high }
+    return value
+}
+
+fn score(hp, x, y) {
+    let position = x * 3 + y * 5
+    return clamp(hp + position, 0, 10000)
+}
+
+fn tick(id) {
+    let hp = field_get(id, 0)
+    let x = field_get(id, 1)
+    let y = field_get(id, 2)
+    let next = score(hp, x, y)
+    field_set(id, 4, next)
+    return next
+}
+";
+
+/// The same state machine and host crossings as `GAME_TICK_SRC`, expressed as
+/// a script-level batch entry. This removes the per-entity public entry and
+/// user-frame boundary without hiding host traffic.
+const GAME_TICK_BATCH_SRC: &str = "
+pub fn tick_batch(count) {
+    for id in range(count) {
+        let hp = field_get(id, 0)
+        let x = field_get(id, 1)
+        let y = field_get(id, 2)
+        let state = field_get(id, 3)
+        let target = field_get(id, 4)
+        if state == 0 {
+            if x < target {
+                field_set(id, 1, x + 1)
+            } else {
+                field_set(id, 4, target + 16)
+            }
+            if hp < 20 {
+                field_set(id, 3, 1)
+            } else {
+                field_set(id, 2, y + 1)
+            }
+            queue_command(id, 1, x, y)
+        } else {
+            if hp < 90 {
+                field_set(id, 0, hp + 5)
+            } else {
+                field_set(id, 3, 0)
+            }
+            field_set(id, 1, x - 1)
+            queue_command(id, 2, x, y)
+        }
+    }
+}
+";
+
 // ─── Host ───────────────────────────────────────────────────────────────────
 
 /// Fields per entity: hp, x, y, state, target_x.
@@ -156,6 +223,10 @@ impl NyblHost for GameHost {
             _ => None,
         }
     }
+
+    fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>> {
+        (name == "bench.tick").then(|| Ok(MODULE_TICK_SRC.to_string()))
+    }
 }
 
 // ─── Engine abstraction ─────────────────────────────────────────────────────
@@ -165,6 +236,7 @@ impl NyblHost for GameHost {
 trait Engine {
     const NAME: &'static str;
     type Instance;
+    type Prepared;
 
     fn load(source: &str, host: &mut dyn NyblHost, limits: &NyblLimits) -> Self::Instance;
     fn call(
@@ -173,6 +245,19 @@ trait Engine {
         args: &[Value],
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError>;
+    fn prepare(instance: &Self::Instance, name: &str) -> Self::Prepared;
+    fn call_prepared(
+        instance: &mut Self::Instance,
+        entry: &Self::Prepared,
+        args: &[Value],
+        host: &mut dyn NyblHost,
+    ) -> Result<Value, NyblError>;
+    fn call_batch(
+        instance: &mut Self::Instance,
+        entry: &Self::Prepared,
+        calls: &[Vec<Value>],
+        host: &mut dyn NyblHost,
+    ) -> Result<Vec<Value>, NyblError>;
 }
 
 struct Walker;
@@ -180,6 +265,7 @@ struct Walker;
 impl Engine for Walker {
     const NAME: &'static str = "walker";
     type Instance = nybl::NyblInstance;
+    type Prepared = nybl::PreparedEntry;
 
     fn load(source: &str, host: &mut dyn NyblHost, limits: &NyblLimits) -> Self::Instance {
         nybl::NyblInstance::load(source, host, limits).expect("walker load failed")
@@ -193,6 +279,28 @@ impl Engine for Walker {
     ) -> Result<Value, NyblError> {
         instance.call(name, args, host)
     }
+
+    fn prepare(instance: &Self::Instance, name: &str) -> Self::Prepared {
+        instance.prepare_entry(name).expect("prepare failed")
+    }
+
+    fn call_prepared(
+        instance: &mut Self::Instance,
+        entry: &Self::Prepared,
+        args: &[Value],
+        host: &mut dyn NyblHost,
+    ) -> Result<Value, NyblError> {
+        instance.call_prepared(entry, args, host)
+    }
+
+    fn call_batch(
+        instance: &mut Self::Instance,
+        entry: &Self::Prepared,
+        calls: &[Vec<Value>],
+        host: &mut dyn NyblHost,
+    ) -> Result<Vec<Value>, NyblError> {
+        instance.call_batch(entry, calls, host)
+    }
 }
 
 struct Vm;
@@ -200,6 +308,7 @@ struct Vm;
 impl Engine for Vm {
     const NAME: &'static str = "vm";
     type Instance = nybl_vm::NyblInstance;
+    type Prepared = nybl_vm::PreparedEntry;
 
     fn load(source: &str, host: &mut dyn NyblHost, limits: &NyblLimits) -> Self::Instance {
         nybl_vm::NyblInstance::load(source, host, limits).expect("vm load failed")
@@ -212,6 +321,28 @@ impl Engine for Vm {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         instance.call(name, args, host)
+    }
+
+    fn prepare(instance: &Self::Instance, name: &str) -> Self::Prepared {
+        instance.prepare_entry(name).expect("prepare failed")
+    }
+
+    fn call_prepared(
+        instance: &mut Self::Instance,
+        entry: &Self::Prepared,
+        args: &[Value],
+        host: &mut dyn NyblHost,
+    ) -> Result<Value, NyblError> {
+        instance.call_prepared(entry, args, host)
+    }
+
+    fn call_batch(
+        instance: &mut Self::Instance,
+        entry: &Self::Prepared,
+        calls: &[Vec<Value>],
+        host: &mut dyn NyblHost,
+    ) -> Result<Vec<Value>, NyblError> {
+        instance.call_batch(entry, calls, host)
     }
 }
 
@@ -238,6 +369,34 @@ fn bench_call_trivial<E: Engine>(c: &mut Criterion) {
         b.iter(|| {
             let result = E::call(&mut instance, "tick", black_box(&args), &mut host)
                 .expect("call_trivial failed");
+            black_box(result)
+        })
+    });
+}
+
+fn bench_call_trivial_prepared<E: Engine>(c: &mut Criterion) {
+    let mut host = GameHost::new(1);
+    let args = [Value::Int(0), Value::Int(1)];
+    let (mut instance, _limits) = load_checked::<E>(TRIVIAL_SRC, &mut host, &args);
+    let entry = E::prepare(&instance, "tick");
+    c.bench_function(&format!("call_trivial_prepared/{}", E::NAME), |b| {
+        b.iter(|| {
+            let result = E::call_prepared(&mut instance, &entry, black_box(&args), &mut host)
+                .expect("call_trivial_prepared failed");
+            black_box(result)
+        })
+    });
+}
+
+fn bench_call_trivial_batch<E: Engine>(c: &mut Criterion) {
+    let mut host = GameHost::new(1);
+    let args = vec![vec![Value::Int(0), Value::Int(1)]; ENTITY_COUNT];
+    let (mut instance, _limits) = load_checked::<E>(TRIVIAL_SRC, &mut host, &args[0]);
+    let entry = E::prepare(&instance, "tick");
+    c.bench_function(&format!("call_trivial_batch_100/{}", E::NAME), |b| {
+        b.iter(|| {
+            let result = E::call_batch(&mut instance, &entry, black_box(&args), &mut host)
+                .expect("call_trivial_batch failed");
             black_box(result)
         })
     });
@@ -277,6 +436,71 @@ fn bench_game_tick<E: Engine>(c: &mut Criterion) {
     });
 }
 
+fn bench_game_tick_prepared<E: Engine>(c: &mut Criterion) {
+    let mut host = GameHost::new(ENTITY_COUNT);
+    let sanity_args = [Value::Int(0)];
+    let (mut instance, _limits) = load_checked::<E>(GAME_TICK_SRC, &mut host, &sanity_args);
+    let entry = E::prepare(&instance, "tick");
+    let args: Vec<Vec<Value>> = (0..ENTITY_COUNT as i64)
+        .map(|id| vec![Value::Int(id)])
+        .collect();
+    c.bench_function(
+        &format!("game_tick_100_entities_prepared/{}", E::NAME),
+        |b| {
+            b.iter(|| {
+                host.commands.clear();
+                for entity_args in &args {
+                    let result =
+                        E::call_prepared(&mut instance, &entry, black_box(entity_args), &mut host)
+                            .expect("prepared game_tick failed");
+                    black_box(result);
+                }
+                black_box(host.commands.len())
+            })
+        },
+    );
+}
+
+fn bench_game_tick_batch<E: Engine>(c: &mut Criterion) {
+    let mut host = GameHost::new(ENTITY_COUNT);
+    let sanity_args = [Value::Int(0)];
+    let (mut instance, _limits) = load_checked::<E>(GAME_TICK_SRC, &mut host, &sanity_args);
+    let entry = E::prepare(&instance, "tick");
+    let args: Vec<Vec<Value>> = (0..ENTITY_COUNT as i64)
+        .map(|id| vec![Value::Int(id)])
+        .collect();
+    c.bench_function(&format!("game_tick_100_entities_batch/{}", E::NAME), |b| {
+        b.iter(|| {
+            host.commands.clear();
+            let results = E::call_batch(&mut instance, &entry, black_box(&args), &mut host)
+                .expect("batch game_tick failed");
+            black_box(results);
+            black_box(host.commands.len())
+        })
+    });
+}
+
+fn bench_game_tick_script_batch<E: Engine>(c: &mut Criterion) {
+    let mut host = GameHost::new(ENTITY_COUNT);
+    let args = [Value::Int(ENTITY_COUNT as i64)];
+    let limits = bench_limits();
+    let mut instance = E::load(GAME_TICK_BATCH_SRC, &mut host, &limits);
+    E::call(&mut instance, "tick_batch", &args, &mut host).expect("sanity call failed");
+    let entry = E::prepare(&instance, "tick_batch");
+    c.bench_function(
+        &format!("game_tick_100_entities_script_batch/{}", E::NAME),
+        |b| {
+            b.iter(|| {
+                host.commands.clear();
+                let results = E::call_prepared(&mut instance, &entry, black_box(&args), &mut host)
+                    .expect("script batch game_tick failed");
+                black_box(results);
+                black_box(host.commands.len())
+            })
+        },
+    );
+}
+
 fn bench_load<E: Engine>(c: &mut Criterion) {
     let limits = bench_limits();
     c.bench_function(&format!("load_game_tick/{}", E::NAME), |b| {
@@ -307,6 +531,46 @@ fn bench_instantiate_from_compiled(c: &mut Criterion) {
             BatchSize::SmallInput,
         )
     });
+}
+
+/// VM only: build 16 independent instances of a module-bearing program. The
+/// legacy path resolves/parses/compiles the helper 16 times; the artifact path
+/// shares the root and module chunks while still executing fresh top-level
+/// state for every instance.
+fn bench_module_bearing_instances(c: &mut Criterion) {
+    const INSTANCE_COUNT: usize = 16;
+    let limits = bench_limits();
+    let program = nybl_vm::CompiledScript::compile_with_modules(MODULE_BEARING_ROOT, |path| {
+        (path == "bench.tick").then(|| Ok(MODULE_TICK_SRC.to_string()))
+    })
+    .expect("module-bearing script compiles");
+    let mut group = c.benchmark_group("instantiate_module_graph_16");
+
+    group.bench_function("legacy_load", |b| {
+        b.iter(|| {
+            let instances: Vec<_> = (0..INSTANCE_COUNT)
+                .map(|_| {
+                    let mut host = GameHost::new(1);
+                    nybl_vm::NyblInstance::load(MODULE_BEARING_ROOT, &mut host, &limits)
+                        .expect("module-bearing load failed")
+                })
+                .collect();
+            black_box(instances)
+        })
+    });
+    group.bench_function("from_precompiled", |b| {
+        b.iter(|| {
+            let instances: Vec<_> = (0..INSTANCE_COUNT)
+                .map(|_| {
+                    let mut host = GameHost::new(1);
+                    nybl_vm::NyblInstance::from_compiled(&program, &mut host, &limits)
+                        .expect("module-bearing instantiation failed")
+                })
+                .collect();
+            black_box(instances)
+        })
+    });
+    group.finish();
 }
 
 fn bench_value_conversion(c: &mut Criterion) {
@@ -372,14 +636,25 @@ fn bench_value_conversion(c: &mut Criterion) {
 fn all_benches(c: &mut Criterion) {
     bench_call_trivial::<Walker>(c);
     bench_call_trivial::<Vm>(c);
+    bench_call_trivial_prepared::<Walker>(c);
+    bench_call_trivial_prepared::<Vm>(c);
+    bench_call_trivial_batch::<Walker>(c);
+    bench_call_trivial_batch::<Vm>(c);
     bench_host_call_roundtrip::<Walker>(c);
     bench_host_call_roundtrip::<Vm>(c);
     bench_game_tick::<Walker>(c);
     bench_game_tick::<Vm>(c);
+    bench_game_tick_prepared::<Walker>(c);
+    bench_game_tick_prepared::<Vm>(c);
+    bench_game_tick_batch::<Walker>(c);
+    bench_game_tick_batch::<Vm>(c);
+    bench_game_tick_script_batch::<Walker>(c);
+    bench_game_tick_script_batch::<Vm>(c);
     bench_value_conversion(c);
     bench_load::<Walker>(c);
     bench_load::<Vm>(c);
     bench_instantiate_from_compiled(c);
+    bench_module_bearing_instances(c);
 }
 
 criterion_group!(benches, all_benches);

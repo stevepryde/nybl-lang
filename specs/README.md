@@ -21,6 +21,8 @@ documentation above.
 
 - [Second-class `ref` parameters](proposals/ref-parameters.md) — implemented;
   the normative runtime requirements are RUN-020 and AC-RUN-016
+- [Prepared and batched instance dispatch](proposals/prepared-batch-dispatch.md)
+  — implemented; the normative runtime requirement is RUN-027
 
 ## Source map
 

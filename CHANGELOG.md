@@ -7,7 +7,6 @@ publishable workspace crates unless a section says otherwise.
 
 ### Embedding
 
-<<<<<<< HEAD
 - Add `nybl_vm::CompiledScript`: compile a program once (no host needed, no
   execution) into an immutable `Send + Sync`, Arc-backed artifact, then
   create any number of VM instances from it with
@@ -22,11 +21,13 @@ publishable workspace crates unless a section says otherwise.
   `disabled_builtins`, which is enforced per `from_compiled` against usage
   data stored in the artifact — are unchanged. The compiled chunk graph now
   uses `Arc` instead of `Rc` internally (`FnDef::chunk`,
-  `InterpRecipe::parts`, `PatternRecipe::pattern`). Module `use` resolution
-  keeps its existing per-instance loading path; the artifact covers the root
-  program.
-=======
->>>>>>> origin/main
+  `InterpRecipe::parts`, `PatternRecipe::pattern`). Plain `compile` preserves
+  lazy per-instance module resolution, while the opt-in
+  `CompiledScript::compile_with_modules` resolves, parses, compiles, validates,
+  and builtin-indexes the complete transitive module graph once. Instances
+  share its Arc-backed module chunks without runtime source resolution while
+  retaining fresh module globals, imports, callable identity, limits, resource
+  accounting, and diagnostics.
 - Add `NyblLimits::disabled_builtins` (and `nybl_compile::Options::
   disabled_builtins` for the AOT engine): a host-configured deny list for
   engine builtins, built for deterministic simulation hosts that must route
@@ -36,6 +37,32 @@ publishable workspace crates unless a section says otherwise.
   fatal, `try_call`-proof error the moment they would invoke the builtin.
   Consistent across the walker, VM, and AOT engines; imported modules are
   checked when they load.
+- Align callable shadowing across the walker, VM, and AOT engines: an executed
+  user function declaration now shadows an engine builtin of the same name,
+  while calls before that declaration retain source-ordered builtin behavior.
+  Disabled-builtin checks follow the same rule, so a lexical replacement such
+  as a host-controlled `rand` function remains valid.
+- Add instance-affine `PreparedEntry` handles plus `call_prepared` and
+  `call_batch` to the walker and VM embedding APIs. Host batches reuse one live
+  engine while resetting step and call-depth accounting per item; script-level
+  batch entry points provide the largest measured game-tick improvement while
+  preserving ordinary host dispatch and sandbox semantics.
+- Make `nybl-sys` clock calls safe on freestanding wasm:
+  `unix_time()` and `unix_time_ms()` now return an actionable Nybl runtime
+  error on `wasm32-unknown-unknown` instead of trapping in
+  `SystemTime::now()`; native and WASI hosts retain real wall-clock time.
+- Execute the wasm parity corpus in CI with both the default `std` math
+  backend and the deterministic defaults-off `no_std`/pure-Rust `libm`
+  backend. Both configurations run through the walker and VM on native and
+  `wasm32-wasip1` and are byte-compared; a deliberate-divergence negative
+  control proves the comparison can fail.
+
+### Tooling
+
+- Reject unresolved merge-conflict markers in tracked text during CI. The
+  guard scans Git-tracked files only, ignores binary data, and carries a
+  deliberately invalid Markdown fixture to prove the failure path without
+  matching its own implementation.
 
 ## 0.4.2
 

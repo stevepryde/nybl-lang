@@ -71,6 +71,13 @@ depend on `nybl-sys`.
   callee locals plus stable caller-binding targets and exposes write-back only
   from its normal-return path after fallible work is complete. Error unwinds
   discard staging without turning the broader instance call into a transaction.
+- **ARCH-012:** A VM compiled artifact may opt into a complete statically
+  discovered module graph. Resolution, parsing, bytecode compilation,
+  validation, and builtin-usage indexing happen once; immutable module chunks
+  are shared across instances, while execution, imports, globals, callable
+  origin, limits, diagnostics, and memory accounting remain instance-owned.
+  Root-only artifacts preserve lazy host source resolution; complete graph
+  artifacts never fall back to a runtime host for missing source.
 
 ## Failure modes
 

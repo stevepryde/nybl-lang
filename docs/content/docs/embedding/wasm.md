@@ -40,8 +40,9 @@ one build graph, `std` wins — a genuine no_std build must disable default
 features.
 
 `nybl-compile`'s generated sandbox runtime follows the same feature split.
-`nybl-sys` and `nybl-cli` are native-only hosts (see the timing caveat
-below).
+`nybl-cli` is a native application. `nybl-sys` compiles for wasm, but remains
+an OS-oriented host rather than the recommended browser/freestanding host;
+its unsupported clock behavior is described below.
 
 ## Allocator
 
@@ -79,8 +80,10 @@ needs bit-identical script output across native and wasm builds (lockstep
 simulation, replay verification), build **both** sides with `no_std` so
 every platform uses the same pure-Rust `libm` code.
 
-CI enforces execution parity between Linux-native and wasm for the
-default configuration on a curated corpus — see
+CI executes the same curated parity corpus twice: once with the default
+configuration and once with both engines linked using
+`default-features = false, features = ["no_std", "nybl-std"]`. The second
+comparison is the lockstep configuration described above — see
 [CI enforcement](#ci-enforcement) below.
 
 ## Timing: `Instant`, `SystemTime`, and `web-time`
@@ -104,30 +107,36 @@ clock. Two places this bites:
   On WASI targets (`wasm32-wasip1`), `std::time` works natively and no
   replacement is needed.
 
-- **`nybl-sys`.** The `StdHost` OS-backed host calls `SystemTime::now()`
-  for `unix_time()` / `unix_time_ms()`. It compiles for wasm but those
-  builtins panic at runtime — `nybl-sys` is not part of the supported
-  wasm surface. Wasm embeddings implement their own `NyblHost` and
-  provide time (if scripts need it) through a host function backed by
-  `web-time` or a host-supplied tick value. `nybl-vm` does not depend on
+- **`nybl-sys`.** `StdHost` uses `SystemTime::now()` on native and WASI
+  targets. On `wasm32-unknown-unknown`, `unix_time()` and `unix_time_ms()`
+  instead return a Nybl runtime error explaining that the system clock is
+  unavailable and recommending a custom `NyblHost`; they do not panic or
+  trap. Browser and other freestanding wasm embeddings should provide time
+  through a host function backed by `web-time`, JavaScript, or a
+  caller-supplied deterministic tick. `nybl-vm` does not depend on
   `nybl-sys`, so this does not constrain the VM.
 
 ## CI enforcement
 
 Two CI jobs keep the wasm surface from regressing:
 
-- **Compile:** `cargo check` for `nybl-lang` and `nybl-vm` on
-  `wasm32-unknown-unknown`, in both the default and
-  `no_std` configurations.
-- **Execution parity:** the `wasm_parity` harness
-  (`nybl-vm/src/bin/wasm_parity.rs`) runs a curated corpus of Nybl
-  programs — float arithmetic and formatting, transcendental builtins,
+- **Compile:** `cargo check` runs for `nybl-lang` and `nybl-vm` on
+  `wasm32-unknown-unknown` in both the default and `no_std` configurations.
+  `nybl-sys` is also compile-checked there with its default features.
+- **Execution:** a small `wasm32-unknown-unknown` module is run under wasmtime
+  to prove `nybl-sys` reports its unsupported clock as a normal Nybl error.
+  The `wasm_parity` runner (`tests/wasm-parity`) then runs a curated corpus of
+  Nybl programs — float arithmetic and formatting, transcendental builtins,
   rounding at the i64 boundary, negative division/modulo, string
   interpolation, dict/array ordering, the deterministic `rand` sequence,
-  error messages, and composite programs — through **both** engines,
-  natively and under [wasmtime](https://wasmtime.dev/) on
-  `wasm32-wasip1`, and byte-compares the transcripts. Any difference
-  between native and wasm output fails CI. (Parity executes on
-  `wasm32-wasip1` because the harness needs stdout; it shares the wasm32
-  data layout with `wasm32-unknown-unknown`, which the compile checks
-  cover.)
+  error messages, and composite programs — through **both** engines, natively
+  and under [wasmtime](https://wasmtime.dev/) on
+  `wasm32-wasip1`, and byte-compares the transcripts in **both** feature
+  configurations: default `std` (platform math) and defaults-off `no_std`
+  (pure-Rust `libm`), with `nybl-std` enabled in both so the corpus can use
+  bundled modules. Any native/wasm difference fails CI. An opt-in negative
+  control perturbs one transcendental Nybl input on wasm: CI also verifies
+  that the same comparison rejects the resulting math-output divergence.
+  Parity executes on
+  `wasm32-wasip1` because the std runner needs stdout; the engine libraries
+  themselves are separately compile-checked for `wasm32-unknown-unknown`.
