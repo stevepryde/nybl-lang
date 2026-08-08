@@ -6,6 +6,12 @@ This tracked documentation fixture represents an unresolved left side.
 This tracked documentation fixture represents an unresolved right side.
 {{RIGHT}} fixture-right
 
-The default scan excludes this one explicit fixture template. Running
-`scripts/check-conflict-markers.sh --self-test` expands its placeholders to
-real markers in memory and must detect them.
+{{LEFT_LONG}} fixture-left-long
+This second region uses nine-character markers.
+{{MIDDLE_LONG}}
+Its purpose is to catch custom merge marker sizes.
+{{RIGHT_LONG}} fixture-right-long
+
+The default scan excludes this one explicit fixture template. Self-test
+expands both regions in memory and passes them through the production region
+detector.
