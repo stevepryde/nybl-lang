@@ -6,9 +6,9 @@ use core::num::{NonZeroU32, NonZeroU64};
 use nybl::parser::ParamMode;
 
 #[cfg(all(feature = "no_std", not(feature = "std")))]
-use alloc::{rc::Rc, string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 #[cfg(any(feature = "std", not(feature = "no_std")))]
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// One bytecode operation.
 ///
@@ -706,7 +706,7 @@ pub enum InterpPart {
 /// slice is shared so repeated interpolation only bumps a refcount.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterpRecipe {
-    pub parts: Rc<[InterpPart]>,
+    pub parts: Arc<[InterpPart]>,
 }
 
 /// One unique slot-backed name declared in a lexical scope.
@@ -925,7 +925,7 @@ impl Chunk {
 /// one recursive pattern can mention several distinct aliases.
 #[derive(Debug, Clone)]
 pub struct PatternRecipe {
-    pub pattern: Rc<nybl::parser::Pattern>,
+    pub pattern: Arc<nybl::parser::Pattern>,
     pub namespaces: Vec<(String, NamespaceRef)>,
 }
 
@@ -938,7 +938,7 @@ pub struct FnDef {
     pub param_modes: Vec<ParamMode>,
     /// Immutable compiled body shared by the defining chunk, function
     /// registry, and every closure materialised from this definition.
-    pub chunk: Rc<Chunk>,
+    pub chunk: Arc<Chunk>,
     /// Total slot count for this function's frame (params + every
     /// `let` / `for-in` variable assigned a slot by the compiler).
     /// The VM resizes the frame's `slots` vec to this length

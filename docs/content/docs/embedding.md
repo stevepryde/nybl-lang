@@ -82,7 +82,10 @@ surface failures as `NyblError` and use the same host boundary.
 Use the one-shot functions when a program should start from scratch on every
 run. For plugin-style programs whose globals, imports, callbacks, types, and
 random-number state must survive host calls, see [Stateful
-instances](/docs/embedding/instances/).
+instances](/docs/embedding/instances/). The VM can additionally compile a
+program once into a shareable `Send + Sync` artifact and instantiate it many
+times — including on worker threads — via
+[`CompiledScript`](/docs/embedding/instances/#compile-once-instantiate-many).
 
 ## The `NyblHost` trait
 

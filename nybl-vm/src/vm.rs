@@ -20,8 +20,9 @@
 //! # Frames
 //!
 //! Each function call — including the top-level program — runs in its
-//! own internal frame. A frame owns its chunk (wrapped in `Rc` so repeated
-//! calls share the compiled code), its instruction pointer, and its
+//! own internal frame. A frame owns its chunk (wrapped in `Arc` so repeated
+//! calls — and instances sharing one [`CompiledScript`] — share the
+//! compiled code), its instruction pointer, and its
 //! lexical scope stack. Returning from a function pops the frame and
 //! truncates the value stack back to the frame's base in case the body
 //! left anything behind.
@@ -46,12 +47,13 @@ use alloc::{
     format,
     rc::Rc,
     string::{String, ToString},
+    sync::Arc,
     vec,
     vec::Vec,
 };
 
 #[cfg(any(feature = "std", not(feature = "no_std")))]
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use core::cell::{Cell, RefCell};
 
@@ -130,7 +132,7 @@ struct FunctionFrameContext {
 }
 
 struct Frame {
-    chunk: Rc<Chunk>,
+    chunk: Arc<Chunk>,
     ip: usize,
     /// Flat slot array for this function's compile-time-resolved
     /// locals (params + every `let` / `for-in` variable assigned
@@ -190,10 +192,10 @@ struct Frame {
 }
 
 impl Frame {
-    fn top(chunk: Chunk, lexical_context: Rc<ModuleLexicalContext>) -> Self {
+    fn top(chunk: Arc<Chunk>, lexical_context: Rc<ModuleLexicalContext>) -> Self {
         let scopes = vec![BTreeMap::new()];
         Self {
-            chunk: Rc::new(chunk),
+            chunk,
             ip: 0,
             slots: Vec::new(),
             scope_base: scopes.len(),
@@ -216,7 +218,7 @@ impl Frame {
     }
 
     fn function(
-        chunk: Rc<Chunk>,
+        chunk: Arc<Chunk>,
         slots: Vec<Value>,
         scopes: Vec<BTreeMap<String, Value>>,
         stack_base: usize,
@@ -318,7 +320,7 @@ struct FnEntry {
     exact_self_name: Option<String>,
     params: Vec<String>,
     param_modes: Vec<ParamMode>,
-    chunk: Rc<Chunk>,
+    chunk: Arc<Chunk>,
     module_path: String,
     declaration_alias_names: BTreeSet<String>,
 }
@@ -815,7 +817,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     pub fn new(chunk: Chunk, host: &'h mut H, limits: NyblLimits) -> Self {
         let memory = nybl::memory::MemoryContext::__new(limits.max_memory);
         Self::new_internal(
-            chunk,
+            Arc::new(chunk),
             host,
             limits,
             ModuleRuntime::empty(),
@@ -828,7 +830,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
 
     #[allow(clippy::too_many_arguments)]
     fn new_internal(
-        chunk: Chunk,
+        chunk: Arc<Chunk>,
         host: &'h mut H,
         limits: NyblLimits,
         module_runtime: ModuleRuntime,
@@ -1210,7 +1212,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     /// named functions, closures, methods, and iterator methods from drifting.
     fn push_function_frame(
         &mut self,
-        chunk: Rc<Chunk>,
+        chunk: Arc<Chunk>,
         slots: Vec<Value>,
         scopes: Vec<BTreeMap<String, Value>>,
         stack_base: usize,
@@ -1571,7 +1573,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     }
 
     /// `set_existing`, but pull the name from the current chunk
-    /// by index. Splits the frame's `&mut` into a `&Rc<Chunk>`
+    /// by index. Splits the frame's `&mut` into a `&Arc<Chunk>`
     /// (for the name slice) and `&mut scopes` (for the walk)
     /// using field-level borrow splitting — no `Rc::clone`.
     fn set_existing_by_idx(&mut self, idx: NameIdx, value: Value) -> bool {
@@ -1795,7 +1797,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     // registry so `fn fib(...) {...}; let g = fib`
                     // yields a real `Value::Fn`. Only then do we
                     // need the name as a `&str` / `String`.
-                    let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+                    let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
                     let name = chunk.name(n);
                     if let Some(module) = self.module_alias(name).cloned() {
                         self.push_value(Value::Module(module));
@@ -1804,8 +1806,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     let fn_entry = self.lookup_function_entry(name);
                     if let Some(entry) = fn_entry {
                         let params = entry.params.clone();
-                        let chunk_rc = entry.chunk.clone();
-                        let body: Rc<dyn core::any::Any + 'static> = chunk_rc;
+                        let body: Rc<dyn core::any::Any + 'static> = Rc::new(entry.chunk.clone());
                         let v = NyblFn::try_new_compiled_in_module_with_origin_and_modes(
                             params,
                             entry.param_modes.clone(),
@@ -1877,7 +1878,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     .is_module_top_scope()
                     .then(|| self.current_chunk().name(n).to_string());
                 let runtime_alias_without_value_binding = {
-                    let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+                    let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
                     let name = chunk.name(n);
                     self.lookup_var_by_idx(n).is_none() && self.module_alias(name).is_some()
                 };
@@ -1889,7 +1890,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 if !self.set_existing_by_idx(n, v) {
                     // Cold path: synthesise the error with the
                     // name — allocation is fine here.
-                    let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+                    let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
                     let name = chunk.name(n);
                     return Err(error_with_hint(
                         line,
@@ -1905,7 +1906,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 let rhs = self.pop_value(line)?;
                 let runtime_alias_without_value_binding = match target {
                     crate::chunk::AssignBack::Name(name_idx) => {
-                        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+                        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
                         self.lookup_var_by_idx(name_idx).is_none()
                             && self.module_alias(chunk.name(name_idx)).is_some()
                     }
@@ -1923,7 +1924,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                             value
                         } else {
                             let chunk =
-                                Rc::clone(&self.frames.last().expect("frame present").chunk);
+                                Arc::clone(&self.frames.last().expect("frame present").chunk);
                             let name = chunk.name(name_idx);
                             if let Some(module) = self.module_alias(name).cloned() {
                                 Value::Module(module)
@@ -1956,7 +1957,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                         }
                         if !self.set_existing_by_idx(name, value) {
                             let chunk =
-                                Rc::clone(&self.frames.last().expect("frame present").chunk);
+                                Arc::clone(&self.frames.last().expect("frame present").chunk);
                             return Err(error(
                                 line,
                                 nybl::error_messages::variable_not_found(chunk.name(name)),
@@ -2237,7 +2238,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
 
             // ─── String interpolation ────────────────────────────
             Instr::StringInterp(idx) => {
-                let recipe_parts = Rc::clone(&self.current_chunk().interp(idx).parts);
+                let recipe_parts = Arc::clone(&self.current_chunk().interp(idx).parts);
                 self.push_value(self.build_interp(&recipe_parts, line)?);
             }
 
@@ -2557,7 +2558,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 type_name,
                 fields,
             } => {
-                let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+                let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
                 self.validate_struct_construct(
                     namespace.map(|namespace| chunk.namespace_ref(namespace)),
                     chunk.name(type_name),
@@ -2572,7 +2573,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 shape,
                 fields,
             } => {
-                let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+                let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
                 self.validate_enum_construct(
                     namespace.map(|namespace| chunk.namespace_ref(namespace)),
                     chunk.name(type_name),
@@ -2775,7 +2776,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         site: CallSiteIdx,
         line: u32,
     ) -> Result<(), NyblError> {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let name = chunk.name(name_idx).to_string();
 
         let scoped = self
@@ -2984,7 +2985,8 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     Some(value) => value,
                     None => {
                         if let Some(entry) = self.lookup_function_entry(&receiver_name) {
-                            let body: Rc<dyn core::any::Any + 'static> = entry.chunk.clone();
+                            let body: Rc<dyn core::any::Any + 'static> =
+                                Rc::new(entry.chunk.clone());
                             let function =
                                 NyblFn::try_new_compiled_in_module_with_origin_and_modes(
                                     entry.params.clone(),
@@ -3866,9 +3868,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // Borrow the name out of the chunk without allocating a
         // fresh `String` per call — `fib(25)` dispatches this
         // path ~75 000 times and even one small allocation per
-        // call shows up in profiles. Holding a local `Rc<Chunk>`
+        // call shows up in profiles. Holding a local `Arc<Chunk>`
         // keeps the name slice valid for the whole body.
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let name: &str = chunk.name(name_idx);
 
         // Check lexical shadowing first (a `let f = fn() {...}`
@@ -4187,7 +4189,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         nested_place: bool,
         line: u32,
     ) -> Result<Next, NyblError> {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let method = chunk.name(method_idx);
 
         let obj = self.pop_value(line)?;
@@ -4203,7 +4205,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         argc: usize,
         line: u32,
     ) -> Result<Next, NyblError> {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let method = chunk.name(method_idx);
         let args = self.pop_n_values(argc, line)?;
         self.call_method_in_place_args(target, method, args, line)
@@ -4216,7 +4218,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         args: Vec<Value>,
         line: u32,
     ) -> Result<Next, NyblError> {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let memory = self.memory.clone();
         let receiver_idx = target.name_idx();
         let receiver_name = chunk.name(receiver_idx);
@@ -4562,7 +4564,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     }
 
     fn define_method(&mut self, type_name: NameIdx, method_name: NameIdx, fn_idx: FnIdx) {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let type_name_s = chunk.name(type_name).to_string();
         let method_name_s = chunk.name(method_name).to_string();
         let fn_def = chunk.function(fn_idx);
@@ -4570,7 +4572,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             exact_self_name: None,
             params: fn_def.params.clone(),
             param_modes: fn_def.param_modes.clone(),
-            chunk: Rc::clone(&fn_def.chunk),
+            chunk: Arc::clone(&fn_def.chunk),
             module_path: self.current_module.clone(),
             declaration_alias_names: self
                 .frames
@@ -5157,14 +5159,14 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     }
 
     fn define_fn(&mut self, idx: FnIdx) {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let fn_def = chunk.function(idx);
         let name = fn_def.name.clone();
         let entry = Rc::new(FnEntry {
             exact_self_name: Some(name.clone()),
             params: fn_def.params.clone(),
             param_modes: fn_def.param_modes.clone(),
-            chunk: Rc::clone(&fn_def.chunk),
+            chunk: Arc::clone(&fn_def.chunk),
             module_path: self.active_module_path().to_string(),
             declaration_alias_names: self
                 .frames
@@ -5195,11 +5197,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     /// — no "flatten every binding in sight" pass, and no
     /// over-capture of out-of-scope slots.
     fn make_lambda(&mut self, idx: FnIdx, line: u32) -> Result<(), NyblError> {
-        let chunk = Rc::clone(&self.frames.last().expect("frame present").chunk);
+        let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let fn_def = chunk.function(idx);
         let captures = self.snapshot_captures_for(fn_def);
-        let compiled_chunk = Rc::clone(&fn_def.chunk);
-        let body: Rc<dyn core::any::Any + 'static> = compiled_chunk;
+        let body: Rc<dyn core::any::Any + 'static> = Rc::new(Arc::clone(&fn_def.chunk));
         let value = NyblFn::try_new_compiled_in_module_with_origin_and_modes(
             fn_def.params.clone(),
             fn_def.param_modes.clone(),
@@ -5283,10 +5284,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // The body must be a VM-compiled chunk. Walker-created
         // `Value::Fn`s would carry `FnBody::Ast` and don't belong
         // in the VM.
-        let chunk: Rc<Chunk> = match &func.body {
-            FnBody::Compiled(any) => match Rc::clone(any).downcast::<Chunk>() {
-                Ok(c) => c,
-                Err(_) => {
+        let chunk: Arc<Chunk> = match &func.body {
+            FnBody::Compiled(any) => match any.downcast_ref::<Arc<Chunk>>() {
+                Some(c) => Arc::clone(c),
+                None => {
                     return Err(error(
                         line,
                         "Closure body wasn't compiled by the bytecode VM",
@@ -5439,8 +5440,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             {
                 continue;
             }
-            let chunk_rc: Rc<Chunk> = entry.chunk.clone();
-            let body: Rc<dyn core::any::Any + 'static> = chunk_rc;
+            let body: Rc<dyn core::any::Any + 'static> = Rc::new(entry.chunk.clone());
             let value = NyblFn::try_new_compiled_in_module_with_origin_and_modes(
                 entry.params.clone(),
                 entry.param_modes.clone(),
@@ -5887,7 +5887,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         };
         let limits = self.limits.clone();
         let mut sub = Vm::new_internal(
-            chunk,
+            Arc::new(chunk),
             self.host,
             limits,
             module_runtime,
@@ -6611,25 +6611,109 @@ where
     }
 }
 
+/// An immutable compiled Nybl program, ready to instantiate any number
+/// of [`NyblInstance`]s without re-parsing or re-compiling.
+///
+/// The artifact owns the validated root chunk (and, transitively, every
+/// nested function body) behind [`Arc`], so `Clone` is a reference-count
+/// bump and the value is `Send + Sync`: compile once on any thread, hand
+/// clones to worker threads, and call [`NyblInstance::from_compiled`] on
+/// each worker. Instances themselves stay single-threaded (`!Send`) —
+/// the supported cross-thread pattern is create-on-worker from a shared
+/// artifact.
+///
+/// Compilation covers the root program only. `use` statements keep
+/// their existing per-instance loading path: each instance resolves
+/// modules through its own host at execution time.
+#[derive(Clone)]
+pub struct CompiledScript {
+    chunk: Arc<Chunk>,
+    root_function_visibility: Arc<BTreeMap<u32, Visibility>>,
+    /// Engine-builtin usage collected at compile time so per-instance
+    /// deny sets ([`NyblLimits::disabled_builtins`]) can be enforced at
+    /// instantiation without the AST.
+    builtin_usage: Arc<BTreeMap<String, u32>>,
+}
+
+impl core::fmt::Debug for CompiledScript {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CompiledScript")
+            .field("instructions", &self.chunk.code.len())
+            .field("functions", &self.chunk.functions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+// `CompiledScript` must remain shareable across threads; the compiled
+// graph is Arc-backed and contains no interior mutability.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<CompiledScript>();
+};
+
+impl CompiledScript {
+    /// Parse, compile, and validate a program without executing it.
+    ///
+    /// No host is needed: top-level statements run later, at
+    /// [`NyblInstance::from_compiled`] time, once per instance.
+    pub fn compile(source: &str) -> Result<Self, NyblError> {
+        let statements = nybl::parse(source)?;
+        let builtin_usage = nybl::check::collect_builtin_usage(&statements);
+        let compiled = crate::compiler::compile_program(&statements)?;
+        crate::validate_chunk(&compiled.chunk)?;
+        Ok(Self {
+            chunk: Arc::new(compiled.chunk),
+            root_function_visibility: Arc::new(compiled.root_function_visibility),
+            builtin_usage: Arc::new(builtin_usage),
+        })
+    }
+
+    /// Stable identity of the shared root chunk, for tests asserting
+    /// that instantiation shares (rather than deep-clones) chunk storage.
+    #[doc(hidden)]
+    pub fn __root_chunk_ptr(&self) -> *const u8 {
+        Arc::as_ptr(&self.chunk).cast()
+    }
+}
+
 impl NyblInstance {
     /// Compile and execute a program once, retaining its VM state for calls.
+    ///
+    /// Equivalent to [`CompiledScript::compile`] followed by
+    /// [`Self::from_compiled`]. Embedders creating several instances of
+    /// the same program should compile once and share the artifact.
     pub fn load(
         source: &str,
         host: &mut dyn NyblHost,
         limits: &NyblLimits,
     ) -> Result<Self, NyblError> {
-        let statements = nybl::parse(source)?;
-        nybl::check::enforce_disabled_builtins(&statements, &limits.disabled_builtins)?;
-        let compiled = crate::compiler::compile_program(&statements)?;
-        crate::validate_chunk(&compiled.chunk)?;
+        let program = CompiledScript::compile(source)?;
+        Self::from_compiled(&program, host, limits)
+    }
+
+    /// Instantiate a compiled program: enforce the deny list in
+    /// `limits`, execute the top-level statements once against `host`,
+    /// and retain the resulting VM state for calls.
+    ///
+    /// The instance borrows the artifact's chunk graph by `Arc`; nothing
+    /// is re-parsed, re-compiled, or deep-cloned. All per-instance state
+    /// (globals, RNG, imports, memory accounting) starts fresh, so K
+    /// instances from one artifact behave exactly like K separate
+    /// [`Self::load`] calls on the same source.
+    pub fn from_compiled(
+        program: &CompiledScript,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+    ) -> Result<Self, NyblError> {
+        nybl::check::check_disabled_builtins(&program.builtin_usage, &limits.disabled_builtins)?;
         let memory = nybl::memory::MemoryContext::__new(limits.max_memory);
         let mut vm = Vm::new_internal(
-            compiled.chunk,
+            Arc::clone(&program.chunk),
             host,
             limits.clone(),
             ModuleRuntime::empty(),
             nybl::value::ROOT_MODULE_PATH.to_string(),
-            compiled.root_function_visibility,
+            (*program.root_function_visibility).clone(),
             NyblFnOrigin::__instance("vm"),
             memory.clone(),
         );
@@ -6658,6 +6742,15 @@ impl NyblInstance {
             in_operation: Cell::new(false),
             memory,
         })
+    }
+
+    /// Stable identity of this instance's executing root chunk, for
+    /// tests asserting chunk-storage sharing with a [`CompiledScript`].
+    #[doc(hidden)]
+    pub fn __root_chunk_ptr(&self) -> *const u8 {
+        let state = self.state.as_ref().expect("instance state present");
+        let frame = state.frames.first().expect("root frame present");
+        Arc::as_ptr(&frame.chunk).cast()
     }
 
     pub fn entry_points(&self) -> &[EntryPoint] {
@@ -7112,7 +7205,7 @@ for outer in [1, 2] {
         // pushed runtime scope is removable. Function exit also discards all
         // still-open type scopes, as an early return requires.
         vm.push_function_frame(
-            Rc::new(Chunk::new()),
+            Arc::new(Chunk::new()),
             Vec::new(),
             Vec::new(),
             0,
@@ -7137,7 +7230,7 @@ for outer in [1, 2] {
         let mut captures = BTreeMap::new();
         captures.insert(String::from("captured"), Value::Int(10));
         vm.push_function_frame(
-            Rc::new(Chunk::new()),
+            Arc::new(Chunk::new()),
             Vec::new(),
             vec![captures],
             vm.stack.len(),
@@ -7159,7 +7252,7 @@ for outer in [1, 2] {
         // depth exactly.
         vm.do_return(Value::None, 0).expect("closure return");
         vm.push_function_frame(
-            Rc::new(Chunk::new()),
+            Arc::new(Chunk::new()),
             Vec::new(),
             Vec::new(),
             vm.stack.len(),
@@ -7168,7 +7261,7 @@ for outer in [1, 2] {
         );
         vm.push_scope();
         vm.push_function_frame(
-            Rc::new(Chunk::new()),
+            Arc::new(Chunk::new()),
             Vec::new(),
             Vec::new(),
             vm.stack.len(),
@@ -7188,7 +7281,7 @@ for outer in [1, 2] {
         let root_context = Rc::clone(&vm.root_lexical_context);
 
         vm.push_function_frame(
-            Rc::new(Chunk::new()),
+            Arc::new(Chunk::new()),
             Vec::new(),
             Vec::new(),
             0,
