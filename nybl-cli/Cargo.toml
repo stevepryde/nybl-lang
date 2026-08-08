@@ -20,14 +20,14 @@ path = "src/main.rs"
 [dependencies]
 # The CLI always bundles the stdlib — users running `nybl run`
 # or `nybl compile` expect `use std.math` to Just Work.
-nybl = { version = "0.4.2", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std", "nybl-std"] }
-nybl-sys = { version = "0.4.2", path = "../nybl-sys" }
+nybl = { version = "0.4.3", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std", "nybl-std"] }
+nybl-sys = { version = "0.4.3", path = "../nybl-sys" }
 # The `run` subcommand defaults to the bytecode VM (2–3× faster
 # than the tree-walker). `--novm` forces the walker path.
-nybl-vm = { version = "0.4.2", path = "../nybl-vm" }
+nybl-vm = { version = "0.4.3", path = "../nybl-vm" }
 # `nybl compile` emits Rust via the AOT transpiler, then (by
 # default) invokes cargo to produce a native binary.
-nybl-compile = { version = "0.4.2", path = "../nybl-compile" }
+nybl-compile = { version = "0.4.3", path = "../nybl-compile" }
 # Compare source and output identities before AOT copy-out. This catches path
 # aliases, symlinks, and hard links portably on Unix and Windows.
 same-file = "1.0.6"

@@ -21,7 +21,7 @@ name = "nybl_compile"
 # drop `default-features` only to avoid pulling the `nybl-std`
 # stdlib blob when the transpiler doesn't need it. Keep the
 # Rust `std` integration explicit.
-nybl = { version = "0.4.2", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std"] }
+nybl = { version = "0.4.3", path = "../nybl", package = "nybl-lang", default-features = false, features = ["std"] }
 
 [features]
 default = ["nybl-std"]
@@ -32,4 +32,4 @@ default = ["nybl-std"]
 nybl-std = ["nybl/nybl-std"]
 
 [dev-dependencies]
-nybl-vm = { version = "0.4.2", path = "../nybl-vm" }
+nybl-vm = { version = "0.4.3", path = "../nybl-vm" }

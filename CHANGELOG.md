@@ -5,6 +5,12 @@ publishable workspace crates unless a section says otherwise.
 
 ## Unreleased
 
+## 0.4.3
+
+`0.4.3` improves persistent embedding, cross-engine consistency, shared VM
+artifacts, and wasm portability while adding evidence-driven dispatch and
+cached-instance benchmarks.
+
 ### Embedding
 
 - Add `nybl_vm::CompiledScript`: compile a program once (no host needed, no

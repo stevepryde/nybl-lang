@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-cli"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "nybl-compile",
  "nybl-lang",
@@ -326,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-compile"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "nybl-lang",
  "nybl-vm",
@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-lang"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "libm",
 ]
@@ -350,14 +350,14 @@ dependencies = [
 
 [[package]]
 name = "nybl-sys"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "nybl-lang",
 ]
 
 [[package]]
 name = "nybl-vm"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "criterion",
  "nybl-lang",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-wasm-clock-smoke"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "nybl-lang",
  "nybl-sys",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "nybl-wasm-parity"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "nybl-lang",
  "nybl-vm",

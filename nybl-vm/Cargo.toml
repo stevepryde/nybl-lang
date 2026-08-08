@@ -17,7 +17,7 @@ categories = ["compilers"]
 name = "nybl_vm"
 
 [dependencies]
-nybl = { version = "0.4.2", path = "../nybl", package = "nybl-lang", default-features = false }
+nybl = { version = "0.4.3", path = "../nybl", package = "nybl-lang", default-features = false }
 
 [features]
 default = ["std", "nybl-std"]
