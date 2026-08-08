@@ -10,7 +10,7 @@
 use nybl::parse;
 use nybl_vm::chunk::{LocalScopeIdx, LocalScopeSnapshot, RefArgTarget, SlotIdx};
 use nybl_vm::{Constant, Instr, LoopStateKind, compile, disassemble, validate_chunk};
-use std::rc::Rc;
+use std::sync::Arc;
 
 fn disasm(source: &str) -> String {
     let ast = parse(source).expect("parse");
@@ -1259,22 +1259,22 @@ let label = match 1 { 1 => "one", _ => "other" }"#,
     let chunk = compile(&ast).expect("compile");
     let cloned = chunk.clone();
 
-    assert!(Rc::ptr_eq(
+    assert!(Arc::ptr_eq(
         &chunk.functions[0].chunk,
         &cloned.functions[0].chunk,
     ));
-    assert!(Rc::ptr_eq(
+    assert!(Arc::ptr_eq(
         &chunk.patterns[0].pattern,
         &cloned.patterns[0].pattern,
     ));
-    assert!(Rc::ptr_eq(
+    assert!(Arc::ptr_eq(
         &chunk.interps[0].parts,
         &cloned.interps[0].parts,
     ));
 
-    let function_body = Rc::downgrade(&chunk.functions[0].chunk);
-    let pattern = Rc::downgrade(&chunk.patterns[0].pattern);
-    let interpolation = Rc::downgrade(&chunk.interps[0].parts);
+    let function_body = Arc::downgrade(&chunk.functions[0].chunk);
+    let pattern = Arc::downgrade(&chunk.patterns[0].pattern);
+    let interpolation = Arc::downgrade(&chunk.interps[0].parts);
     drop(cloned);
     drop(chunk);
     assert!(function_body.upgrade().is_none());

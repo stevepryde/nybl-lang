@@ -167,6 +167,81 @@ Use `compile` plus `execute` when you want to reuse bytecode but intentionally
 start with fresh program state on every execution. Use `NyblInstance` when the
 state itself must persist.
 
+## Compile once, instantiate many
+
+`NyblInstance::load` parses, compiles, and executes in one step. When a host
+creates several instances of the same program — one per worker thread, one per
+game entity shard, one per tenant — split the pipeline with
+`CompiledScript`:
+
+```rust
+use nybl::NyblLimits;
+use nybl_vm::{CompiledScript, NyblInstance};
+
+// Parse + compile + validate once. No host is needed: nothing executes.
+let program = CompiledScript::compile(source)?;
+
+// Each instantiation runs the top-level statements once against its own
+// host and produces fully independent instance state.
+let mut a = NyblInstance::from_compiled(&program, &mut host_a, &NyblLimits::standard())?;
+let mut b = NyblInstance::from_compiled(&program, &mut host_b, &NyblLimits::standard())?;
+```
+
+`load` is exactly `CompiledScript::compile` followed by
+`NyblInstance::from_compiled`, so both paths behave identically.
+`from_compiled` never re-parses or re-compiles, and every instance executes
+the artifact's chunks in place — K instances share one copy of the compiled
+program.
+
+`CompiledScript` is immutable, cheap to clone, and `Send + Sync`.
+Instances are deliberately not `Send`: their runtime state is
+reference-counted per thread for hot-path performance. The supported
+cross-thread pattern is therefore *create-on-worker* — clone the artifact
+into each worker and instantiate there:
+
+```rust
+use nybl::NyblLimits;
+use nybl_vm::{CompiledScript, NyblInstance};
+
+let program = CompiledScript::compile(source)?;
+
+let workers: Vec<_> = (0..4)
+    .map(|_| {
+        let program = program.clone(); // refcount bump, not a recompile
+        std::thread::spawn(move || {
+            let mut host = WorkerHost::new();
+            let mut instance = NyblInstance::from_compiled(
+                &program, &mut host, &NyblLimits::standard(),
+            ).expect("instantiate");
+            // Dispatch this worker's entities against its own instance.
+            run_shard(&mut instance, &mut host)
+        })
+    })
+    .collect();
+```
+
+This is the sharded game-engine shape: N workers each own an instance built
+from one shared artifact and dispatch per-entity callbacks in parallel.
+Determinism is unchanged — instances from one artifact given identical call
+sequences produce byte-identical results, including RNG use, because all
+per-instance state (globals, RNG seed, imports, memory accounting) starts
+fresh at `from_compiled` exactly as it does at `load`.
+
+Two details to keep in mind:
+
+- **Per-instance rules still apply.** Re-entry guards and callback affinity
+  are per *instance*, not per artifact: a callback created by one instance is
+  rejected by its siblings even though they share compiled code.
+- **The artifact covers the root program.** `use` statements keep their
+  per-instance loading path: each instance resolves modules through its own
+  host at execution time and caches them privately. A shared module-artifact
+  cache is possible future work.
+
+[Resource limits](/docs/embedding/#resource-limits) stay per-instance too, and
+the builtin deny list (`NyblLimits::disabled_builtins`) is enforced at
+`from_compiled` time with the same load-time error as `load`, so one
+unrestricted artifact can serve hosts with different deny sets.
+
 ## Sandboxed AOT instances
 
 The AOT transpiler emits a persistent `NyblInstance` only when

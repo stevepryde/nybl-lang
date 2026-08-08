@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use nybl::parser::ParamMode;
 use nybl::{NyblHost, NyblLimits, Value};
@@ -156,7 +156,7 @@ fn execute_rejects_every_index_pool_without_panicking() {
 fn execute_rejects_invalid_interpolation_parts() {
     let mut chunk = chunk_with(Instr::StringInterp(InterpIdx(0)));
     chunk.interps.push(InterpRecipe {
-        parts: Rc::from([InterpPart::Name(NameIdx(0))]),
+        parts: Arc::from([InterpPart::Name(NameIdx(0))]),
     });
 
     let error = execution_error(chunk);
@@ -404,7 +404,7 @@ fn execute_rejects_invalid_namespace_references() {
         on_fail: CodeOffset(1),
     });
     pattern.patterns.push(PatternRecipe {
-        pattern: Rc::new(nybl::parser::Pattern::Wildcard),
+        pattern: Arc::new(nybl::parser::Pattern::Wildcard),
         namespaces: vec![("module".into(), NamespaceRef::from_name(NameIdx(0)))],
     });
     let name_error = execution_error(pattern);
@@ -424,7 +424,7 @@ fn execute_recursively_validates_function_chunks_and_capture_metadata() {
         name: "broken".into(),
         params: vec!["x".into()],
         param_modes: vec![ParamMode::Value],
-        chunk: Rc::new(child),
+        chunk: Arc::new(child),
         slot_count: 1,
         capture_names: vec![],
         capture_sources: vec![],
@@ -440,7 +440,7 @@ fn execute_recursively_validates_function_chunks_and_capture_metadata() {
 
 #[test]
 fn shared_function_chunk_dags_are_validated_once_without_recursive_traversal() {
-    let leaf = Rc::new(Chunk {
+    let leaf = Arc::new(Chunk {
         code: vec![Instr::ReturnNone],
         lines: vec![0],
         ..Chunk::new()
@@ -451,12 +451,12 @@ fn shared_function_chunk_dags_are_validated_once_without_recursive_traversal() {
             name: format!("{name}_{depth}"),
             params: vec![],
             param_modes: vec![],
-            chunk: Rc::clone(&shared),
+            chunk: Arc::clone(&shared),
             slot_count: 0,
             capture_names: vec![],
             capture_sources: vec![],
         };
-        shared = Rc::new(Chunk {
+        shared = Arc::new(Chunk {
             code: vec![Instr::ReturnNone],
             lines: vec![0],
             functions: vec![function("left"), function("right")],
@@ -494,7 +494,7 @@ fn execute_rejects_sparse_or_absurd_function_slot_metadata() {
         name: "oversized".into(),
         params: vec![],
         param_modes: vec![],
-        chunk: Rc::new(child),
+        chunk: Arc::new(child),
         slot_count: u32::MAX,
         capture_names: vec![],
         capture_sources: vec![],
@@ -508,7 +508,7 @@ fn execute_rejects_sparse_or_absurd_function_slot_metadata() {
 
 #[test]
 fn shared_chunks_are_validated_for_each_distinct_parameter_layout() {
-    let child = Rc::new(Chunk {
+    let child = Arc::new(Chunk {
         code: vec![Instr::ReturnNone],
         lines: vec![0],
         slot_count: 1,
@@ -521,7 +521,7 @@ fn shared_chunks_are_validated_for_each_distinct_parameter_layout() {
             name: name.into(),
             params,
             param_modes,
-            chunk: Rc::clone(&child),
+            chunk: Arc::clone(&child),
             slot_count: 1,
             capture_names: vec![],
             capture_sources: vec![],
@@ -529,7 +529,7 @@ fn shared_chunks_are_validated_for_each_distinct_parameter_layout() {
     };
     let mut outer = chunk_with(Instr::Halt);
     // LIFO traversal sees `valid` first. Pointer-only memoization would then
-    // skip the invalid zero-parameter layout for the same Rc allocation.
+    // skip the invalid zero-parameter layout for the same Arc allocation.
     outer.functions = vec![
         function("invalid", vec![]),
         function("valid", vec!["value".into()]),
@@ -549,7 +549,7 @@ fn parameter_binding_metadata_must_match_names_and_slots() {
         name: "binding".into(),
         params: params.iter().map(|name| (*name).into()).collect(),
         param_modes: vec![ParamMode::Value; params.len()],
-        chunk: Rc::new(Chunk {
+        chunk: Arc::new(Chunk {
             code: vec![Instr::ReturnNone],
             lines: vec![0],
             slot_count,
@@ -605,7 +605,7 @@ fn rest_parameter_metadata_must_be_unique_and_final() {
         name: "rest".into(),
         params: (0..modes.len()).map(|index| format!("p{index}")).collect(),
         param_modes: modes.clone(),
-        chunk: Rc::new(Chunk {
+        chunk: Arc::new(Chunk {
             code: vec![Instr::ReturnNone],
             lines: vec![0],
             slot_count: modes.len() as u32,

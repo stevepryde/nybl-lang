@@ -4,12 +4,12 @@
 #[cfg(all(feature = "no_std", not(feature = "std")))]
 use alloc::{
     collections::BTreeMap,
-    rc::Rc,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 #[cfg(any(feature = "std", not(feature = "no_std")))]
-use std::{collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use nybl::error::NyblError;
 use nybl::parser::{
@@ -417,7 +417,7 @@ impl Compiler {
             })
             .collect();
         self.chunk.patterns.push(PatternRecipe {
-            pattern: Rc::new(pat),
+            pattern: Arc::new(pat),
             namespaces,
         });
         idx
@@ -1107,7 +1107,7 @@ impl Compiler {
                     }
                 }
                 let recipe = InterpRecipe {
-                    parts: Rc::from(resolved),
+                    parts: Arc::from(resolved),
                 };
                 let idx = self.add_interp(recipe);
                 self.emit(Instr::StringInterp(idx), line);
@@ -1726,7 +1726,7 @@ impl Compiler {
             name: name.to_string(),
             params: params.iter().map(|param| param.name.clone()).collect(),
             param_modes: params.iter().map(|param| param.mode).collect(),
-            chunk: Rc::new(chunk),
+            chunk: Arc::new(chunk),
             slot_count,
             capture_names,
             capture_sources,

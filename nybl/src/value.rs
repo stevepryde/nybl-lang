@@ -625,9 +625,9 @@ pub struct NyblFn {
 /// - The tree-walker creates `Ast` bodies and re-walks the AST on
 ///   every call.
 /// - The bytecode VM creates `Compiled` bodies carrying a
-///   pre-compiled form (typically `Rc<nybl_vm::Chunk>`). `Rc<dyn
-///   Any>` keeps `nybl-lang` from taking a dep on any particular
-///   engine crate.
+///   pre-compiled form (typically `Arc<nybl_vm::Chunk>`, so compiled
+///   code can be shared by many instances). `Rc<dyn Any>` keeps
+///   `nybl-lang` from taking a dep on any particular engine crate.
 ///
 /// An engine that only understands one variant errors cleanly
 /// when handed the other, rather than silently misbehaving.

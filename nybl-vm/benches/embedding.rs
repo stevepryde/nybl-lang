@@ -288,6 +288,27 @@ fn bench_load<E: Engine>(c: &mut Criterion) {
     });
 }
 
+/// VM only: instantiating from a pre-compiled shared artifact versus a full
+/// `load` (parse + compile + validate + top-level execution). The difference
+/// is the per-worker saving when N workers share one `CompiledScript`.
+fn bench_instantiate_from_compiled(c: &mut Criterion) {
+    let limits = bench_limits();
+    let program =
+        nybl_vm::CompiledScript::compile(GAME_TICK_SRC).expect("game tick script compiles");
+    c.bench_function("instantiate_from_compiled/vm", |b| {
+        b.iter_batched(
+            || GameHost::new(ENTITY_COUNT),
+            |mut host| {
+                black_box(
+                    nybl_vm::NyblInstance::from_compiled(black_box(&program), &mut host, &limits)
+                        .expect("from_compiled failed"),
+                )
+            },
+            BatchSize::SmallInput,
+        )
+    });
+}
+
 fn bench_value_conversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("value_conversion");
 
@@ -358,6 +379,7 @@ fn all_benches(c: &mut Criterion) {
     bench_value_conversion(c);
     bench_load::<Walker>(c);
     bench_load::<Vm>(c);
+    bench_instantiate_from_compiled(c);
 }
 
 criterion_group!(benches, all_benches);

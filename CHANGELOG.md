@@ -7,6 +7,23 @@ publishable workspace crates unless a section says otherwise.
 
 ### Embedding
 
+- Add `nybl_vm::CompiledScript`: compile a program once (no host needed, no
+  execution) into an immutable `Send + Sync`, Arc-backed artifact, then
+  create any number of VM instances from it with
+  `NyblInstance::from_compiled(&program, host, limits)`. Instantiation never
+  re-parses, re-compiles, or deep-clones — all instances execute the shared
+  chunk storage — and `NyblInstance::load` is now exactly `compile` +
+  `from_compiled`, so both paths behave identically. Instances stay
+  single-threaded (`!Send`); the supported cross-thread pattern is
+  create-on-worker from a shared artifact (compile once, clone the artifact
+  into N worker threads, instantiate per worker). Determinism, re-entry
+  guards, callback affinity, and per-instance limits — including
+  `disabled_builtins`, which is enforced per `from_compiled` against usage
+  data stored in the artifact — are unchanged. The compiled chunk graph now
+  uses `Arc` instead of `Rc` internally (`FnDef::chunk`,
+  `InterpRecipe::parts`, `PatternRecipe::pattern`). Module `use` resolution
+  keeps its existing per-instance loading path; the artifact covers the root
+  program.
 - Add `NyblLimits::disabled_builtins` (and `nybl_compile::Options::
   disabled_builtins` for the AOT engine): a host-configured deny list for
   engine builtins, built for deterministic simulation hosts that must route

@@ -28,7 +28,7 @@ pub fn validate_chunk(chunk: &Chunk) -> Result<(), NyblError> {
     let mut pending = vec![Validator::new(chunk, 0, String::from("top-level chunk"))];
     let mut visited = BTreeSet::new();
     while let Some(validator) = pending.pop() {
-        // Function bodies are Rc-backed and may form a heavily shared DAG.
+        // Function bodies are Arc-backed and may form a heavily shared DAG.
         // Validate each allocation once so a hand-built diamond cannot turn
         // verification into exponential work. The traversal is iterative so
         // arbitrary nesting cannot overflow the Rust call stack.
