@@ -21,9 +21,13 @@ publishable workspace crates unless a section says otherwise.
   `disabled_builtins`, which is enforced per `from_compiled` against usage
   data stored in the artifact — are unchanged. The compiled chunk graph now
   uses `Arc` instead of `Rc` internally (`FnDef::chunk`,
-  `InterpRecipe::parts`, `PatternRecipe::pattern`). Module `use` resolution
-  keeps its existing per-instance loading path; the artifact covers the root
-  program.
+  `InterpRecipe::parts`, `PatternRecipe::pattern`). Plain `compile` preserves
+  lazy per-instance module resolution, while the opt-in
+  `CompiledScript::compile_with_modules` resolves, parses, compiles, validates,
+  and builtin-indexes the complete transitive module graph once. Instances
+  share its Arc-backed module chunks without runtime source resolution while
+  retaining fresh module globals, imports, callable identity, limits, resource
+  accounting, and diagnostics.
 - Add `NyblLimits::disabled_builtins` (and `nybl_compile::Options::
   disabled_builtins` for the AOT engine): a host-configured deny list for
   engine builtins, built for deterministic simulation hosts that must route
@@ -42,6 +46,13 @@ publishable workspace crates unless a section says otherwise.
   backend. Both configurations run through the walker and VM on native and
   `wasm32-wasip1` and are byte-compared; a deliberate-divergence negative
   control proves the comparison can fail.
+
+### Tooling
+
+- Reject unresolved merge-conflict markers in tracked text during CI. The
+  guard scans Git-tracked files only, ignores binary data, and carries a
+  deliberately invalid Markdown fixture to prove the failure path without
+  matching its own implementation.
 
 ## 0.4.2
 

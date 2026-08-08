@@ -38,6 +38,18 @@ release bench profile. Criterion point estimates from a quiet machine,
 | — per entity | 1.83 µs | 2.42 µs |
 | `load_game_tick` (one-shot `NyblInstance::load`) | 14.2 µs | 24.8 µs |
 
+Module-bearing VM startup, 16 fresh instances per iteration:
+
+| Path | 16 instances | Per instance |
+| --- | ---: | ---: |
+| Legacy `load` (resolve + parse + compile each time) | 324 µs | 20.3 µs |
+| `from_compiled` with `compile_with_modules` | 76.5 µs | 4.78 µs |
+
+Precompiling the module graph is **4.24x faster** for this K-instance case, a
+76.4% startup reduction. Both paths still execute fresh root and module state
+for every instance; the delta is source resolution, parsing, compilation, and
+validation removed from the repeated path.
+
 | Value conversion | Time |
 | --- | ---: |
 | `i64` `into_value` | ~1.0 ns |

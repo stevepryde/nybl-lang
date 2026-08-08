@@ -15,6 +15,9 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
+            # Scan tracked text only; the self-test proves a representative
+            # tracked Markdown fixture is rejected without matching the guard.
+            - run: ./scripts/check-conflict-markers.sh --self-test
             - run: cargo test --all
 
     bench-smoke:

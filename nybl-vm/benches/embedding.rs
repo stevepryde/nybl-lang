@@ -84,6 +84,36 @@ pub fn tick(id) {
 }
 ";
 
+/// Module-bearing equivalent used to measure K-instance startup. The root is
+/// intentionally small while the helper carries enough real bytecode that
+/// repeated module parsing and compilation is visible in the baseline.
+const MODULE_BEARING_ROOT: &str = "
+use bench.tick as behavior
+pub fn tick(id) { return behavior.tick(id) }
+";
+
+const MODULE_TICK_SRC: &str = "
+fn clamp(value, low, high) {
+    if value < low { return low }
+    if value > high { return high }
+    return value
+}
+
+fn score(hp, x, y) {
+    let position = x * 3 + y * 5
+    return clamp(hp + position, 0, 10000)
+}
+
+fn tick(id) {
+    let hp = field_get(id, 0)
+    let x = field_get(id, 1)
+    let y = field_get(id, 2)
+    let next = score(hp, x, y)
+    field_set(id, 4, next)
+    return next
+}
+";
+
 // ─── Host ───────────────────────────────────────────────────────────────────
 
 /// Fields per entity: hp, x, y, state, target_x.
@@ -155,6 +185,10 @@ impl NyblHost for GameHost {
             })()),
             _ => None,
         }
+    }
+
+    fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>> {
+        (name == "bench.tick").then(|| Ok(MODULE_TICK_SRC.to_string()))
     }
 }
 
@@ -309,6 +343,46 @@ fn bench_instantiate_from_compiled(c: &mut Criterion) {
     });
 }
 
+/// VM only: build 16 independent instances of a module-bearing program. The
+/// legacy path resolves/parses/compiles the helper 16 times; the artifact path
+/// shares the root and module chunks while still executing fresh top-level
+/// state for every instance.
+fn bench_module_bearing_instances(c: &mut Criterion) {
+    const INSTANCE_COUNT: usize = 16;
+    let limits = bench_limits();
+    let program = nybl_vm::CompiledScript::compile_with_modules(MODULE_BEARING_ROOT, |path| {
+        (path == "bench.tick").then(|| Ok(MODULE_TICK_SRC.to_string()))
+    })
+    .expect("module-bearing script compiles");
+    let mut group = c.benchmark_group("instantiate_module_graph_16");
+
+    group.bench_function("legacy_load", |b| {
+        b.iter(|| {
+            let instances: Vec<_> = (0..INSTANCE_COUNT)
+                .map(|_| {
+                    let mut host = GameHost::new(1);
+                    nybl_vm::NyblInstance::load(MODULE_BEARING_ROOT, &mut host, &limits)
+                        .expect("module-bearing load failed")
+                })
+                .collect();
+            black_box(instances)
+        })
+    });
+    group.bench_function("from_precompiled", |b| {
+        b.iter(|| {
+            let instances: Vec<_> = (0..INSTANCE_COUNT)
+                .map(|_| {
+                    let mut host = GameHost::new(1);
+                    nybl_vm::NyblInstance::from_compiled(&program, &mut host, &limits)
+                        .expect("module-bearing instantiation failed")
+                })
+                .collect();
+            black_box(instances)
+        })
+    });
+    group.finish();
+}
+
 fn bench_value_conversion(c: &mut Criterion) {
     let mut group = c.benchmark_group("value_conversion");
 
@@ -380,6 +454,7 @@ fn all_benches(c: &mut Criterion) {
     bench_load::<Walker>(c);
     bench_load::<Vm>(c);
     bench_instantiate_from_compiled(c);
+    bench_module_bearing_instances(c);
 }
 
 criterion_group!(benches, all_benches);

@@ -6,6 +6,9 @@
 //! contract: no recompilation, shared chunk storage, byte-identical
 //! determinism across threads, and per-instance deny-list enforcement.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
 use nybl::{NyblError, NyblHost, NyblLimits, Value};
 use nybl_vm::{CompiledScript, NyblInstance};
 
@@ -19,6 +22,30 @@ impl NyblHost for Host {
         _line: u32,
     ) -> Option<Result<Value, NyblError>> {
         None
+    }
+}
+
+#[derive(Default)]
+struct NoResolveHost {
+    resolutions: usize,
+}
+
+impl NyblHost for NoResolveHost {
+    fn call(
+        &mut self,
+        _name: &str,
+        _args: &[Value],
+        _line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        None
+    }
+
+    fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>> {
+        self.resolutions += 1;
+        Some(Err(NyblError::runtime(
+            format!("runtime host unexpectedly resolved `{name}`"),
+            0,
+        )))
     }
 }
 
@@ -285,4 +312,205 @@ fn callbacks_from_sibling_instances_of_one_artifact_stay_distinct() {
         .call_value(&callback, &[Value::Int(7)], &mut host)
         .unwrap_err();
     assert!(affinity.message.contains("different Nybl engine instance"));
+}
+
+const MODULE_GRAPH_ROOT: &str = r#"
+use left as l
+use right as r
+
+pub fn tick() { return l.next_left() + r.next_right() }
+pub fn make() { return l.make() }
+"#;
+
+fn module_sources() -> BTreeMap<String, String> {
+    [
+        (
+            "left",
+            "use shared as s\nfn next_left() { return s.next() }\nfn make() { return fn(x) { return x + s.current() } }",
+        ),
+        (
+            "right",
+            "use shared as s\nfn next_right() { return s.next() }",
+        ),
+        (
+            "shared",
+            "let count = 0\nfn next() { count += 1; return count }\nfn current() { return count }",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, source)| (name.to_string(), source.to_string()))
+    .collect()
+}
+
+#[test]
+fn precompiled_transitive_diamond_is_resolved_once_and_shared_across_four_threads() {
+    let sources = module_sources();
+    let resolutions = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+    let resolution_counts = Arc::clone(&resolutions);
+    let program = CompiledScript::compile_with_modules(MODULE_GRAPH_ROOT, move |path| {
+        *resolution_counts
+            .lock()
+            .unwrap()
+            .entry(path.to_string())
+            .or_default() += 1;
+        sources.get(path).cloned().map(Ok)
+    })
+    .unwrap();
+
+    assert_eq!(
+        *resolutions.lock().unwrap(),
+        BTreeMap::from([
+            ("left".to_string(), 1),
+            ("right".to_string(), 1),
+            ("shared".to_string(), 1),
+        ]),
+        "the diamond dependency must resolve only once at artifact build time"
+    );
+
+    let module_pointers: BTreeMap<String, usize> = ["left", "right", "shared"]
+        .into_iter()
+        .map(|path| {
+            (
+                path.to_string(),
+                program.__module_chunk_ptr(path).unwrap() as usize,
+            )
+        })
+        .collect();
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let program = program.clone();
+            let module_pointers = module_pointers.clone();
+            std::thread::spawn(move || {
+                let mut host = NoResolveHost::default();
+                let mut instance =
+                    NyblInstance::from_compiled(&program, &mut host, &NyblLimits::standard())
+                        .unwrap();
+                for (path, pointer) in module_pointers {
+                    assert_eq!(
+                        instance.__module_chunk_ptr(&path).unwrap() as usize,
+                        pointer,
+                        "module chunks must be shared, not recompiled"
+                    );
+                }
+                let first = instance.call("tick", &[], &mut host).unwrap().inspect();
+                let second = instance.call("tick", &[], &mut host).unwrap().inspect();
+                assert_eq!(
+                    host.resolutions, 0,
+                    "runtime source resolution is forbidden"
+                );
+                (first, second)
+            })
+        })
+        .collect();
+
+    for worker in workers {
+        assert_eq!(worker.join().unwrap(), ("3".to_string(), "7".to_string()));
+    }
+}
+
+#[test]
+fn precompiled_module_state_and_callable_affinity_are_per_instance() {
+    let sources = module_sources();
+    let program = CompiledScript::compile_with_modules(MODULE_GRAPH_ROOT, |path| {
+        sources.get(path).cloned().map(Ok)
+    })
+    .unwrap();
+    let mut host = NoResolveHost::default();
+    let mut first =
+        NyblInstance::from_compiled(&program, &mut host, &NyblLimits::standard()).unwrap();
+    let mut second =
+        NyblInstance::from_compiled(&program, &mut host, &NyblLimits::standard()).unwrap();
+
+    assert_eq!(first.call("tick", &[], &mut host).unwrap().inspect(), "3");
+    assert_eq!(first.call("tick", &[], &mut host).unwrap().inspect(), "7");
+    assert_eq!(
+        second.call("tick", &[], &mut host).unwrap().inspect(),
+        "3",
+        "module globals must start fresh in a sibling instance"
+    );
+
+    let callback = first.call("make", &[], &mut host).unwrap();
+    let affinity = second
+        .call_value(&callback, &[Value::Int(10)], &mut host)
+        .unwrap_err();
+    assert!(affinity.message.contains("different Nybl engine instance"));
+    assert_eq!(host.resolutions, 0);
+}
+
+#[test]
+fn precompiled_cycles_keep_the_runtime_circular_import_diagnostic() {
+    let sources = BTreeMap::from([
+        ("a".to_string(), "use b\nlet a_value = 1".to_string()),
+        ("b".to_string(), "use a\nlet b_value = 2".to_string()),
+    ]);
+    let program =
+        CompiledScript::compile_with_modules("use a", |path| sources.get(path).cloned().map(Ok))
+            .expect("a cyclic graph can be compiled without executing it");
+    let mut host = NoResolveHost::default();
+    let failure = NyblInstance::from_compiled(&program, &mut host, &NyblLimits::standard())
+        .err()
+        .expect("executing the cycle must still fail");
+    assert!(failure.message.contains("Circular import"));
+    assert_eq!(failure.source_context.unwrap().module_path, "b");
+    assert_eq!(host.resolutions, 0);
+}
+
+#[test]
+fn precompiled_module_builtin_usage_is_checked_with_each_instances_limits() {
+    let source = "let value = rand(6)".to_string();
+    let program = CompiledScript::compile_with_modules("use dice", |path| {
+        (path == "dice").then(|| Ok(source.clone()))
+    })
+    .unwrap();
+    let mut host = NoResolveHost::default();
+    assert!(NyblInstance::from_compiled(&program, &mut host, &NyblLimits::standard()).is_ok());
+
+    let denied = NyblLimits::standard().with_disabled_builtins(["rand"]);
+    let failure = NyblInstance::from_compiled(&program, &mut host, &denied)
+        .err()
+        .expect("the module deny list must be enforced per instance");
+    assert!(failure.is_fatal);
+    assert!(
+        failure.message.contains("builtin `rand` is disabled"),
+        "{failure:?}"
+    );
+    assert_eq!(failure.source_context.unwrap().module_path, "dice");
+    assert_eq!(host.resolutions, 0);
+}
+
+#[test]
+fn compile_time_module_diagnostics_keep_the_deepest_source() {
+    let sources = BTreeMap::from([
+        ("outer".to_string(), "use broken".to_string()),
+        ("broken".to_string(), "let nope = (".to_string()),
+    ]);
+    let failure = CompiledScript::compile_with_modules("use outer", |path| {
+        sources.get(path).cloned().map(Ok)
+    })
+    .unwrap_err();
+    let context = failure.source_context.expect("module context");
+    assert_eq!(context.module_path, "broken");
+    assert_eq!(context.source.as_deref(), Some("let nope = ("));
+}
+
+#[test]
+fn precompiled_graph_discovers_lazy_function_uses_and_keeps_runtime_diagnostics() {
+    let program = CompiledScript::compile_with_modules(
+        "pub fn fail() { use lazy as m; return m.fail() }",
+        |path| (path == "lazy").then(|| Ok("fn fail() { return missing_binding }".to_string())),
+    )
+    .unwrap();
+    let mut host = NoResolveHost::default();
+    let mut instance =
+        NyblInstance::from_compiled(&program, &mut host, &NyblLimits::standard()).unwrap();
+    assert_eq!(host.resolutions, 0, "the lazy module has not executed yet");
+
+    let failure = instance.call("fail", &[], &mut host).unwrap_err();
+    let context = failure.source_context.expect("module runtime context");
+    assert_eq!(context.module_path, "lazy");
+    assert_eq!(
+        context.source.as_deref(),
+        Some("fn fail() { return missing_binding }")
+    );
+    assert_eq!(host.resolutions, 0);
 }

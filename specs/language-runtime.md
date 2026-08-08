@@ -150,6 +150,13 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   value methods. Arguments are value-only and host-side effects are outside
   Nybl transaction rollback. Persistent instances retain handle values but do
   not extend the lifetime of the host object used for a call.
+- **RUN-025 — Shared VM module artifacts.** VM embedders may supply an explicit
+  compile-time module resolver to build a complete transitive module graph.
+  Each unique path is resolved, parsed, compiled, validated, and
+  builtin-indexed once. Instances share immutable module chunks but execute
+  fresh module state, retain import idempotency and cycle behavior, enforce
+  their own limits and builtin deny set, and never resolve source through the
+  runtime host. Root-only compiled artifacts retain legacy lazy module loading.
 
 ## Acceptance criteria
 
