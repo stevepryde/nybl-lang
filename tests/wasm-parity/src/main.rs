@@ -12,6 +12,10 @@
 //! each native/wasm transcript. The runner itself uses std only for
 //! stdout and transcript storage; the selected engine feature graph is
 //! what the corpus exercises.
+//! Cargo features stay additive: when `engine-std` and `engine-no-std`
+//! unify, the engines' documented `std`-wins rule applies. CI passes
+//! `--no-default-features --features engine-no-std` for the genuine
+//! no_std/libm graph.
 //!
 //! The corpus is chosen for platform-drift sensitivity: float
 //! arithmetic and formatting, transcendental math builtins
@@ -22,9 +26,6 @@
 //! Program syntax mirrors `nybl-vm/tests/differential.rs`.
 
 use nybl::{NyblError, NyblHost, NyblLimits, Value};
-
-#[cfg(all(feature = "engine-std", feature = "engine-no-std"))]
-compile_error!("select exactly one engine backend feature");
 
 #[cfg(not(any(feature = "engine-std", feature = "engine-no-std")))]
 compile_error!("select one of `engine-std` or `engine-no-std`");
@@ -306,6 +307,24 @@ print(1 == 1, 1 != 2, 3 < 5, 5 >= 6)"#,
     ),
 ];
 
+fn source_for_target<'a>(name: &str, source: &'a str) -> std::borrow::Cow<'a, str> {
+    // Negative-control builds alter one transcendental input only on wasm.
+    // Both engines still parse and execute the same math-sensitive corpus
+    // case; the ordinary transcript comparison must catch the changed result.
+    #[cfg(all(feature = "divergence-probe", target_arch = "wasm32"))]
+    if name == "math_trig" {
+        let perturbed = source.replacen("print(1.tan())", "print(1.125.tan())", 1);
+        assert_ne!(
+            perturbed, source,
+            "math_trig divergence probe no longer matches the corpus"
+        );
+        return std::borrow::Cow::Owned(perturbed);
+    }
+
+    let _ = name;
+    std::borrow::Cow::Borrowed(source)
+}
+
 /// Host that records prints and resolves `use std.*` from the
 /// bundled stdlib. Same shape as the differential-test harness.
 struct RecordHost {
@@ -358,25 +377,13 @@ fn run_engine(
 fn main() {
     for (index, (name, source)) in CORPUS.iter().enumerate() {
         println!("=== [{index}] {name}");
-        run_engine("walker", source, |src, host, limits| {
+        let source = source_for_target(name, source);
+        run_engine("walker", &source, |src, host, limits| {
             nybl::run(src, host, limits)
         });
-        run_engine("vm", source, |src, host, limits| {
+        run_engine("vm", &source, |src, host, limits| {
             nybl_vm::run(src, host, limits)
         });
     }
     println!("=== end ({} programs)", CORPUS.len());
-
-    // CI enables this only for a negative-control run. A target-specific
-    // marker proves the byte comparison detects an intentional divergence;
-    // it is never present in either production parity transcript.
-    #[cfg(feature = "divergence-probe")]
-    println!(
-        "=== divergence-probe: {}",
-        if cfg!(target_arch = "wasm32") {
-            "wasm"
-        } else {
-            "native"
-        }
-    );
 }

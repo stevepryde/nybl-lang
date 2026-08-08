@@ -17,8 +17,10 @@
   `--no-default-features --features no_std`.
 - **Workspace:** Cargo workspace containing `nybl`, `nybl-vm`, `nybl-compile`,
   `nybl-sys`, and `nybl-cli`, plus the non-published
-  `nybl-rust-embedding-examples` integration fixture; manifests and
-  `Cargo.lock` own exact versions.
+  `nybl-rust-embedding-examples`, `nybl-wasm-clock-smoke`, and
+  `nybl-wasm-parity` integration fixtures; manifests and `Cargo.lock` own
+  exact versions. The wasm fixtures runtime-check the freestanding clock
+  error and native-to-WASI execution parity respectively.
 - **Testing:** Cargo unit/integration tests plus VM differential and AOT
   three-way suites. `cargo clippy --workspace --all-targets` is the code-health
   target, and the explicit Rust 1.88 command above is the release MSRV gate.

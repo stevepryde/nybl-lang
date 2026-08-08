@@ -67,7 +67,9 @@ jobs:
             # wasm32-unknown-unknown because the harness needs stdout;
             # both targets share the wasm32 data layout, and the
             # compile checks above still cover wasm32-unknown-unknown.
-            - run: rustup target add wasm32-wasip1
+            # Jobs are isolated, so install both execution targets here even
+            # though check-wasm installed wasm32-unknown-unknown separately.
+            - run: rustup target add wasm32-wasip1 wasm32-unknown-unknown
             - uses: bytecodealliance/actions/wasmtime/setup@v1
               with:
                   version: "v27.0.0"
@@ -88,8 +90,8 @@ jobs:
             - run: cargo build -p nybl-wasm-parity --bin wasm_parity --release --target wasm32-wasip1 --no-default-features --features engine-no-std
             - run: wasmtime target/wasm32-wasip1/release/wasm_parity.wasm > no-std-wasm.txt
             - run: cmp no-std-native.txt no-std-wasm.txt
-            # Negative control: an opt-in target marker must make the same
-            # comparison differ, proving the parity check is sensitive.
+            # Negative control: alter one transcendental corpus input on wasm
+            # and prove the ordinary transcript comparison catches the result.
             - run: cargo run -p nybl-wasm-parity --bin wasm_parity --release --no-default-features --features engine-no-std,divergence-probe > probe-native.txt
             - run: cargo build -p nybl-wasm-parity --bin wasm_parity --release --target wasm32-wasip1 --no-default-features --features engine-no-std,divergence-probe
             - run: wasmtime target/wasm32-wasip1/release/wasm_parity.wasm > probe-wasm.txt

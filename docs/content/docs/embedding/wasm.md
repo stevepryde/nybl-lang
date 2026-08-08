@@ -134,8 +134,9 @@ Two CI jobs keep the wasm surface from regressing:
   `wasm32-wasip1`, and byte-compares the transcripts in **both** feature
   configurations: default `std` (platform math) and defaults-off `no_std`
   (pure-Rust `libm`), with `nybl-std` enabled in both so the corpus can use
-  bundled modules. Any native/wasm difference fails CI. An opt-in
-  target-specific marker supplies a negative control: CI also verifies that
-  the comparison rejects that deliberate divergence. Parity executes on
+  bundled modules. Any native/wasm difference fails CI. An opt-in negative
+  control perturbs one transcendental Nybl input on wasm: CI also verifies
+  that the same comparison rejects the resulting math-output divergence.
+  Parity executes on
   `wasm32-wasip1` because the std runner needs stdout; the engine libraries
   themselves are separately compile-checked for `wasm32-unknown-unknown`.
