@@ -34,3 +34,10 @@ no_std = ["nybl/no_std"]
 # default `NyblHost::resolve_module` path resolves `std.*`
 # correctly.
 nybl-std = ["nybl/nybl-std"]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "embedding"
+harness = false

@@ -17,6 +17,15 @@ jobs:
             - uses: actions/checkout@v4
             - run: cargo test --all
 
+    bench-smoke:
+        name: Bench smoke (embedding)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            # Criterion's --test mode runs each benchmark body once with
+            # no measurement, so the suite can't rot without failing CI.
+            - run: cargo bench -p nybl-vm --bench embedding -- --test
+
     check-no-std:
         name: Check (no-std)
         runs-on: ubuntu-latest
