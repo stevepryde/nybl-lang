@@ -26,6 +26,7 @@ fn bench_limits() -> NyblLimits {
     NyblLimits {
         max_steps: 100_000_000,
         max_memory: 100 * 1024 * 1024,
+        ..NyblLimits::standard()
     }
 }
 
