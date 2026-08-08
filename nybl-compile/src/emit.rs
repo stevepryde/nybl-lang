@@ -4994,9 +4994,9 @@ fn __nybl_preflight_active_function_call(
     name: &str,
     actual_modes: &[::nybl::parser::ParamMode],
     line: u32,
-) -> Result<(), ::nybl::error::NyblError> {
+) -> Result<bool, ::nybl::error::NyblError> {
     if __nybl_binding_value(ctx, module_path, name).is_some() {
-        return Ok(());
+        return Ok(true);
     }
     if let ::std::option::Option::Some(site_id) = ctx
         .active_function_sites
@@ -5005,8 +5005,9 @@ fn __nybl_preflight_active_function_call(
         .copied()
     {
         __nybl_preflight_function_site_call(site_id, actual_modes, line)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 fn __nybl_active_ref_function_site(
@@ -6779,27 +6780,31 @@ fn __nybl_function_site_value(
             .collect::<Vec<_>>()
             .join(", ");
         // Named function calls validate the selected declaration before
-        // evaluating arguments. Correct-arity calls still evaluate their
-        // arguments before host dispatch, preserving host precedence.
+        // evaluating arguments. Executed lexical declarations shadow engine
+        // builtins while preserving host-before-named-function precedence.
+        let builtin_preflight = Self::builtin_arity_preflight_src(name, args.len(), line);
         let preflight = if exact_site.is_some() {
             String::new()
         } else if let Some(site) = self.native_static_function_site(name) {
-            if args.len() == self.functions.sites[site].params.len() {
+            let active_preflight = if args.len() == self.functions.sites[site].params.len() {
                 String::new()
             } else {
                 format!(
-                    "if ctx.reached_function_sites[{site}] {{ {}; }} ",
+                    "{};",
                     self.function_site_arity_error_src(site, args.len(), line)
                 )
-            }
+            };
+            format!(
+                "if ctx.reached_function_sites[{site}] {{ {active_preflight} }} else {{ {builtin_preflight} }} "
+            )
         } else if self.fn_info.all_fns.contains(name) {
             format!(
-                "__nybl_preflight_active_function_call(ctx, {module}, {name}, &[{actual_modes}], {line})?; ",
+                "if !__nybl_preflight_active_function_call(ctx, {module}, {name}, &[{actual_modes}], {line})? {{ {builtin_preflight} }} ",
                 module = rust_string_literal(&self.current_module),
                 name = rust_string_literal(name),
             )
         } else {
-            String::new()
+            builtin_preflight
         };
 
         // Evaluate args into locals up-front so the resulting block
@@ -6846,14 +6851,8 @@ fn __nybl_function_site_value(
         // sites, instead of the builtin call. Value bindings were
         // already handled above, so reaching this point with a
         // builtin name means builtin dispatch.
-        if nybl::check::ENGINE_BUILTINS.contains(&name)
-            && self.opts.disabled_builtins.contains(name)
-        {
-            return Ok(format!(
-                "return ::std::result::Result::Err(::nybl::check::disabled_builtin_error({}, {line}))",
-                rust_string_literal(name),
-            ));
-        }
+        let disabled_builtin = nybl::check::ENGINE_BUILTINS.contains(&name)
+            && self.opts.disabled_builtins.contains(name);
 
         let mut body = match name {
             "print" => {
@@ -6979,11 +6978,36 @@ fn __nybl_function_site_value(
             }
         };
 
+        if disabled_builtin {
+            body = format!(
+                "return ::std::result::Result::Err(::nybl::check::disabled_builtin_error({}, {line}))",
+                rust_string_literal(name),
+            );
+        }
+
         let args_vec = if arg_names.is_empty() {
             "::std::vec::Vec::<::nybl::value::Value>::new()".to_string()
         } else {
             format!("::std::vec![{}]", arg_names.join(", "))
         };
+        if self.fn_info.all_fns.contains(name) {
+            let active_call = if self.opts.sandbox {
+                format!(
+                    "{{ let __args = {args_vec}; match __nybl_host_call(ctx, {name_lit}, &__args, {line}) {{ ::std::option::Option::Some(__result) => __result?, ::std::option::Option::None => __nybl_call_function_site(ctx, __site, __args, {line})?, }} }}",
+                    name_lit = rust_string_literal(name),
+                )
+            } else {
+                format!(
+                    "{{ let __args = {args_vec}; match ctx.host.call({name_lit}, &__args, {line}) {{ ::std::option::Option::Some(__result) => __result?, ::std::option::Option::None => __nybl_call_function_site(ctx, __site, __args, {line})?, }} }}",
+                    name_lit = rust_string_literal(name),
+                )
+            };
+            body = format!(
+                "match ctx.active_function_sites.get(&({module}.to_string(), {name_lit}.to_string())).or_else(|| ctx.module_imported_function_sites.get(&({module}.to_string(), {name_lit}.to_string()))).copied() {{ ::std::option::Option::Some(__site) => {active_call}, ::std::option::Option::None => {{ {body} }}, }}",
+                module = rust_string_literal(&self.current_module),
+                name_lit = rust_string_literal(name),
+            );
+        }
         // The rebinding probe is only semantically meaningful for names some
         // top-level `let` or import in this module could ever shadow. Every
         // other call — builtins in import-free programs, user fns nothing
@@ -7018,6 +7042,33 @@ fn __nybl_function_site_value(
         }
 
         Ok(format!("{{ {preflight}{arg_lets}{body} }}"))
+    }
+
+    /// Walker and VM reject an engine builtin's arity before evaluating any
+    /// argument expressions. AOT must emit that same preflight whenever no
+    /// reached lexical declaration has taken over the builtin name.
+    fn builtin_arity_preflight_src(name: &str, count: usize, line: u32) -> String {
+        let expected = match name {
+            "rand" | "try_call" | "panic" => Some((1, 1)),
+            "range" => Some((1, 3)),
+            "print" => None,
+            _ => return String::new(),
+        };
+        let Some((min, max)) = expected else {
+            return String::new();
+        };
+        if (min..=max).contains(&count) {
+            return String::new();
+        }
+        let expectation = if min == max {
+            format!("{min} argument{}", if min == 1 { "" } else { "s" })
+        } else {
+            format!("{min} to {max} arguments")
+        };
+        format!(
+            "return Err(::nybl::error::NyblError::runtime({}, {line}));",
+            rust_string_literal(&format!("`{name}` expects {expectation}, but got {count}")),
+        )
     }
 
     fn array_src(&mut self, items: &[Expr], line: u32) -> Result<String, NyblError> {

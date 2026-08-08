@@ -2796,13 +2796,44 @@ fn let_bound_rand_shadows_the_disabled_builtin_diff() {
 }
 
 #[test]
-fn fn_declaration_of_a_disabled_builtin_name_is_rejected_at_load_diff() {
-    // Unlike a `let` binding, a `fn` declaration does not shadow a
-    // builtin for direct calls in every engine, so the only
-    // parity-preserving semantics is to reject the program up front.
+fn fn_declaration_shadows_a_disabled_builtin_diff() {
     let out = run_both("fn rand(n) { return n }\nprint(rand(10))", &no_rand());
+    assert!(out.is_ok(), "unexpected error: {:?}", out.error);
+    assert_eq!(out.prints, vec!["10"]);
+}
+
+#[test]
+fn disabled_builtin_called_before_shadowing_fn_hits_runtime_backstop_diff() {
+    let out = run_both("rand(10)\nfn rand(n) { return n }", &no_rand());
     assert_eq!(out.error.as_deref(), Some(RAND_DISABLED));
-    assert!(out.prints.is_empty());
+}
+
+#[test]
+fn function_declarations_shadow_every_engine_builtin_diff() {
+    for (source, expected) in [
+        ("fn range(n) { return [41] }\nprint(range(3)[0])", "41"),
+        ("fn rand(n) { return 42 }\nprint(rand(10))", "42"),
+        (
+            "fn try_call(f) { return 43 }\nprint(try_call(fn() { return 1 }))",
+            "43",
+        ),
+        ("fn panic(message) { return 44 }\nprint(panic(\"x\"))", "44"),
+    ] {
+        let out = run_both(source, &standard());
+        assert!(
+            out.is_ok(),
+            "unexpected error for {source}: {:?}",
+            out.error
+        );
+        assert_eq!(out.prints, vec![expected], "source: {source}");
+    }
+
+    let out = run_both(
+        "fn print(value) { return value }\nlet hidden = print(45)",
+        &standard(),
+    );
+    assert!(out.is_ok(), "unexpected error: {:?}", out.error);
+    assert!(out.prints.is_empty(), "user `print` must suppress output");
 }
 
 #[test]

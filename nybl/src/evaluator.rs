@@ -4236,6 +4236,17 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         line: u32,
         resolved_function: Option<FunctionDefinition>,
     ) -> Result<Value, NyblError> {
+        // Executed lexical function declarations shadow engine builtins while
+        // preserving the established host-before-named-function precedence.
+        // Direct-call classification passes the canonical declaration here,
+        // avoiding a second lookup.
+        if let Some(func) = resolved_function {
+            if let Some(result) = self.host.call(name, &args, line) {
+                return result;
+            }
+            return self.call_nybl_fn(&func, args, line);
+        }
+
         // 1. Global builtins. The short list: anything variadic
         // (`print`), a collection constructor (`range`), session-
         // stateful (`rand`), or inherently takes a callable
@@ -4277,32 +4288,29 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             return result;
         }
 
-        // 3. User-defined functions. Direct-call classification passes its
-        // already-resolved canonical callable here, avoiding a second lookup.
-        // Builtin-only paths resolve lazily after host dispatch.
-        let func = resolved_function
-            .or_else(|| self.lookup_function(name))
-            .ok_or_else(|| {
-                // Preference order: "did you mean" suggestion first
-                // (most specific to the user's typo), then the
-                // host's generic function hint (embedder-specific
-                // tips like "available host functions: …"), then a
-                // bare error.
-                if let Some(hint) = self.callable_candidates_hint(name) {
-                    error_with_hint(line, crate::error_messages::function_not_found(name), hint)
+        // 3. A dynamically published/imported user function not classified
+        // by the direct-call path above.
+        let func = self.lookup_function(name).ok_or_else(|| {
+            // Preference order: "did you mean" suggestion first
+            // (most specific to the user's typo), then the
+            // host's generic function hint (embedder-specific
+            // tips like "available host functions: …"), then a
+            // bare error.
+            if let Some(hint) = self.callable_candidates_hint(name) {
+                error_with_hint(line, crate::error_messages::function_not_found(name), hint)
+            } else {
+                let host_hint = self.host.function_hint().to_string();
+                if host_hint.is_empty() {
+                    error(line, crate::error_messages::function_not_found(name))
                 } else {
-                    let host_hint = self.host.function_hint().to_string();
-                    if host_hint.is_empty() {
-                        error(line, crate::error_messages::function_not_found(name))
-                    } else {
-                        error_with_hint(
-                            line,
-                            crate::error_messages::function_not_found(name),
-                            host_hint,
-                        )
-                    }
+                    error_with_hint(
+                        line,
+                        crate::error_messages::function_not_found(name),
+                        host_hint,
+                    )
                 }
-            })?;
+            }
+        })?;
 
         self.call_nybl_fn(&func, args, line)
     }
@@ -5255,6 +5263,90 @@ impl ReplSession {
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn prepared_entry_target(&self, name: &str) -> Option<Rc<NyblFn>> {
+        self.abi_declarations
+            .iter()
+            .find(|(entry_name, visibility, _)| {
+                entry_name == name && *visibility == Visibility::Public
+            })
+            .map(|(_, _, target)| Rc::clone(target))
+    }
+
+    pub(crate) fn call_prepared_in<H: NyblHost + ?Sized>(
+        &mut self,
+        target: &Rc<NyblFn>,
+        args: &[Value],
+        host: &mut H,
+        limits: &NyblLimits,
+        memory: &crate::memory::MemoryContext,
+    ) -> Result<Value, NyblError> {
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let result = eval
+            .call_nybl_fn_with_refs(target, args.to_vec(), &[], 0)
+            .map(|(value, _)| value);
+        write_runtime_warnings(&mut eval.runtime_warnings);
+        self.put_evaluator(eval);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_prepared_batch_in<H, A>(
+        &mut self,
+        target: &Rc<NyblFn>,
+        name: &str,
+        arity: usize,
+        variadic: bool,
+        calls: &[A],
+        host: &mut H,
+        limits: &NyblLimits,
+        memory: &crate::memory::MemoryContext,
+    ) -> Result<Vec<Value>, NyblError>
+    where
+        H: NyblHost + ?Sized,
+        A: AsRef<[Value]>,
+    {
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let mut values = Vec::with_capacity(calls.len());
+        let result = (|| {
+            for call in calls {
+                let args = call.as_ref();
+                let accepts_arity = if variadic {
+                    args.len() >= arity
+                } else {
+                    args.len() == arity
+                };
+                if !accepts_arity {
+                    return Err(error(
+                        0,
+                        if variadic {
+                            format!(
+                                "`{name}` expects at least {arity} arguments, but got {}",
+                                args.len()
+                            )
+                        } else {
+                            format!(
+                                "`{name}` expects {arity} argument{}, but got {}",
+                                if arity == 1 { "" } else { "s" },
+                                args.len()
+                            )
+                        },
+                    ));
+                }
+                eval.steps = 0;
+                debug_assert_eq!(eval.call_depth, 0);
+                let value = eval
+                    .call_nybl_fn_with_refs(target, args.to_vec(), &[], 0)
+                    .map(|(value, _)| value);
+                write_runtime_warnings(&mut eval.runtime_warnings);
+                values.push(value?);
+            }
+            Ok(values)
+        })();
+        write_runtime_warnings(&mut eval.runtime_warnings);
+        self.put_evaluator(eval);
+        result
     }
 
     pub(crate) fn call_named<H: NyblHost + ?Sized>(

@@ -170,6 +170,55 @@ Use `compile` plus `execute` when you want to reuse bytecode but intentionally
 start with fresh program state on every execution. Use `NyblInstance` when the
 state itself must persist.
 
+## Prepared and batched dispatch
+
+The walker and VM can resolve a hot public entry once and reuse the opaque
+handle. The handle is bound to the exact instance that created it:
+
+```rust
+let tick = instance.prepare_entry("tick")?;
+
+// Drop-in fast path for an existing per-entity loop.
+let value = instance.call_prepared(&tick, &[Value::Int(entity_id)], &mut host)?;
+
+// Host-side batch: one live evaluator/VM, ordered calls and results.
+let calls = [
+    [Value::Int(0)],
+    [Value::Int(1)],
+    [Value::Int(2)],
+];
+let values = instance.call_batch(&tick, &calls, &mut host)?;
+```
+
+`prepare_entry` rejects `ref`-bearing entries because host values do not name
+Nybl bindings. `call_prepared` and `call_batch` reject a handle created by a
+different instance, even if both instances loaded identical source.
+
+`call_batch` preserves repeated-`call` semantics: items run in order, each item
+gets a fresh step and call-depth budget, tracked memory remains persistent, and
+the first error stops the batch. Mutations and host effects from completed
+items remain visible. The host is borrowed once for the operation and is never
+retained. This is why prepared dispatch does not cache host-specific numeric
+function IDs: a later operation may deliberately supply a different compatible
+host.
+
+For the lowest dispatch overhead, expose a script-level batch entry and loop in
+Nybl. It keeps one Nybl function frame for the whole shard while retaining the
+same host calls:
+
+```nybl
+pub fn tick_batch(entity_count) {
+  for entity_id in range(entity_count) {
+    // Read fields, update state, and queue commands for entity_id.
+  }
+}
+```
+
+A script-level batch is one Nybl call, so `max_steps` applies to the complete
+batch. Size that budget for the maximum accepted shard; the batch cannot reset
+or evade it. Use host-side `call_batch` when every entity must instead receive
+the same independent per-call budget as `call`.
+
 ## Compile once, instantiate many
 
 `NyblInstance::load` parses, compiles, and executes in one step. When a host

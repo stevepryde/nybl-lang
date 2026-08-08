@@ -145,4 +145,4 @@ pub use chunk::{
 pub use compiler::compile;
 pub use disasm::disassemble;
 pub use validate::validate_chunk;
-pub use vm::{CompiledScript, NyblInstance, Vm, execute, run};
+pub use vm::{CompiledScript, NyblInstance, PreparedEntry, Vm, execute, run};

@@ -157,6 +157,19 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   fresh module state, retain import idempotency and cycle behavior, enforce
   their own limits and builtin deny set, and never resolve source through the
   runtime host. Root-only compiled artifacts retain legacy lazy module loading.
+- **RUN-026 — Lexical callable shadowing.** A value binding or executed user
+  function declaration shadows an engine builtin of the same name in the
+  walker, VM, and AOT engines. Function declarations remain source ordered: a
+  call before the declaration executes still reaches the builtin. A disabled
+  builtin is rejected only when dispatch would actually reach that builtin;
+  lexical replacements with the same spelling remain valid.
+- **RUN-027 — Prepared and batch dispatch.** Walker and VM instances may
+  pre-resolve a public value-only entry into an opaque instance-affine handle.
+  Prepared calls preserve ordinary instance behavior. Host-side batches run in
+  order, stop on first error, keep completed effects, reset step/call-depth
+  accounting per item, retain persistent memory accounting, and enforce the
+  existing same-instance re-entry fence. Script-level batches are one call and
+  apply one step budget to the complete batch.
 
 ## Acceptance criteria
 
@@ -238,6 +251,13 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   user-defined `ref self` commit/rollback, invalid and duplicate receiver
   fences, receiver-plus-ref-argument atomicity, and value-receiver mutation
   diagnostics.
+- **AC-RUN-018:** Differential and native AOT tests cover user function
+  shadowing for all five engine builtins, including source-order and disabled
+  builtin behavior.
+- **AC-RUN-019:** Walker and VM instance tests cover prepared-entry affinity,
+  value-only/ref fences, arity, retained state, ordered batch failure, and
+  per-item step resets. Embedding benchmarks compare ordinary, prepared,
+  host-side batch, and script-level batch dispatch on the same host workload.
 
 ## Design notes
 

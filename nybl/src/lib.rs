@@ -208,7 +208,7 @@ mod evaluator;
 
 pub use error::NyblError;
 pub use error::NyblWarning;
-pub use instance::{EntryPoint, NyblInstance};
+pub use instance::{EntryPoint, NyblInstance, PreparedEntry};
 pub use parser::{ParamMode, Stmt, count_instructions};
 pub use ref_params::{validate_call_modes, validate_value_only_call_modes};
 pub use value::{HostValue, Value};

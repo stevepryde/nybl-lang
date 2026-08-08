@@ -16,21 +16,20 @@
 //! treated as a builtin reference unless the program can bind that name
 //! to a value: a `let`/`const` of the name, a function/method/lambda
 //! parameter, a `for`-loop variable, a match-arm binding, a selective
-//! import (`use m.{name}`), a module alias (`use m as name`), or any
-//! glob import (`use m` — its exports are unknowable statically). All
-//! engines dispatch a lexically bound value before consulting builtins,
-//! so a bound name never reaches the builtin.
+//! import (`use m.{name}`), a module alias (`use m as name`), any glob
+//! import (`use m` — its exports are unknowable statically), or a `fn`
+//! declaration. All engines dispatch a lexical value or executed function
+//! declaration before consulting builtins, so a bound name never reaches the
+//! builtin.
 //!
 //! The suppression is deliberately file-coarse (a binding anywhere in
 //! the AST suppresses the name everywhere in that AST) rather than
-//! scope-precise. Precision would require replicating each engine's
+//! scope- or source-order-precise. Precision would require replicating each engine's
 //! capture and visibility rules; coarseness only delays the diagnostic
 //! from load time to the runtime backstop, and both fire the same fatal
-//! error. Note that a `fn name(...)` *declaration* does not suppress the
-//! check: engines do not agree today on whether a user `fn` of a builtin
-//! name shadows the builtin for direct calls (walker and AOT dispatch
-//! the builtin; the VM dispatches the user fn), so the only
-//! parity-preserving choice is to reject the program up front.
+//! error. A `fn name(...)` declaration suppresses the coarse load-time check;
+//! if execution calls the name before reaching that declaration, the runtime
+//! backstop rejects the actual disabled-builtin dispatch.
 //!
 //! # Split for compiled artifacts
 //!
@@ -204,10 +203,14 @@ impl UsageCollector {
                     self.walk_expr(iterable);
                     self.walk_stmts(body);
                 }
-                // The declared fn *name* is deliberately not a binding —
-                // see the module docs.
-                StmtKind::FnDecl { params, body, .. }
-                | StmtKind::MethodDecl { params, body, .. } => {
+                StmtKind::FnDecl {
+                    name, params, body, ..
+                } => {
+                    self.bind(name);
+                    self.bind_params(params);
+                    self.walk_stmts(body);
+                }
+                StmtKind::MethodDecl { params, body, .. } => {
                     self.bind_params(params);
                     self.walk_stmts(body);
                 }
@@ -361,11 +364,9 @@ mod tests {
     }
 
     #[test]
-    fn fn_declarations_do_not_suppress() {
-        // Engines disagree on user-fn-vs-builtin priority for direct
-        // calls, so a `fn rand` must still flag the call.
+    fn fn_declarations_suppress_the_coarse_load_time_check() {
         let map = usage("fn rand(n) { return n }\nlet x = rand(1)");
-        assert_eq!(map.get("rand"), Some(&2));
+        assert_eq!(map.get("rand"), None);
     }
 
     #[test]

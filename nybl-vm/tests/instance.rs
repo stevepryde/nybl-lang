@@ -254,6 +254,334 @@ fn step_budget_resets_for_each_call() {
     );
 }
 
+#[test]
+fn prepared_and_batch_calls_preserve_state_limits_and_affinity() {
+    let limits = NyblLimits {
+        max_steps: 20,
+        max_memory: 1024 * 1024,
+        ..NyblLimits::standard()
+    };
+    let source = "let total = 0\npub fn work(n) { repeat 5 { total += 1 }; total += n; return total }\npub fn read() { return total }";
+    let mut host = Host;
+    let mut instance = NyblInstance::load(source, &mut host, &limits).unwrap();
+    let work = instance.prepare_entry("work").unwrap();
+    assert_eq!(work.name(), "work");
+    assert_eq!(work.arity(), 1);
+    assert!(!work.is_variadic());
+    assert_eq!(
+        instance
+            .call_prepared(&work, &[Value::Int(1)], &mut host)
+            .unwrap()
+            .inspect(),
+        "6"
+    );
+    let calls = [[Value::Int(2)], [Value::Int(3)]];
+    let values = instance.call_batch(&work, &calls, &mut host).unwrap();
+    assert_eq!(
+        values.iter().map(Value::inspect).collect::<Vec<_>>(),
+        ["13", "21"]
+    );
+
+    let mut other = NyblInstance::load(source, &mut host, &limits).unwrap();
+    let error = other
+        .call_prepared(&work, &[Value::Int(1)], &mut host)
+        .unwrap_err();
+    assert!(error.message.contains("different Nybl engine instance"));
+}
+
+#[test]
+fn batch_stops_on_error_and_keeps_prior_mutations() {
+    let mut host = Host;
+    let mut instance = NyblInstance::load(
+        "let total = 0\npub fn add(n) { total += n; if n == 2 { panic(\"stop\") }; return total }\npub fn read() { return total }",
+        &mut host,
+        &NyblLimits::standard(),
+    )
+    .unwrap();
+    let add = instance.prepare_entry("add").unwrap();
+    let calls = [[Value::Int(1)], [Value::Int(2)], [Value::Int(4)]];
+    assert_eq!(
+        instance
+            .call_batch(&add, &calls, &mut host)
+            .unwrap_err()
+            .message,
+        "stop"
+    );
+    assert_eq!(
+        instance.call("read", &[], &mut host).unwrap().inspect(),
+        "3"
+    );
+}
+
+#[test]
+fn batch_retains_persistent_memory_accounting() {
+    let limits = NyblLimits {
+        max_steps: 100,
+        max_memory: 64,
+        ..NyblLimits::standard()
+    };
+    let mut host = Host;
+    let mut instance = NyblInstance::load(
+        "let values = []\npub fn keep(value) { values.push(value); return values.len() }",
+        &mut host,
+        &limits,
+    )
+    .unwrap();
+    let keep = instance.prepare_entry("keep").unwrap();
+    let calls = (0..32).map(|n| [Value::Int(n)]).collect::<Vec<_>>();
+    let error = instance.call_batch(&keep, &calls, &mut host).unwrap_err();
+    assert!(error.is_fatal);
+    assert!(error.message.contains("Memory limit"));
+}
+
+struct ValueHost {
+    value: i64,
+    seen: Vec<i64>,
+}
+
+impl NyblHost for ValueHost {
+    fn call(&mut self, name: &str, args: &[Value], line: u32) -> Option<Result<Value, NyblError>> {
+        match name {
+            "host_value" => Some(Ok(Value::Int(self.value))),
+            "observe" => Some(match args {
+                [Value::Int(value)] => {
+                    self.seen.push(*value);
+                    Ok(Value::Int(*value))
+                }
+                _ => Err(NyblError::runtime("observe expects one Int", line)),
+            }),
+            _ => None,
+        }
+    }
+}
+
+#[test]
+fn prepared_entries_do_not_cache_host_specific_dispatch() {
+    let source = "pub fn read() { return host_value() }";
+    let limits = NyblLimits::standard();
+
+    let mut walker_host_a = ValueHost {
+        value: 11,
+        seen: Vec::new(),
+    };
+    let mut walker = nybl::NyblInstance::load(source, &mut walker_host_a, &limits).unwrap();
+    let walker_entry = walker.prepare_entry("read").unwrap();
+    assert_eq!(
+        walker
+            .call_prepared(&walker_entry, &[], &mut walker_host_a)
+            .unwrap()
+            .inspect(),
+        "11"
+    );
+    let mut walker_host_b = ValueHost {
+        value: 22,
+        seen: Vec::new(),
+    };
+    assert_eq!(
+        walker
+            .call_batch(&walker_entry, &[Vec::<Value>::new()], &mut walker_host_b)
+            .unwrap()[0]
+            .inspect(),
+        "22"
+    );
+
+    let mut vm_host_a = ValueHost {
+        value: 33,
+        seen: Vec::new(),
+    };
+    let mut vm = NyblInstance::load(source, &mut vm_host_a, &limits).unwrap();
+    let vm_entry = vm.prepare_entry("read").unwrap();
+    assert_eq!(
+        vm.call_prepared(&vm_entry, &[], &mut vm_host_a)
+            .unwrap()
+            .inspect(),
+        "33"
+    );
+    let mut vm_host_b = ValueHost {
+        value: 44,
+        seen: Vec::new(),
+    };
+    assert_eq!(
+        vm.call_batch(&vm_entry, &[Vec::<Value>::new()], &mut vm_host_b)
+            .unwrap()[0]
+            .inspect(),
+        "44"
+    );
+}
+
+#[test]
+fn batch_matches_repeated_calls_for_results_state_and_host_effects() {
+    let source = "let total = 0\npub fn step(n) { total += observe(n); return total }\npub fn read() { return total }";
+    let calls = vec![
+        vec![Value::Int(2)],
+        vec![Value::Int(3)],
+        vec![Value::Int(5)],
+    ];
+    let limits = NyblLimits::standard();
+
+    let mut walker_repeated_host = ValueHost {
+        value: 0,
+        seen: Vec::new(),
+    };
+    let mut walker_repeated =
+        nybl::NyblInstance::load(source, &mut walker_repeated_host, &limits).unwrap();
+    let walker_repeated_values = calls
+        .iter()
+        .map(|args| {
+            walker_repeated
+                .call("step", args, &mut walker_repeated_host)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let walker_repeated_final = walker_repeated
+        .call("read", &[], &mut walker_repeated_host)
+        .unwrap();
+
+    let mut walker_batch_host = ValueHost {
+        value: 0,
+        seen: Vec::new(),
+    };
+    let mut walker_batch =
+        nybl::NyblInstance::load(source, &mut walker_batch_host, &limits).unwrap();
+    let walker_entry = walker_batch.prepare_entry("step").unwrap();
+    let walker_batch_values = walker_batch
+        .call_batch(&walker_entry, &calls, &mut walker_batch_host)
+        .unwrap();
+    let walker_batch_final = walker_batch
+        .call("read", &[], &mut walker_batch_host)
+        .unwrap();
+    assert_eq!(
+        walker_batch_values
+            .iter()
+            .map(Value::inspect)
+            .collect::<Vec<_>>(),
+        walker_repeated_values
+            .iter()
+            .map(Value::inspect)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        walker_batch_final.inspect(),
+        walker_repeated_final.inspect()
+    );
+    assert_eq!(walker_batch_host.seen, walker_repeated_host.seen);
+
+    let mut vm_repeated_host = ValueHost {
+        value: 0,
+        seen: Vec::new(),
+    };
+    let mut vm_repeated = NyblInstance::load(source, &mut vm_repeated_host, &limits).unwrap();
+    let vm_repeated_values = calls
+        .iter()
+        .map(|args| {
+            vm_repeated
+                .call("step", args, &mut vm_repeated_host)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let vm_repeated_final = vm_repeated
+        .call("read", &[], &mut vm_repeated_host)
+        .unwrap();
+
+    let mut vm_batch_host = ValueHost {
+        value: 0,
+        seen: Vec::new(),
+    };
+    let mut vm_batch = NyblInstance::load(source, &mut vm_batch_host, &limits).unwrap();
+    let vm_entry = vm_batch.prepare_entry("step").unwrap();
+    let vm_batch_values = vm_batch
+        .call_batch(&vm_entry, &calls, &mut vm_batch_host)
+        .unwrap();
+    let vm_batch_final = vm_batch.call("read", &[], &mut vm_batch_host).unwrap();
+    assert_eq!(
+        vm_batch_values
+            .iter()
+            .map(Value::inspect)
+            .collect::<Vec<_>>(),
+        vm_repeated_values
+            .iter()
+            .map(Value::inspect)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(vm_batch_final.inspect(), vm_repeated_final.inspect());
+    assert_eq!(vm_batch_host.seen, vm_repeated_host.seen);
+}
+
+#[test]
+fn preparing_ref_entry_is_rejected_before_execution() {
+    let mut host = Host;
+    let instance = NyblInstance::load(
+        "pub fn update(ref value) { value = 2 }",
+        &mut host,
+        &NyblLimits::standard(),
+    )
+    .unwrap();
+    let error = instance.prepare_entry("update").unwrap_err();
+    assert!(error.message.contains("cannot be called from the host"));
+}
+
+#[test]
+fn prepared_batches_are_deterministic_across_walker_and_vm() {
+    let source = "pub fn roll(n) { return rand(n) }";
+    let calls = [
+        [Value::Int(100)],
+        [Value::Int(100)],
+        [Value::Int(100)],
+        [Value::Int(100)],
+    ];
+    let limits = NyblLimits::standard();
+
+    let mut walker_host = Host;
+    let mut walker = nybl::NyblInstance::load(source, &mut walker_host, &limits).unwrap();
+    let walker_entry = walker.prepare_entry("roll").unwrap();
+    let walker_values = walker
+        .call_batch(&walker_entry, &calls, &mut walker_host)
+        .unwrap();
+
+    let mut vm_host = Host;
+    let mut vm = NyblInstance::load(source, &mut vm_host, &limits).unwrap();
+    let vm_entry = vm.prepare_entry("roll").unwrap();
+    let vm_values = vm.call_batch(&vm_entry, &calls, &mut vm_host).unwrap();
+
+    assert_eq!(
+        walker_values.iter().map(Value::inspect).collect::<Vec<_>>(),
+        vm_values.iter().map(Value::inspect).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn prepared_variadic_entries_keep_minimum_arity_across_engines() {
+    let source = "pub fn collect(first, ..rest) { return rest.len() }";
+    let calls = vec![
+        vec![Value::Int(1)],
+        vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+    ];
+    let limits = NyblLimits::standard();
+
+    let mut walker_host = Host;
+    let mut walker = nybl::NyblInstance::load(source, &mut walker_host, &limits).unwrap();
+    let walker_entry = walker.prepare_entry("collect").unwrap();
+    assert_eq!(walker_entry.arity(), 1);
+    assert!(walker_entry.is_variadic());
+    let walker_values = walker
+        .call_batch(&walker_entry, &calls, &mut walker_host)
+        .unwrap();
+
+    let mut vm_host = Host;
+    let mut vm = NyblInstance::load(source, &mut vm_host, &limits).unwrap();
+    let vm_entry = vm.prepare_entry("collect").unwrap();
+    let vm_values = vm.call_batch(&vm_entry, &calls, &mut vm_host).unwrap();
+
+    assert_eq!(
+        walker_values.iter().map(Value::inspect).collect::<Vec<_>>(),
+        ["0", "2"]
+    );
+    assert_eq!(
+        walker_values.iter().map(Value::inspect).collect::<Vec<_>>(),
+        vm_values.iter().map(Value::inspect).collect::<Vec<_>>()
+    );
+}
+
 struct ModuleHost {
     modules: BTreeMap<String, String>,
 }

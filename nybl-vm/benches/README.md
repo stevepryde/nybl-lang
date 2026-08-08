@@ -1,9 +1,9 @@
 # Embedding hot-path benchmarks
 
 Criterion suite for the costs a host engine pays when it drives Nybl per
-entity per tick: `instance.call()` dispatch, `NyblHost::call` round-trips, a
-representative game-tick workload, Rust <-> `Value` conversion, and one-shot
-`load`. Every engine-sensitive benchmark runs on both the tree-walker
+entity per tick: `instance.call()` dispatch, `NyblHost::call` round-trips,
+ordinary/prepared/batched game-tick workloads, Rust <-> `Value` conversion,
+and one-shot `load`. Every engine-sensitive benchmark runs on both the tree-walker
 (`nybl::NyblInstance`) and the bytecode VM (`nybl_vm::NyblInstance`).
 
 ## Running
@@ -118,6 +118,41 @@ Value conversion is *not* a top overhead source: scalar conversions are
 ~1 ns and even small dict/array conversions are 120-230 ns — an entity's
 worth of scalar field traffic through `IntoValue`/`FromValue` is noise next
 to the call and host-boundary costs above.
+
+## Dispatch optimization results (#186)
+
+The accepted design is documented in
+`specs/proposals/prepared-batch-dispatch.md`. It adds instance-affine prepared
+entry handles, a host-side `call_batch` with fresh per-item step/call-depth
+budgets, and a documented script-level `tick_batch` convention. Numeric host
+IDs were not added because an instance may receive a different compatible host
+on every operation; an ID has no stable meaning without a larger host identity
+and registration contract.
+
+Follow-up run on the same Apple M5 machine, 2026-08-08. Each row used one
+Criterion run with 1 second warmup, 3 second measurement, and 30 samples, so
+the deltas compare variants under the same machine state:
+
+| `game_tick_100_entities` variant | Walker | Delta | VM | Delta |
+| --- | ---: | ---: | ---: | ---: |
+| repeated `call` | 173.70 us | baseline | 215.17 us | baseline |
+| repeated `call_prepared` | 171.87 us | -1.1% | 215.51 us | +0.2% |
+| host-side `call_batch` | 151.76 us | -12.6% | 206.30 us | -4.1% |
+| script-level `tick_batch` | 119.04 us | **-31.5%** | 170.30 us | **-20.9%** |
+
+The host-side batch keeps the per-entity function frame and therefore helps
+the walker much more than the VM. The true script batch removes that frame and
+the public-entry boundary for every entity while retaining the same field and
+command host crossings; it is the material win on both engines. Its example
+does not collect the per-entity return value because the representative game
+host consumes mutations and queued commands, matching the intended tick ABI.
+
+Prepared single-call dispatch is intentionally retained as a backwards-
+compatible resolution API, but the representative workload shows that entry
+lookup alone is not a meaningful VM optimization. Nanosecond-scale isolated
+call-floor samples were sensitive to local scheduling and did not establish a
+repeatable prepared-entry VM delta; the same-run game workload above is the
+decision metric.
 
 ## CI
 

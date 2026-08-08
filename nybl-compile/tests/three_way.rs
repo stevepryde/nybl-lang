@@ -432,6 +432,36 @@ fn parse_envelope(stdout: &str) -> Vec<(String, Outcome)> {
 
 const CORPUS: &[(&str, &str)] = &[
     (
+        "fn_shadows_builtin_range",
+        "fn range(n) { return [41] }\nprint(range(3)[0])",
+    ),
+    (
+        "fn_shadows_builtin_rand",
+        "fn rand(n) { return 42 }\nprint(rand(10))",
+    ),
+    (
+        "fn_shadows_builtin_print",
+        "fn print(value) { return value }\nlet hidden = print(45)",
+    ),
+    (
+        "fn_shadows_builtin_try_call",
+        "fn try_call(f) { return 43 }\nprint(try_call(fn() { return 1 }))",
+    ),
+    (
+        "fn_shadows_builtin_panic",
+        "fn panic(message) { return 44 }\nprint(panic(\"x\"))",
+    ),
+    (
+        "fn_shadows_builtin_source_order_preflight",
+        r#"let calls = 0
+fn side() { calls += 1; return 2 }
+print(try_call(fn() { return rand(1, side()) }))
+print(calls)
+fn rand(a, b) { return 42 }
+print(rand(1, side()))
+print(calls)"#,
+    ),
+    (
         "place_indices_run_before_root_snapshot",
         r#"let values = [0, 1]
 fn assign() { values[values.pop()] = 9 }
@@ -3905,6 +3935,22 @@ fn three_way_diff() {
             modules,
         });
     }
+    assert_three_way(&entries);
+}
+
+#[test]
+#[ignore]
+fn three_way_function_declarations_shadow_engine_builtins() {
+    let entries = CORPUS
+        .iter()
+        .filter(|(name, _)| name.starts_with("fn_shadows_builtin_"))
+        .map(|(name, source)| CorpusEntry {
+            name,
+            source,
+            modules: &[],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), nybl::check::ENGINE_BUILTINS.len() + 1);
     assert_three_way(&entries);
 }
 

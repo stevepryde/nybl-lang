@@ -38,6 +38,25 @@ fn transpile_refuses_a_disabled_builtin_inside_an_imported_module() {
 }
 
 #[test]
+fn function_declaration_shadows_a_disabled_builtin() {
+    transpile(
+        "fn rand(n) { return n }\nlet value = rand(3)",
+        &library_options(),
+    )
+    .expect("the lexical function, not the disabled builtin, is called");
+}
+
+#[test]
+fn call_before_shadowing_function_keeps_the_runtime_backstop() {
+    let source = transpile(
+        "let value = rand(3)\nfn rand(n) { return n }",
+        &library_options(),
+    )
+    .expect("source-order ambiguity is checked at runtime");
+    assert!(source.contains("disabled_builtin_error"));
+}
+
+#[test]
 fn unprovable_references_compile_into_the_fatal_backstop_error() {
     // The glob import could bind `rand`, so the static pass cannot
     // refuse the program; the call site must compile into the fatal
