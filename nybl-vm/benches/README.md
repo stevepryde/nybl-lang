@@ -3,7 +3,8 @@
 Criterion suite for the costs a host engine pays when it drives Nybl per
 entity per tick: `instance.call()` dispatch, `NyblHost::call` round-trips,
 ordinary/prepared/batched game-tick workloads, Rust <-> `Value` conversion,
-and one-shot `load`. Every engine-sensitive benchmark runs on both the tree-walker
+100 distinct persistent entity-script instances, and one-shot `load`. Every
+engine-sensitive benchmark runs on both the tree-walker
 (`nybl::NyblInstance`) and the bytecode VM (`nybl_vm::NyblInstance`).
 
 ## Running
@@ -153,6 +154,87 @@ lookup alone is not a meaningful VM optimization. Nanosecond-scale isolated
 call-floor samples were sensitive to local scheduling and did not establish a
 repeatable prepared-entry VM delta; the same-run game workload above is the
 decision metric.
+
+## Persistent cached-instance results (#199)
+
+This benchmark models one generic consumer lifecycle that an engine may choose:
+
+1. Cache a script asset. With the VM, compile it once: `CompiledScript` is a
+   **VM-only** artifact. The walker has no equivalent compiled representation
+   and loads each AST-backed instance separately.
+2. Create 100 independent instances outside the frame loop. VM instances all
+   borrow the same `CompiledScript`; both engines retain separate globals, RNG,
+   imports, memory accounting, and execution state per instance.
+3. Resolve one instance-affine `PreparedEntry` per attachment outside the frame
+   loop.
+4. On each measured frame, reuse those instances while one consumer-owned host
+   calls `begin_frame`, binds the current entity before each callback, retains
+   its field cache, and buffers commands for all 100 callbacks.
+
+There is no parsing, compilation, module resolution, top-level initialization,
+instance construction, or entry preparation inside `b.iter`. The script keeps
+a private tick counter so the benchmark would not accidentally model stateless
+fresh instances. The engine ID is host-bound rather than passed through Nybl on
+every field access.
+
+Startup remains a separate lifecycle cost. The baseline above measured one-shot
+`load_game_tick` at 14.2 us for the walker and 24.8 us for the VM; the
+module-bearing benchmark measured VM `from_compiled` startup at 4.78 us per
+instance versus 20.3 us for repeated legacy `load`. Consumers pay those costs
+when filling an asset/instance cache, not during the measured frame.
+
+Apple M5 follow-up, 2026-08-08, using one-second warmup, three-second
+measurement, and 30 samples. Ordinary and prepared variants use independent,
+identically initialized host state. Values below are Criterion point estimates:
+
+| 100 distinct cached instances | Walker | Per entity | VM | Per entity |
+| --- | ---: | ---: | ---: | ---: |
+| ordinary `call` | 196.53 us | 1.965 us | 254.62 us | 2.546 us |
+| instance-affine `call_prepared` | 192.61 us | 1.926 us | 241.47 us | 2.415 us |
+
+Prepared lookup is not a decisive optimization here: its walker result was
+2.0% faster and its VM result 5.2% faster in this run, so consumers should
+measure their actual workload rather than assume those deltas transfer. On this
+host-call-heavy callback the walker remains faster: 22.8% lower frame time than
+VM for ordinary calls and 20.2% lower for prepared calls. That does **not**
+contradict the VM's advantage on
+script-compute-heavy programs; `CompiledScript` primarily removes repeated VM
+startup work and does not change the per-call execution path of the instances
+created from it. Sharing the artifact does not by itself make every callback
+faster than the walker. A consumer whose representative workload resembles
+this host-heavy callback has evidence to choose the walker today and defer VM
+adoption until an end-to-end benchmark shows a worthwhile gain. In that choice,
+`CompiledScript` is a future VM-tier optimization, not a walker requirement.
+
+Companion measurements used the same settings to separate the major layers:
+
+| Layer, 100 calls/entities | Walker | VM |
+| --- | ---: | ---: |
+| empty cached callback, ordinary | 50.70 us | 38.38 us |
+| empty cached callback, prepared | 48.58 us | 38.78 us |
+| direct custom-host frame through its `Value` ABI | 3.46 us | same shared host |
+
+The empty callback is the best direct measurement of Nybl public-entry,
+argument placement, and executor-state handling across 100 different cached
+instances. It shows the VM's entry floor is actually lower. The direct-host
+number measures consumer dispatch, bound-entity field access, branching, and
+command buffering without Nybl instruction execution; it is a lower bound
+because script-originated calls also allocate and populate host argument
+vectors. The remaining full-workload time belongs to script execution plus
+Nybl's internal host boundary rather than the consumer's cache itself.
+
+The scalar `dt` `Value` is constructed once outside the measured loop, and the
+existing conversion benchmarks put `i64` conversion at about 1 ns. Even
+constructing one per entity would be around 0.1 us per frame, so Rust-to-Nybl
+scalar conversion is not material here. Composite values should still be
+measured for consumers that use them.
+
+These results inform instance-granularity choices; they do not prescribe one
+instance per entity for every consumer. A worker-owned shard instance, several
+entries on one instance, or consumer-side batching can be equally valid when
+their state and scheduling model permit it. Nothing in this measurement
+justifies game-specific scheduling, ECS policy, or a stable-host registry in
+Nybl, and no runtime API was changed for #199.
 
 ## CI
 

@@ -47,6 +47,11 @@ publishable workspace crates unless a section says otherwise.
   engine while resetting step and call-depth accounting per item; script-level
   batch entry points provide the largest measured game-tick improvement while
   preserving ordinary host dispatch and sandbox semantics.
+- Benchmark 100 distinct persistent script instances with a consumer-owned,
+  entity-binding host. VM instances share one VM-only `CompiledScript`; walker
+  instances and all prepared entries are likewise created outside the measured
+  frame loop. The host-heavy workload still favors the walker, while an empty
+  callback confirms the VM has the lower cached-instance entry floor.
 - Make `nybl-sys` clock calls safe on freestanding wasm:
   `unix_time()` and `unix_time_ms()` now return an actionable Nybl runtime
   error on `wasm32-unknown-unknown` instead of trapping in

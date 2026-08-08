@@ -2,6 +2,7 @@
 //!
 //! Measures the costs a host engine pays when it drives Nybl scripts per
 //! entity per tick: ordinary and prepared `instance.call()` dispatch,
+//! 100 distinct cached entity-script instances driven by one worker host,
 //! `NyblHost::call` round-trips, host-side and script-side batching of a
 //! representative game-tick workload, Rust <-> `Value` conversion, and
 //! one-shot `load` cost. Every engine-sensitive benchmark runs on both the
@@ -36,6 +37,14 @@ fn bench_limits() -> NyblLimits {
 /// The per-entity dispatch floor: an entry point that does nothing.
 const TRIVIAL_SRC: &str = "
 pub fn tick(a, b) {
+}
+";
+
+/// Empty callback with the same scalar argument shape as the cached entity
+/// workload. Across 100 persistent instances this isolates public-entry and
+/// executor-state handling from script execution and host calls.
+const CACHED_TRIVIAL_SRC: &str = "
+pub fn tick(dt) {
 }
 ";
 
@@ -82,6 +91,45 @@ pub fn tick(id) {
         queue_command(id, 2, x, y)
     }
     return hp
+}
+";
+
+/// A persistent entity-script attachment model. The consumer binds the entity
+/// in its worker-local host before each callback, so the script does not shuttle
+/// an entity ID through every host call. `ticks` deliberately proves that each
+/// cached instance owns mutable state across frames.
+const CACHED_ENTITY_TICK_SRC: &str = "
+let ticks = 0
+
+pub fn tick(dt) {
+    ticks += 1
+    let hp = current_field_get(0)
+    let x = current_field_get(1)
+    let y = current_field_get(2)
+    let state = current_field_get(3)
+    let target = current_field_get(4)
+    if state == 0 {
+        if x < target {
+            current_field_set(1, x + dt)
+        } else {
+            current_field_set(4, target + 16)
+        }
+        if hp < 20 {
+            current_field_set(3, 1)
+        } else {
+            current_field_set(2, y + dt)
+        }
+        current_queue_command(1, x, y)
+    } else {
+        if hp < 90 {
+            current_field_set(0, hp + 5)
+        } else {
+            current_field_set(3, 0)
+        }
+        current_field_set(1, x - dt)
+        current_queue_command(2, x, y)
+    }
+    return ticks
 }
 ";
 
@@ -162,6 +210,7 @@ const FIELD_COUNT: usize = 5;
 struct GameHost {
     fields: Vec<[i64; FIELD_COUNT]>,
     commands: Vec<[i64; 4]>,
+    current_entity: Option<usize>,
 }
 
 impl GameHost {
@@ -171,7 +220,24 @@ impl GameHost {
                 .map(|id| [100, (id as i64) % 13, 0, (id as i64) % 2, 24])
                 .collect(),
             commands: Vec::with_capacity(entities),
+            current_entity: None,
         }
+    }
+
+    /// Start one engine-owned frame while retaining the ECS-like field cache.
+    fn begin_frame(&mut self) {
+        self.commands.clear();
+        self.current_entity = None;
+    }
+
+    /// Bind an entity attachment before entering its persistent script.
+    fn bind_entity(&mut self, entity: usize) {
+        self.current_entity = Some(entity);
+    }
+
+    fn bound_entity(&self, line: u32) -> Result<usize, NyblError> {
+        self.current_entity
+            .ok_or_else(|| NyblError::runtime("no entity bound for script callback", line))
     }
 }
 
@@ -179,6 +245,93 @@ fn arg_int(args: &[Value], index: usize, line: u32) -> Result<i64, NyblError> {
     match args.get(index) {
         Some(Value::Int(value)) => Ok(*value),
         _ => Err(NyblError::runtime("expected Int argument", line)),
+    }
+}
+
+fn direct_host_int(host: &mut dyn NyblHost, name: &str, args: &[Value]) -> i64 {
+    match host
+        .call(black_box(name), black_box(args), 0)
+        .expect("game host handles benchmark function")
+    {
+        Ok(Value::Int(value)) => value,
+        Ok(other) => panic!("expected Int from game host, got {}", other.type_name()),
+        Err(error) => panic!("game host call failed: {error}"),
+    }
+}
+
+fn direct_host_none(host: &mut dyn NyblHost, name: &str, args: &[Value]) {
+    match host
+        .call(black_box(name), black_box(args), 0)
+        .expect("game host handles benchmark function")
+    {
+        Ok(Value::None) => {}
+        Ok(other) => panic!("expected None from game host, got {}", other.type_name()),
+        Err(error) => panic!("game host call failed: {error}"),
+    }
+}
+
+/// Execute the same field/branch/command work as `CACHED_ENTITY_TICK_SRC`
+/// directly through the custom host's `Value` ABI. This is a lower bound for
+/// consumer-owned host work: subtracting it from the script benchmark still
+/// includes Nybl instruction execution and host-argument vector creation.
+fn direct_custom_host_frame(host: &mut GameHost) {
+    host.begin_frame();
+    for entity in 0..ENTITY_COUNT {
+        host.bind_entity(entity);
+        let hp = direct_host_int(host, "current_field_get", &[Value::Int(0)]);
+        let x = direct_host_int(host, "current_field_get", &[Value::Int(1)]);
+        let y = direct_host_int(host, "current_field_get", &[Value::Int(2)]);
+        let state = direct_host_int(host, "current_field_get", &[Value::Int(3)]);
+        let target = direct_host_int(host, "current_field_get", &[Value::Int(4)]);
+        if state == 0 {
+            if x < target {
+                direct_host_none(
+                    host,
+                    "current_field_set",
+                    &[Value::Int(1), Value::Int(x + 1)],
+                );
+            } else {
+                direct_host_none(
+                    host,
+                    "current_field_set",
+                    &[Value::Int(4), Value::Int(target + 16)],
+                );
+            }
+            if hp < 20 {
+                direct_host_none(host, "current_field_set", &[Value::Int(3), Value::Int(1)]);
+            } else {
+                direct_host_none(
+                    host,
+                    "current_field_set",
+                    &[Value::Int(2), Value::Int(y + 1)],
+                );
+            }
+            direct_host_none(
+                host,
+                "current_queue_command",
+                &[Value::Int(1), Value::Int(x), Value::Int(y)],
+            );
+        } else {
+            if hp < 90 {
+                direct_host_none(
+                    host,
+                    "current_field_set",
+                    &[Value::Int(0), Value::Int(hp + 5)],
+                );
+            } else {
+                direct_host_none(host, "current_field_set", &[Value::Int(3), Value::Int(0)]);
+            }
+            direct_host_none(
+                host,
+                "current_field_set",
+                &[Value::Int(1), Value::Int(x - 1)],
+            );
+            direct_host_none(
+                host,
+                "current_queue_command",
+                &[Value::Int(2), Value::Int(x), Value::Int(y)],
+            );
+        }
     }
 }
 
@@ -220,6 +373,36 @@ impl NyblHost for GameHost {
                 self.commands.push([id, kind, x, y]);
                 Ok(Value::None)
             })()),
+            "current_field_get" => Some((|| {
+                let id = self.bound_entity(line)?;
+                let field = arg_int(args, 0, line)? as usize;
+                self.fields
+                    .get(id)
+                    .and_then(|fields| fields.get(field))
+                    .map(|value| Value::Int(*value))
+                    .ok_or_else(|| NyblError::runtime("current_field_get out of range", line))
+            })()),
+            "current_field_set" => Some((|| {
+                let id = self.bound_entity(line)?;
+                let field = arg_int(args, 0, line)? as usize;
+                let value = arg_int(args, 1, line)?;
+                self.fields
+                    .get_mut(id)
+                    .and_then(|fields| fields.get_mut(field))
+                    .map(|slot| {
+                        *slot = value;
+                        Value::None
+                    })
+                    .ok_or_else(|| NyblError::runtime("current_field_set out of range", line))
+            })()),
+            "current_queue_command" => Some((|| {
+                let id = self.bound_entity(line)? as i64;
+                let kind = arg_int(args, 0, line)?;
+                let x = arg_int(args, 1, line)?;
+                let y = arg_int(args, 2, line)?;
+                self.commands.push([id, kind, x, y]);
+                Ok(Value::None)
+            })()),
             _ => None,
         }
     }
@@ -237,6 +420,7 @@ trait Engine {
     const NAME: &'static str;
     type Instance;
     type Prepared;
+    type CachedSource;
 
     fn load(source: &str, host: &mut dyn NyblHost, limits: &NyblLimits) -> Self::Instance;
     fn call(
@@ -258,6 +442,13 @@ trait Engine {
         calls: &[Vec<Value>],
         host: &mut dyn NyblHost,
     ) -> Result<Vec<Value>, NyblError>;
+    fn cache_source(source: &str) -> Self::CachedSource;
+    fn load_cached_instances(
+        source: &Self::CachedSource,
+        count: usize,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+    ) -> Vec<Self::Instance>;
 }
 
 struct Walker;
@@ -266,6 +457,7 @@ impl Engine for Walker {
     const NAME: &'static str = "walker";
     type Instance = nybl::NyblInstance;
     type Prepared = nybl::PreparedEntry;
+    type CachedSource = String;
 
     fn load(source: &str, host: &mut dyn NyblHost, limits: &NyblLimits) -> Self::Instance {
         nybl::NyblInstance::load(source, host, limits).expect("walker load failed")
@@ -301,6 +493,23 @@ impl Engine for Walker {
     ) -> Result<Vec<Value>, NyblError> {
         instance.call_batch(entry, calls, host)
     }
+
+    fn cache_source(source: &str) -> Self::CachedSource {
+        source.to_string()
+    }
+
+    fn load_cached_instances(
+        source: &Self::CachedSource,
+        count: usize,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+    ) -> Vec<Self::Instance> {
+        // The walker has no `CompiledScript`: load every AST-backed instance
+        // once when the entity attaches, outside the measured frame loop.
+        (0..count)
+            .map(|_| Self::load(source, host, limits))
+            .collect()
+    }
 }
 
 struct Vm;
@@ -309,6 +518,7 @@ impl Engine for Vm {
     const NAME: &'static str = "vm";
     type Instance = nybl_vm::NyblInstance;
     type Prepared = nybl_vm::PreparedEntry;
+    type CachedSource = nybl_vm::CompiledScript;
 
     fn load(source: &str, host: &mut dyn NyblHost, limits: &NyblLimits) -> Self::Instance {
         nybl_vm::NyblInstance::load(source, host, limits).expect("vm load failed")
@@ -343,6 +553,26 @@ impl Engine for Vm {
         host: &mut dyn NyblHost,
     ) -> Result<Vec<Value>, NyblError> {
         instance.call_batch(entry, calls, host)
+    }
+
+    fn cache_source(source: &str) -> Self::CachedSource {
+        nybl_vm::CompiledScript::compile(source).expect("cached script compiles")
+    }
+
+    fn load_cached_instances(
+        program: &Self::CachedSource,
+        count: usize,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+    ) -> Vec<Self::Instance> {
+        // VM-only: every attachment borrows one Arc-backed compiled artifact,
+        // while globals, RNG, imports, and runtime state remain per instance.
+        (0..count)
+            .map(|_| {
+                nybl_vm::NyblInstance::from_compiled(program, host, limits)
+                    .expect("cached VM instance initializes")
+            })
+            .collect()
     }
 }
 
@@ -501,6 +731,104 @@ fn bench_game_tick_script_batch<E: Engine>(c: &mut Criterion) {
     );
 }
 
+/// Models the consumer-owned lifecycle from issue #199: one persistent script
+/// instance per entity attachment and one custom worker host shared across all
+/// callbacks. Setup, including VM compilation and all instance preparation,
+/// occurs before `b.iter`; the measured body is exactly one 100-entity frame.
+fn bench_cached_entity_instances<E: Engine>(c: &mut Criterion) {
+    let limits = bench_limits();
+    let source = E::cache_source(CACHED_ENTITY_TICK_SRC);
+    // Keep independent but identically initialized consumer state so Criterion
+    // can run each dispatch variant for a different iteration count without
+    // advancing the other variant's ECS fields.
+    let mut ordinary_host = GameHost::new(ENTITY_COUNT);
+    let mut prepared_host = GameHost::new(ENTITY_COUNT);
+    let mut ordinary = E::load_cached_instances(&source, ENTITY_COUNT, &mut ordinary_host, &limits);
+    let mut prepared = E::load_cached_instances(&source, ENTITY_COUNT, &mut prepared_host, &limits);
+    let entries: Vec<_> = prepared
+        .iter()
+        .map(|instance| E::prepare(instance, "tick"))
+        .collect();
+    let args = [Value::Int(1)];
+    let mut group = c.benchmark_group("cached_entity_instances_100");
+
+    group.bench_function(format!("{}/ordinary", E::NAME), |b| {
+        b.iter(|| {
+            ordinary_host.begin_frame();
+            for (entity, instance) in ordinary.iter_mut().enumerate() {
+                ordinary_host.bind_entity(entity);
+                let result = E::call(instance, "tick", black_box(&args), &mut ordinary_host)
+                    .expect("cached entity tick failed");
+                black_box(result);
+            }
+            black_box(ordinary_host.commands.len())
+        })
+    });
+
+    group.bench_function(format!("{}/prepared", E::NAME), |b| {
+        b.iter(|| {
+            prepared_host.begin_frame();
+            for (entity, (instance, entry)) in prepared.iter_mut().zip(entries.iter()).enumerate() {
+                prepared_host.bind_entity(entity);
+                let result =
+                    E::call_prepared(instance, entry, black_box(&args), &mut prepared_host)
+                        .expect("prepared cached entity tick failed");
+                black_box(result);
+            }
+            black_box(prepared_host.commands.len())
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_cached_trivial_instances<E: Engine>(c: &mut Criterion) {
+    let limits = bench_limits();
+    let source = E::cache_source(CACHED_TRIVIAL_SRC);
+    let mut host = GameHost::new(ENTITY_COUNT);
+    let mut ordinary = E::load_cached_instances(&source, ENTITY_COUNT, &mut host, &limits);
+    let mut prepared = E::load_cached_instances(&source, ENTITY_COUNT, &mut host, &limits);
+    let entries: Vec<_> = prepared
+        .iter()
+        .map(|instance| E::prepare(instance, "tick"))
+        .collect();
+    let args = [Value::Int(1)];
+    let mut group = c.benchmark_group("cached_trivial_instances_100");
+
+    group.bench_function(format!("{}/ordinary", E::NAME), |b| {
+        b.iter(|| {
+            for instance in &mut ordinary {
+                black_box(
+                    E::call(instance, "tick", black_box(&args), &mut host)
+                        .expect("cached trivial call failed"),
+                );
+            }
+        })
+    });
+    group.bench_function(format!("{}/prepared", E::NAME), |b| {
+        b.iter(|| {
+            for (instance, entry) in prepared.iter_mut().zip(entries.iter()) {
+                black_box(
+                    E::call_prepared(instance, entry, black_box(&args), &mut host)
+                        .expect("prepared cached trivial call failed"),
+                );
+            }
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_custom_host_frame(c: &mut Criterion) {
+    let mut host = GameHost::new(ENTITY_COUNT);
+    c.bench_function("custom_host_frame_100/direct_value_abi", |b| {
+        b.iter(|| {
+            direct_custom_host_frame(&mut host);
+            black_box(host.commands.len())
+        })
+    });
+}
+
 fn bench_load<E: Engine>(c: &mut Criterion) {
     let limits = bench_limits();
     c.bench_function(&format!("load_game_tick/{}", E::NAME), |b| {
@@ -650,6 +978,11 @@ fn all_benches(c: &mut Criterion) {
     bench_game_tick_batch::<Vm>(c);
     bench_game_tick_script_batch::<Walker>(c);
     bench_game_tick_script_batch::<Vm>(c);
+    bench_cached_entity_instances::<Walker>(c);
+    bench_cached_entity_instances::<Vm>(c);
+    bench_cached_trivial_instances::<Walker>(c);
+    bench_cached_trivial_instances::<Vm>(c);
+    bench_custom_host_frame(c);
     bench_value_conversion(c);
     bench_load::<Walker>(c);
     bench_load::<Vm>(c);
