@@ -67,6 +67,7 @@ pub fn compile_file(input: &str, output: Option<&str>, emit_rs: bool, keep: bool
         sandbox: false,
         module_name: None,
         module_resolver: Some(resolver),
+        ..Options::default()
     };
 
     let rust_src = match transpile(&source, &opts) {

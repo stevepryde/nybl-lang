@@ -803,7 +803,13 @@ pub fn transactional_dict_method(
     args: Vec<Value>,
     line: u32,
 ) -> Result<Value, NyblError> {
-    transactional_dict_method_in(binding, method, args, line, &MemoryContext::__legacy_current())
+    transactional_dict_method_in(
+        binding,
+        method,
+        args,
+        line,
+        &MemoryContext::__legacy_current(),
+    )
 }
 
 #[doc(hidden)]

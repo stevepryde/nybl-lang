@@ -1115,6 +1115,7 @@ fn options_without_main_skip_entry_point() {
         sandbox: false,
         module_name: None,
         module_resolver: None,
+        ..Options::default()
     };
     let out = transpile("print(1)", &opts).unwrap();
     assert!(
@@ -1147,6 +1148,7 @@ fn compile_with_modules(
             sandbox: false,
             module_name: None,
             module_resolver: Some(resolver),
+            ..Options::default()
         },
     )
 }

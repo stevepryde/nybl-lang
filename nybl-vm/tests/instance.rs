@@ -18,6 +18,17 @@ impl NyblHost for Host {
 }
 
 #[test]
+fn load_rejects_a_program_using_a_host_disabled_builtin() {
+    let mut host = Host;
+    let limits = NyblLimits::standard().with_disabled_builtins(["rand"]);
+    let error = NyblInstance::load("pub fn roll() { return rand(6) }", &mut host, &limits)
+        .err()
+        .expect("load must refuse a disabled-builtin reference");
+    assert_eq!(error.message, "builtin `rand` is disabled by the host");
+    assert!(error.is_fatal, "disabled builtins are uncatchable");
+}
+
+#[test]
 fn executed_final_public_declarations_define_the_abi() {
     let mut host = Host;
     let mut instance = NyblInstance::load(
@@ -224,6 +235,7 @@ fn step_budget_resets_for_each_call() {
     let limits = NyblLimits {
         max_steps: 20,
         max_memory: 1024 * 1024,
+        ..NyblLimits::standard()
     };
     let mut host = Host;
     let mut instance = NyblInstance::load(
@@ -538,6 +550,7 @@ fn fatal_step_and_call_depth_errors_leave_the_instance_reusable() {
     let step_limits = NyblLimits {
         max_steps: 20,
         max_memory: 1024 * 1024,
+        ..NyblLimits::standard()
     };
     let mut step_instance = NyblInstance::load(
         "pub fn spin() { while true {} }\npub fn ok() { return 7 }",
@@ -558,6 +571,7 @@ fn fatal_step_and_call_depth_errors_leave_the_instance_reusable() {
         &NyblLimits {
             max_steps: 1_000_000,
             max_memory: 1024 * 1024,
+            ..NyblLimits::standard()
         },
     )
     .unwrap();

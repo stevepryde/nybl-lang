@@ -3801,6 +3801,15 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         line: u32,
     ) -> Result<Next, NyblError> {
         match name {
+            // Runtime backstop for host-disabled builtins — mirrors
+            // the guard in `Vm::call` and the walker's
+            // `call_function`; fatal so `try_call` can't swallow it.
+            "range" | "rand" | "print" | "try_call" | "panic"
+                if !self.limits.disabled_builtins.is_empty()
+                    && self.limits.disabled_builtins.contains(name) =>
+            {
+                return Err(nybl::check::disabled_builtin_error(name, line));
+            }
             "range" => {
                 let value =
                     builtins::builtin_range_in(&args, line, &mut self.rand_state, &self.memory)?;
@@ -3978,6 +3987,16 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // a method; see `methods::common_method` and
         // `methods::numeric_method`.
         match name {
+            // Runtime backstop for host-disabled builtins: a call the
+            // load-time pass could not prove (a shadowing binding
+            // exists somewhere) still dies — fatally, so `try_call`
+            // can't swallow it — the moment it reaches the builtin.
+            "range" | "rand" | "print" | "try_call" | "panic"
+                if !self.limits.disabled_builtins.is_empty()
+                    && self.limits.disabled_builtins.contains(name) =>
+            {
+                return Err(nybl::check::disabled_builtin_error(name, line));
+            }
             "range" => {
                 let v =
                     builtins::builtin_range_in(&args, line, &mut self.rand_state, &self.memory)?;
@@ -5854,6 +5873,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         source: &str,
     ) -> Result<ModuleArtifacts, NyblError> {
         let stmts = nybl::parse(source)?;
+        // Modules load lazily at their `use` site, so this is the
+        // earliest point their source is visible — apply the same
+        // disabled-builtin gate the root program got, before any of
+        // the module's statements run.
+        nybl::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
         let chunk = crate::compile(&stmts)?;
         let public_surface = chunk.public_surface.clone();
         let module_runtime = ModuleRuntime {
@@ -6595,6 +6619,7 @@ impl NyblInstance {
         limits: &NyblLimits,
     ) -> Result<Self, NyblError> {
         let statements = nybl::parse(source)?;
+        nybl::check::enforce_disabled_builtins(&statements, &limits.disabled_builtins)?;
         let compiled = crate::compiler::compile_program(&statements)?;
         crate::validate_chunk(&compiled.chunk)?;
         let memory = nybl::memory::MemoryContext::__new(limits.max_memory);
@@ -6921,6 +6946,7 @@ pub fn execute<H: NyblHost>(
 /// This mirrors [`nybl::run`] but routes through the bytecode VM.
 pub fn run<H: NyblHost>(source: &str, host: &mut H, limits: &NyblLimits) -> Result<(), NyblError> {
     let stmts = nybl::parse(source)?;
+    nybl::check::enforce_disabled_builtins(&stmts, &limits.disabled_builtins)?;
     let chunk = crate::compile(&stmts)?;
     execute(chunk, host, limits)
 }
@@ -7286,6 +7312,7 @@ let read = fn() { return [missing, present] }"#,
         let limits = NyblLimits {
             max_steps: 100,
             max_memory: 32,
+            ..NyblLimits::standard()
         };
         let mut host = RetainingHost { retained: None };
         let mut instance = NyblInstance::load(
@@ -7325,6 +7352,7 @@ let read = fn() { return [missing, present] }"#,
         let limits = NyblLimits {
             max_steps: 100,
             max_memory: 64,
+            ..NyblLimits::standard()
         };
         let mut host = ExternalValueHost {
             value: Some(external),
@@ -7423,6 +7451,7 @@ let read = fn() { return [missing, present] }"#,
         let limits = NyblLimits {
             max_steps: 100,
             max_memory: 64,
+            ..NyblLimits::standard()
         };
         let mut host = HookAllocatingHost {
             retained: RefCell::new(Vec::new()),

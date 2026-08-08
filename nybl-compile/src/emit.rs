@@ -50,10 +50,20 @@ use runtime_templates::{
 };
 
 pub(crate) fn emit(stmts: &[Stmt], opts: &Options) -> Result<String, NyblError> {
+    // Refuse to transpile a definite reference to a host-disabled
+    // builtin — transpile time is this engine's earliest detectable
+    // point. References the static pass cannot prove are compiled
+    // into fatal runtime errors instead (see `value_named_call_src`).
+    nybl::check::enforce_disabled_builtins(stmts, &opts.disabled_builtins)?;
     // Pre-resolve every import in the program's transitive graph.
     // Failures here (missing resolver, module not found, cycle)
     // surface before any Rust is written.
     let modules = build_module_graph(stmts, opts)?;
+    for name in &modules.order {
+        let entry = &modules.modules[name];
+        nybl::check::enforce_disabled_builtins(&entry.ast, &opts.disabled_builtins)
+            .map_err(|error| error.with_module_source(name, entry.source.as_str()))?;
+    }
     let info = collect_fn_info(stmts);
     let types = collect_type_registry(stmts, &modules)?;
     let mut persistent_constants = HashMap::new();
@@ -6826,6 +6836,22 @@ fn __nybl_function_site_value(
             return Ok(format!(
                 "{{ {preflight}{arg_lets}__nybl_call_named_value(ctx, {callee}, {args_vec}, {name}, {line})? }}",
                 name = rust_string_literal(name),
+            ));
+        }
+
+        // Runtime backstop for host-disabled builtins, resolved at
+        // codegen time: a call the load-time pass could not prove (a
+        // shadowing binding exists somewhere) compiles into the same
+        // fatal error the walker and VM raise at their dispatch
+        // sites, instead of the builtin call. Value bindings were
+        // already handled above, so reaching this point with a
+        // builtin name means builtin dispatch.
+        if nybl::check::ENGINE_BUILTINS.contains(&name)
+            && self.opts.disabled_builtins.contains(name)
+        {
+            return Ok(format!(
+                "return ::std::result::Result::Err(::nybl::check::disabled_builtin_error({}, {line}))",
+                rust_string_literal(name),
             ));
         }
 

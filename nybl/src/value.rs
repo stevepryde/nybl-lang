@@ -3581,10 +3581,7 @@ mod depth_tests {
         assert_eq!(removed.ownership_depth(), 2);
         let removed = dict.remove_key("flat").expect("key present");
         assert!(matches!(removed, Value::Int(1)));
-        assert!(matches!(
-            dict.remove_key("deep"),
-            Some(Value::Int(9))
-        ));
+        assert!(matches!(dict.remove_key("deep"), Some(Value::Int(9))));
         assert!(dict.is_empty());
         assert_eq!(dict.0.depth, 1);
         assert_eq!(dict.0.depth_counts.flat, 0);

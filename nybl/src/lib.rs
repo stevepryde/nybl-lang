@@ -166,7 +166,9 @@ extern crate alloc;
 extern crate std;
 
 #[cfg(all(feature = "no_std", not(feature = "std")))]
-use alloc::{string::String, vec::Vec};
+use alloc::{collections::BTreeSet, string::String, vec::Vec};
+#[cfg(any(feature = "std", not(feature = "no_std")))]
+use std::collections::BTreeSet;
 
 #[doc(hidden)]
 pub mod ast_visit;
@@ -247,6 +249,16 @@ pub struct NyblLimits {
     pub max_steps: u64,
     /// Max total tracked memory (bytes) for strings + arrays
     pub max_memory: usize,
+    /// Engine builtins the host forbids for this program (e.g.
+    /// `rand` in a deterministic simulation whose randomness must
+    /// flow through a host-provided seeded RNG). A definite
+    /// reference to a disabled builtin is a fatal load-time error;
+    /// references that static analysis cannot prove (a shadowing
+    /// binding might apply) fail with the same fatal error at the
+    /// moment they would invoke the builtin, and `try_call` cannot
+    /// catch them. Names that are not engine builtins are allowed
+    /// and never match. Empty (the default) disables nothing.
+    pub disabled_builtins: BTreeSet<String>,
 }
 
 impl NyblLimits {
@@ -255,6 +267,7 @@ impl NyblLimits {
         Self {
             max_steps: 10_000,
             max_memory: 10 * 1024 * 1024, // 10 MB
+            disabled_builtins: BTreeSet::new(),
         }
     }
 
@@ -263,7 +276,20 @@ impl NyblLimits {
         Self {
             max_steps: 1_000,
             max_memory: 1024 * 1024, // 1 MB
+            disabled_builtins: BTreeSet::new(),
         }
+    }
+
+    /// Builder-style helper that disables the given builtins on top of
+    /// the receiver's other settings:
+    /// `NyblLimits::standard().with_disabled_builtins(["rand"])`.
+    pub fn with_disabled_builtins(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.disabled_builtins
+            .extend(names.into_iter().map(Into::into));
+        self
     }
 }
 
@@ -353,6 +379,7 @@ pub trait NyblHost {
 pub fn run<H: NyblHost>(source: &str, host: &mut H, limits: &NyblLimits) -> Result<(), NyblError> {
     let tokens = lexer::lex(source)?;
     let stmts = parser::parse(tokens)?;
+    check::enforce_disabled_builtins(&stmts, &limits.disabled_builtins)?;
     let eval = evaluator::Evaluator::new(host, limits.clone());
     eval.run(&stmts)
 }
@@ -485,6 +512,7 @@ mod tests {
         NyblLimits {
             max_steps: 500,
             max_memory: 64 * 1024,
+            ..NyblLimits::standard()
         }
     }
 
@@ -1365,6 +1393,7 @@ fn invoke() { exhaust(ref value) }"#,
                 &NyblLimits {
                     max_steps: 8,
                     max_memory: 1024 * 1024,
+                    ..NyblLimits::standard()
                 },
             )
             .unwrap_err();
@@ -1398,6 +1427,7 @@ fn invoke() { grow(ref first, ref second, payload) }"#,
                 &NyblLimits {
                     max_steps: 1_000,
                     max_memory: 1,
+                    ..NyblLimits::standard()
                 },
             )
             .unwrap_err();
@@ -2561,6 +2591,7 @@ let x = 1"#,
         let limits = NyblLimits {
             max_steps: 500,
             max_memory: 32 * 1024,
+            ..NyblLimits::standard()
         };
         let msg = run_err_with_limits(r#"let s = "x" * 40000"#, limits);
         assert!(msg.contains("Memory limit"), "got: {msg}");
@@ -2571,6 +2602,7 @@ let x = 1"#,
         let limits = NyblLimits {
             max_steps: 500,
             max_memory: 64 * 1024,
+            ..NyblLimits::standard()
         };
         let mut host = TestHost::new();
         let error = run(
@@ -3205,6 +3237,7 @@ print(match r {
         let tight = NyblLimits {
             max_steps: 200,
             max_memory: 1 << 20,
+            ..NyblLimits::standard()
         };
         let mut host = TestHost::new();
         let err = run(

@@ -210,6 +210,7 @@ fn build_driver(programs: &[CorpusEntry]) -> String {
                     sandbox: mode.sandbox(),
                     module_name: Some(format!("p_{}_{}", mode.label(), entry.name)),
                     module_resolver: resolver,
+                    ..Options::default()
                 },
             )
             .unwrap_or_else(|e| {

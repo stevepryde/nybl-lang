@@ -15,6 +15,7 @@ fn main() {
             sandbox: true,
             module_name: Some("plugin".to_owned()),
             module_resolver: None,
+            ..Options::default()
         },
     )
     .expect("transpile Nybl plugin");

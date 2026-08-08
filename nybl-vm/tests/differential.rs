@@ -190,6 +190,7 @@ fn type_publication_scaling_stays_below_quadratic_growth() {
         let limits = NyblLimits {
             max_steps: 100_000,
             max_memory: 64 * 1024 * 1024,
+            ..NyblLimits::standard()
         };
         (0..3)
             .map(|_| {
@@ -230,6 +231,7 @@ fn tight() -> NyblLimits {
     NyblLimits {
         max_steps: 500,
         max_memory: 64 * 1024,
+        ..NyblLimits::standard()
     }
 }
 
@@ -2753,6 +2755,92 @@ let s = Shape::Circel(5)"#,
     assert_eq!(hint.as_deref(), Some("Did you mean `Circle`?"));
 }
 
+// ─── Host-disabled builtins ───────────────────────────────────────
+
+/// Standard limits with builtin `rand` disabled by the host.
+fn no_rand() -> NyblLimits {
+    NyblLimits::standard().with_disabled_builtins(["rand"])
+}
+
+const RAND_DISABLED: &str = "builtin `rand` is disabled by the host";
+
+#[test]
+fn disabled_rand_is_a_load_time_error_before_any_output_diff() {
+    let out = run_both("print(\"side effect\")\nprint(rand(3))", &no_rand());
+    assert_eq!(out.error.as_deref(), Some(RAND_DISABLED));
+    assert!(
+        out.prints.is_empty(),
+        "load-time rejection must precede all output: {:?}",
+        out.prints
+    );
+}
+
+#[test]
+fn disabled_rand_leaves_other_builtins_untouched_diff() {
+    let out = run_both(
+        "let total = 0\nfor i in range(4) { total = total + i }\nprint(total)",
+        &no_rand(),
+    );
+    assert!(out.is_ok(), "unexpected error: {:?}", out.error);
+    assert_eq!(out.prints, vec!["6"]);
+}
+
+#[test]
+fn let_bound_rand_shadows_the_disabled_builtin_diff() {
+    // A value binding wins over the builtin in every engine, so the
+    // deny list doesn't reject it — scripts can keep the ergonomic
+    // name for a host-supplied replacement.
+    let out = run_both("let rand = fn(n) { return n }\nprint(rand(10))", &no_rand());
+    assert!(out.is_ok(), "unexpected error: {:?}", out.error);
+    assert_eq!(out.prints, vec!["10"]);
+}
+
+#[test]
+fn fn_declaration_of_a_disabled_builtin_name_is_rejected_at_load_diff() {
+    // Unlike a `let` binding, a `fn` declaration does not shadow a
+    // builtin for direct calls in every engine, so the only
+    // parity-preserving semantics is to reject the program up front.
+    let out = run_both("fn rand(n) { return n }\nprint(rand(10))", &no_rand());
+    assert_eq!(out.error.as_deref(), Some(RAND_DISABLED));
+    assert!(out.prints.is_empty());
+}
+
+#[test]
+fn try_call_cannot_catch_the_disabled_builtin_backstop_diff() {
+    // The glob import could bind any name, so the load-time pass
+    // cannot flag the program; the runtime backstop fires instead —
+    // fatally, so `try_call` must not swallow it.
+    set_modules(&[("noise", "let unrelated = 1")]);
+    let out = run_both(
+        r#"use noise
+print("before")
+let r = try_call(fn() { return rand(1) })
+print("after")"#,
+        &no_rand(),
+    );
+    assert_eq!(out.error.as_deref(), Some(RAND_DISABLED));
+    assert_eq!(out.prints, vec!["before"]);
+}
+
+#[test]
+fn disabled_rand_in_an_imported_module_fails_when_the_module_loads_diff() {
+    set_modules(&[("chaos", "let seed = rand(9)\nlet exported = 1")]);
+    let out = run_both(
+        "print(\"pre\")\nuse chaos.{exported}\nprint(exported)",
+        &no_rand(),
+    );
+    assert_eq!(out.error.as_deref(), Some(RAND_DISABLED));
+    assert_eq!(out.prints, vec!["pre"]);
+}
+
+#[test]
+fn unknown_names_in_the_deny_list_are_inert_diff() {
+    let limits = NyblLimits::standard().with_disabled_builtins(["not_a_builtin"]);
+    let out = run_both("print(rand(5))", &limits);
+    assert!(out.is_ok(), "unexpected error: {:?}", out.error);
+    assert_eq!(out.prints.len(), 1);
+}
+
 // ─── `try_call` builtin ───────────────────────────────────────────
 
 #[test]
@@ -2846,6 +2934,7 @@ fn try_call_step_limit_is_fatal_diff() {
     let tight = NyblLimits {
         max_steps: 200,
         max_memory: 1 << 20,
+        ..NyblLimits::standard()
     };
     let code = r#"let r = try_call(fn() {
     while true { }
@@ -6491,6 +6580,7 @@ let result = shared.split(",")"#,
     let limits = NyblLimits {
         max_steps: 1_000,
         max_memory: 1_200,
+        ..NyblLimits::standard()
     };
 
     for (name, code) in cases {

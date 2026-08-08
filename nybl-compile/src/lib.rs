@@ -161,6 +161,13 @@ pub struct Options {
     /// before any Rust is emitted, so cycle detection and missing
     /// modules both surface at build time rather than at run time.
     pub module_resolver: Option<ModuleResolver>,
+    /// Engine builtins the host forbids, mirroring
+    /// [`nybl::NyblLimits::disabled_builtins`]. A definite reference
+    /// in the root program or any resolved module refuses to
+    /// transpile; a reference the static pass cannot prove (a
+    /// shadowing binding might apply) compiles into a fatal runtime
+    /// error at the builtin call site instead of the builtin call.
+    pub disabled_builtins: std::collections::BTreeSet<String>,
 }
 
 impl Default for Options {
@@ -171,6 +178,7 @@ impl Default for Options {
             sandbox: false,
             module_name: None,
             module_resolver: None,
+            disabled_builtins: std::collections::BTreeSet::new(),
         }
     }
 }

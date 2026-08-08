@@ -270,6 +270,7 @@ fn fatal_unwind_discards_staged_values_and_instance_remains_reusable() {
     let limits = NyblLimits {
         max_steps: 40,
         max_memory: 1024 * 1024,
+        ..NyblLimits::standard()
     };
     let mut instance = NyblInstance::load(
         r#"
@@ -303,6 +304,7 @@ fn final_return_memory_check_runs_before_ref_commit() {
     let limits = NyblLimits {
         max_steps: 100,
         max_memory: 32,
+        ..NyblLimits::standard()
     };
     let mut instance = NyblInstance::load(
         r#"

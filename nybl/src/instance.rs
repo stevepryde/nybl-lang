@@ -100,6 +100,7 @@ impl NyblInstance {
         limits: &NyblLimits,
     ) -> Result<Self, NyblError> {
         let stmts = crate::parse(source)?;
+        crate::check::enforce_disabled_builtins(&stmts, &limits.disabled_builtins)?;
         let mut session = ReplSession::new();
         let memory = MemoryContext::__new(limits.max_memory);
         session.run_stmts_in(&stmts, host, limits, &memory)?;
@@ -235,6 +236,17 @@ mod tests {
         ) -> Option<Result<Value, NyblError>> {
             None
         }
+    }
+
+    #[test]
+    fn load_rejects_a_program_using_a_host_disabled_builtin() {
+        let mut host = Host;
+        let limits = NyblLimits::standard().with_disabled_builtins(["rand"]);
+        let error = NyblInstance::load("pub fn roll() { return rand(6) }", &mut host, &limits)
+            .err()
+            .expect("load must refuse a disabled-builtin reference");
+        assert_eq!(error.message, "builtin `rand` is disabled by the host");
+        assert!(error.is_fatal, "disabled builtins are uncatchable");
     }
 
     #[test]
@@ -807,6 +819,7 @@ mod tests {
         let limits = NyblLimits {
             max_steps: 100,
             max_memory: 32,
+            ..NyblLimits::standard()
         };
         let mut host = RetainingHost { retained: None };
         let mut instance = NyblInstance::load(
@@ -845,6 +858,7 @@ mod tests {
         let limits = NyblLimits {
             max_steps: 100,
             max_memory: 64,
+            ..NyblLimits::standard()
         };
         let mut host = ExternalValueHost {
             value: Some(external),
@@ -966,6 +980,7 @@ mod tests {
         let limits = NyblLimits {
             max_steps: 100,
             max_memory: 64,
+            ..NyblLimits::standard()
         };
         let mut host = HookAllocatingHost {
             retained: RefCell::new(Vec::new()),
