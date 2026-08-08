@@ -24,6 +24,7 @@ Important integration rules:
 
 - [Embedding Nybl](https://nybl-lang.com/docs/embedding/index.html.md): Cargo dependencies, engine selection, custom `NyblHost` implementations, typed `Value` conversion, limits, modules, warnings, no_std, and WASM.
 - [Stateful instances](https://nybl-lang.com/docs/embedding/instances/index.html.md): Persistent walker, VM, and sandboxed AOT programs with host-callable `pub fn` entries.
+- [WebAssembly](https://nybl-lang.com/docs/embedding/wasm/index.html.md): Supported wasm32 crates and features, allocator, math backend and float determinism, timing caveats, and CI parity enforcement.
 - [Compile-tested Rust example guide](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/README.md): Dependency manifest and standalone custom-host, persistent-instance, and build-script AOT integrations exercised by the workspace tests.
 - [Custom host example](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/src/bin/custom_host.rs): Complete narrow host that runs unchanged on the walker and VM.
 - [Persistent instance example](https://raw.githubusercontent.com/stevepryde/nybl-lang/main/examples/rust-embedding/src/bin/persistent_instance.rs): Complete stateful walker and VM plugin example.

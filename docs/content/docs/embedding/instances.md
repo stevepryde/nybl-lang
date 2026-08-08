@@ -7,6 +7,9 @@ page_template = "docs/page.html"
 [extra.previous]
 title = "Embedding Nybl"
 path = "/docs/embedding/"
+[extra.next]
+title = "WebAssembly"
+path = "/docs/embedding/wasm/"
 +++
 
 # Stateful instances

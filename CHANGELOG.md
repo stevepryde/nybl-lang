@@ -7,6 +7,7 @@ publishable workspace crates unless a section says otherwise.
 
 ### Embedding
 
+<<<<<<< HEAD
 - Add `nybl_vm::CompiledScript`: compile a program once (no host needed, no
   execution) into an immutable `Send + Sync`, Arc-backed artifact, then
   create any number of VM instances from it with
@@ -24,6 +25,8 @@ publishable workspace crates unless a section says otherwise.
   `InterpRecipe::parts`, `PatternRecipe::pattern`). Module `use` resolution
   keeps its existing per-instance loading path; the artifact covers the root
   program.
+=======
+>>>>>>> origin/main
 - Add `NyblLimits::disabled_builtins` (and `nybl_compile::Options::
   disabled_builtins` for the AOT engine): a host-configured deny list for
   engine builtins, built for deterministic simulation hosts that must route
