@@ -7,7 +7,6 @@ publishable workspace crates unless a section says otherwise.
 
 ### Embedding
 
-<<<<<<< HEAD
 - Add `nybl_vm::CompiledScript`: compile a program once (no host needed, no
   execution) into an immutable `Send + Sync`, Arc-backed artifact, then
   create any number of VM instances from it with
@@ -25,8 +24,6 @@ publishable workspace crates unless a section says otherwise.
   `InterpRecipe::parts`, `PatternRecipe::pattern`). Module `use` resolution
   keeps its existing per-instance loading path; the artifact covers the root
   program.
-=======
->>>>>>> origin/main
 - Add `NyblLimits::disabled_builtins` (and `nybl_compile::Options::
   disabled_builtins` for the AOT engine): a host-configured deny list for
   engine builtins, built for deterministic simulation hosts that must route
@@ -36,6 +33,15 @@ publishable workspace crates unless a section says otherwise.
   fatal, `try_call`-proof error the moment they would invoke the builtin.
   Consistent across the walker, VM, and AOT engines; imported modules are
   checked when they load.
+- Make `nybl-sys` clock calls safe on freestanding wasm:
+  `unix_time()` and `unix_time_ms()` now return an actionable Nybl runtime
+  error on `wasm32-unknown-unknown` instead of trapping in
+  `SystemTime::now()`; native and WASI hosts retain real wall-clock time.
+- Execute the wasm parity corpus in CI with both the default `std` math
+  backend and the deterministic defaults-off `no_std`/pure-Rust `libm`
+  backend. Both configurations run through the walker and VM on native and
+  `wasm32-wasip1` and are byte-compared; a deliberate-divergence negative
+  control proves the comparison can fail.
 
 ## 0.4.2
 

@@ -51,6 +51,9 @@ jobs:
             # default (std) and no_std feature configurations.
             - run: cargo check -p nybl-vm --target wasm32-unknown-unknown
             - run: cargo check -p nybl-vm --target wasm32-unknown-unknown --no-default-features --features no_std
+            # nybl-sys is OS-oriented, but it must not compile an
+            # unconditional SystemTime::now trap into freestanding wasm.
+            - run: cargo check -p nybl-sys --target wasm32-unknown-unknown
 
     wasm-parity:
         name: Wasm execution parity
@@ -65,14 +68,34 @@ jobs:
             - uses: bytecodealliance/actions/wasmtime/setup@v1
               with:
                   version: "v27.0.0"
-            # Run the curated differential corpus natively and under
-            # wasmtime, then byte-compare the transcripts. Any
-            # difference means Nybl execution drifted between native
-            # and wasm (float/libm results, formatting, ordering, …).
-            - run: cargo run -p nybl-vm --bin wasm_parity --release > native.txt
-            - run: cargo build -p nybl-vm --bin wasm_parity --release --target wasm32-wasip1
-            - run: wasmtime target/wasm32-wasip1/release/wasm_parity.wasm > wasm.txt
-            - run: cmp native.txt wasm.txt
+            # Runtime-smoke the nybl-sys clock on freestanding wasm. The
+            # exported function returns normally only when unix_time reports
+            # the documented Nybl error instead of trapping in SystemTime.
+            - run: cargo build -p nybl-wasm-clock-smoke --release --target wasm32-unknown-unknown
+            - run: wasmtime run --invoke nybl_sys_clock_smoke target/wasm32-unknown-unknown/release/nybl_wasm_clock_smoke.wasm
+            # Run the one curated differential corpus with the engines'
+            # default std backend and byte-compare native against WASI.
+            - run: cargo run -p nybl-wasm-parity --bin wasm_parity --release > default-native.txt
+            - run: cargo build -p nybl-wasm-parity --bin wasm_parity --release --target wasm32-wasip1
+            - run: wasmtime target/wasm32-wasip1/release/wasm_parity.wasm > default-wasm.txt
+            - run: cmp default-native.txt default-wasm.txt
+            # Repeat with both engines built default-features=false + no_std,
+            # which selects the same pure-Rust libm backend on both targets.
+            - run: cargo run -p nybl-wasm-parity --bin wasm_parity --release --no-default-features --features engine-no-std > no-std-native.txt
+            - run: cargo build -p nybl-wasm-parity --bin wasm_parity --release --target wasm32-wasip1 --no-default-features --features engine-no-std
+            - run: wasmtime target/wasm32-wasip1/release/wasm_parity.wasm > no-std-wasm.txt
+            - run: cmp no-std-native.txt no-std-wasm.txt
+            # Negative control: an opt-in target marker must make the same
+            # comparison differ, proving the parity check is sensitive.
+            - run: cargo run -p nybl-wasm-parity --bin wasm_parity --release --no-default-features --features engine-no-std,divergence-probe > probe-native.txt
+            - run: cargo build -p nybl-wasm-parity --bin wasm_parity --release --target wasm32-wasip1 --no-default-features --features engine-no-std,divergence-probe
+            - run: wasmtime target/wasm32-wasip1/release/wasm_parity.wasm > probe-wasm.txt
+            - name: Verify deliberate divergence is detected
+              run: |
+                  if cmp -s probe-native.txt probe-wasm.txt; then
+                      echo "parity comparison accepted a deliberate divergence"
+                      exit 1
+                  fi
 
     check-docs:
         name: Check docs and LLM exports

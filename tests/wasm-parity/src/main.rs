@@ -6,13 +6,12 @@
 //! index header, then every print line and the success/error outcome
 //! per engine, byte-stable.
 //!
-//! CI builds this binary twice — natively and for `wasm32-wasip1`
-//! (run under wasmtime) — and byte-compares the two transcripts. Any
-//! difference means Nybl execution has drifted between native and
-//! wasm (float formatting, libm/platform math results, integer
-//! semantics, hashing/ordering, …), which breaks downstream
-//! determinism invariants. The same transcript also cross-checks the
-//! two engines against each other on every platform it runs on.
+//! CI builds this std runner natively and for `wasm32-wasip1`, first
+//! linking the engines with their default `std` backend and then with
+//! defaults disabled plus `no_std` (pure-Rust `libm`). It byte-compares
+//! each native/wasm transcript. The runner itself uses std only for
+//! stdout and transcript storage; the selected engine feature graph is
+//! what the corpus exercises.
 //!
 //! The corpus is chosen for platform-drift sensitivity: float
 //! arithmetic and formatting, transcendental math builtins
@@ -23,6 +22,12 @@
 //! Program syntax mirrors `nybl-vm/tests/differential.rs`.
 
 use nybl::{NyblError, NyblHost, NyblLimits, Value};
+
+#[cfg(all(feature = "engine-std", feature = "engine-no-std"))]
+compile_error!("select exactly one engine backend feature");
+
+#[cfg(not(any(feature = "engine-std", feature = "engine-no-std")))]
+compile_error!("select one of `engine-std` or `engine-no-std`");
 
 /// (name, source) pairs. Every program must be deterministic: no
 /// host time, no external input — `rand` is fine because both
@@ -361,4 +366,17 @@ fn main() {
         });
     }
     println!("=== end ({} programs)", CORPUS.len());
+
+    // CI enables this only for a negative-control run. A target-specific
+    // marker proves the byte comparison detects an intentional divergence;
+    // it is never present in either production parity transcript.
+    #[cfg(feature = "divergence-probe")]
+    println!(
+        "=== divergence-probe: {}",
+        if cfg!(target_arch = "wasm32") {
+            "wasm"
+        } else {
+            "native"
+        }
+    );
 }

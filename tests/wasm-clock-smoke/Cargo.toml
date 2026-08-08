@@ -1,0 +1,14 @@
+[package]
+name = "nybl-wasm-clock-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nybl = { path = "../../nybl", package = "nybl-lang" }
+nybl-sys = { path = "../../nybl-sys" }

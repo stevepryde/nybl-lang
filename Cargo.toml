@@ -6,6 +6,8 @@ members = [
     "nybl-sys",
     "nybl-vm",
     "examples/rust-embedding",
+    "tests/wasm-clock-smoke",
+    "tests/wasm-parity",
 ]
 resolver = "2"
 
