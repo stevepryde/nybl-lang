@@ -12,6 +12,13 @@ This second region uses nine-character markers.
 Its purpose is to catch custom merge marker sizes.
 {{RIGHT_LONG}} fixture-right-long
 
+{{LEFT}} fixture-left-payload-opener
+This third region checks marker-like text in the right-hand payload.
+{{MIDDLE}}
+{{LEFT}} note-in-right-payload
+The active region must survive that payload line.
+{{RIGHT}} fixture-right-payload-opener
+
 The default scan excludes this one explicit fixture template. Self-test
-expands both regions in memory and passes them through the production region
+expands all regions in memory and passes them through the production region
 detector.

@@ -39,7 +39,10 @@ scan_stream() {
         {
             line = $0
             sub(/\r$/, "", line)
-            if (is_boundary(line, "<")) {
+            # A later opening can replace an incomplete candidate, but once a
+            # divider is seen we must retain that region until its closing
+            # marker. Right-hand payload may legitimately look like an opener.
+            if (!divider_line && is_boundary(line, "<")) {
                 opening_line = NR
                 divider_line = 0
                 next
@@ -115,8 +118,8 @@ if [[ ${1:-} == '--self-test' ]]; then
 
     if negative_matches=$(scan_stream "$negative_fixture (expanded)" <<<"$expanded_fixture"); then
         region_count=$(printf '%s\n' "$negative_matches" | wc -l | tr -d '[:space:]')
-        if [[ $region_count -ne 2 ]]; then
-            printf '%s\n' "Conflict-marker guard self-test found ${region_count} regions, expected 2." >&2
+        if [[ $region_count -ne 3 ]]; then
+            printf '%s\n' "Conflict-marker guard self-test found ${region_count} regions, expected 3." >&2
             exit 1
         fi
     else
