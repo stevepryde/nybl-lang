@@ -3,6 +3,20 @@
 All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
+## Unreleased
+
+### Embedding
+
+- Add `NyblLimits::disabled_builtins` (and `nybl_compile::Options::
+  disabled_builtins` for the AOT engine): a host-configured deny list for
+  engine builtins, built for deterministic simulation hosts that must route
+  all randomness through their own seeded RNG. A definite reference to a
+  disabled builtin is a fatal error at load/transpile time; references that
+  static analysis cannot prove (a shadowing binding may apply) raise the same
+  fatal, `try_call`-proof error the moment they would invoke the builtin.
+  Consistent across the walker, VM, and AOT engines; imported modules are
+  checked when they load.
+
 ## 0.4.2
 
 `0.4.2` rounds out the built-in collection surface with mutating dict methods

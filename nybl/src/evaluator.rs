@@ -2363,6 +2363,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     ) -> Result<ModuleBindings, NyblError> {
         let _ = line;
         let stmts = crate::parse(source)?;
+        // Modules load lazily at their `use` site, so this is the
+        // earliest point their source is visible — apply the same
+        // disabled-builtin gate the root program got, before any of
+        // the module's statements run.
+        crate::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
         let public_surface: Option<BTreeSet<String>> = {
             let mut names = BTreeSet::new();
             let mut explicit = false;
@@ -3063,9 +3068,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 // before mutation, which preserves exact instance memory
                 // accounting.
                 if let ExprKind::Ident(name) = &object.kind
-                    && self
-                        .get_var(name)
-                        .is_some_and(|value| methods::is_mutating_collection_receiver(value, method))
+                    && self.get_var(name).is_some_and(|value| {
+                        methods::is_mutating_collection_receiver(value, method)
+                    })
                 {
                     crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
                     let expected = methods::builtin_method_arity(method)
@@ -4238,6 +4243,16 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         // live here is now a method on the receiver's type —
         // see `methods::common_method` and `methods::numeric_method`.
         match name {
+            // Runtime backstop for host-disabled builtins: a call the
+            // load-time pass could not prove (a shadowing binding
+            // exists somewhere) still dies — fatally, so `try_call`
+            // can't swallow it — the moment it reaches the builtin.
+            "range" | "rand" | "print" | "try_call" | "panic"
+                if !self.limits.disabled_builtins.is_empty()
+                    && self.limits.disabled_builtins.contains(name) =>
+            {
+                return Err(crate::check::disabled_builtin_error(name, line));
+            }
             "range" => {
                 return builtins::builtin_range_in(&args, line, &mut self.rand_state, &self.memory);
             }

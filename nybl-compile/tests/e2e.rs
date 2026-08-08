@@ -367,7 +367,7 @@ impl ::nybl::NyblHost for Host {
     }
 }
 fn main() {
-    let limits = ::nybl::NyblLimits { max_steps: 100, max_memory: 1_024 };
+    let limits = ::nybl::NyblLimits { max_steps: 100, max_memory: 1_024, ..::nybl::NyblLimits::standard() };
     let mut host = Host;
     let mut instance = NyblInstance::load(&mut host, &limits).unwrap();
     let error = instance.call("trigger", &[], &mut host).unwrap_err();
@@ -1093,7 +1093,7 @@ impl ::nybl::NyblHost for Host {
     }
 }
 fn main() {
-    let limits = ::nybl::NyblLimits { max_steps: 100, max_memory: 1_600 };
+    let limits = ::nybl::NyblLimits { max_steps: 100, max_memory: 1_600, ..::nybl::NyblLimits::standard() };
     let mut host = Host {
         retained: ::std::cell::RefCell::new(Vec::new()),
         charged: None,
@@ -2452,7 +2452,7 @@ fn assert_memory_error(result: Result<::nybl::value::Value, ::nybl::error::NyblE
     assert_eq!(error.message, "Memory limit exceeded");
 }
 fn main() {
-    let limits = ::nybl::NyblLimits { max_steps: 1_000, max_memory: 1_200 };
+    let limits = ::nybl::NyblLimits { max_steps: 1_000, max_memory: 1_200, ..::nybl::NyblLimits::standard() };
     let mut host = Host { prints: 0 };
     let mut instance = NyblInstance::load(&mut host, &limits).unwrap();
 
@@ -2697,6 +2697,7 @@ fn cross_engine_warning_runs(
                 module_resolver: Some(modules_from_map(
                     modules.iter().map(|(name, source)| (*name, *source)),
                 )),
+                ..Options::default()
             },
         )
         .unwrap_or_else(|error| {
@@ -4229,4 +4230,33 @@ let value = try Result::Err("boom")"#;
             run.stderr
         );
     }
+}
+
+// ─── Host-disabled builtins ───────────────────────────────────────
+
+#[test]
+fn disabled_builtin_backstop_fires_at_runtime_in_generated_code() {
+    // The glob import could bind `rand`, so transpile cannot refuse
+    // the program; the generated call site must carry the same fatal
+    // error the walker and VM raise at their dispatch sites, and it
+    // must fire only when execution reaches the call.
+    let opts = Options {
+        disabled_builtins: std::collections::BTreeSet::from(["rand".to_string()]),
+        ..Options::default()
+    };
+    let run = run_aot_with_modules_and_opts(
+        "use noise\nprint(\"before\")\nlet x = rand(1)\nprint(\"after\")",
+        "disabled_builtin_backstop",
+        &[("noise", "let unrelated = 1")],
+        &opts,
+    );
+    assert_ne!(run.status, Some(0), "the backstop must abort the program");
+    assert_eq!(run.stdout, "before");
+    assert!(
+        run.stderr
+            .contains("builtin `rand` is disabled by the host"),
+        "stderr:\n{}\ngenerated:\n{}",
+        run.stderr,
+        run.rust_src
+    );
 }

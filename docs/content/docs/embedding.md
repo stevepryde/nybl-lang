@@ -419,8 +419,9 @@ fn on_tick(&mut self) -> Result<(), NyblError> {
 
 ```rust
 pub struct NyblLimits {
-    pub max_steps: u64,      // tick budget
-    pub max_memory: usize,   // bytes for strings + arrays + structs
+    pub max_steps: u64,                       // tick budget
+    pub max_memory: usize,                    // bytes for strings + arrays + structs
+    pub disabled_builtins: BTreeSet<String>,  // engine builtins the host forbids
 }
 ```
 
@@ -437,10 +438,51 @@ Custom:
 let limits = NyblLimits {
     max_steps: 50_000,
     max_memory: 32 * 1024 * 1024,
+    ..NyblLimits::standard()
 };
 ```
 
 Limit violations are **fatal** — `try_call` in user code can't swallow them.
+
+## Disabling builtins
+
+`NyblLimits::disabled_builtins` lets the host forbid specific engine builtins
+(`range`, `rand`, `print`, `try_call`, `panic`) for a program:
+
+```rust
+let limits = NyblLimits::standard().with_disabled_builtins(["rand"]);
+```
+
+The motivating case is a deterministic simulation or game engine: replays and
+lockstep networking need every piece of randomness to flow through the
+engine's own seeded RNG, and Nybl's builtin `rand` keeps instance-local state
+outside that seeding scheme. Disabling `rand` and exposing a host function (or
+module) with the engine's RNG makes the divergence impossible instead of
+merely discouraged.
+
+A disabled builtin is treated as a programming error, not a resource kill —
+but with the same **fatal** severity:
+
+- A definite reference fails at **load time** (or transpile time for the AOT
+  engine), before any program statement runs:
+  ``builtin `rand` is disabled by the host``.
+- A reference the load-time pass can't prove — the program contains a binding
+  that might shadow the name, such as `let rand = ...`, a parameter named
+  `rand`, or a glob `use` whose exports are unknown statically — fails with
+  the same fatal error at the moment it would actually invoke the builtin.
+  `try_call` cannot catch it in either form.
+- Imported modules are checked the same way when they load at their `use`
+  site (at transpile time for AOT, which resolves modules eagerly).
+
+Shadowing note: a value binding of the same name (`let rand = my_rng`) is not
+a violation — every engine dispatches the binding, so the builtin is
+unreachable and scripts can keep the ergonomic name. A `fn rand(...)`
+*declaration*, by contrast, is still rejected: builtins take priority over
+function declarations for direct calls, so the builtin would still be
+reachable.
+
+Unknown names in the set are allowed and simply never match, so a deny list
+written for a newer engine stays compatible with older ones.
 
 ## Ready-made host helpers
 

@@ -1,4 +1,9 @@
-//! Static advisory checks that run after parsing and before execution.
+//! Static checks that run after parsing and before execution.
+//!
+//! Most checks are advisory (warnings). The exception is
+//! [`disabled_builtins`], which turns a host-configured builtin deny
+//! list ([`crate::NyblLimits::disabled_builtins`]) into a fatal
+//! load-time error.
 //!
 //! Match exhaustiveness is deliberately conservative. The checker follows
 //! source-ordered lexical type bindings and only warns when every relevant arm
@@ -7,7 +12,13 @@
 //! shadowed namespaces suppress the advisory rather than risking a false
 //! diagnostic.
 
+pub mod disabled_builtins;
 mod source_order;
+
+pub use disabled_builtins::{
+    ENGINE_BUILTINS, check_disabled_builtins, collect_builtin_usage, disabled_builtin_error,
+    enforce_disabled_builtins,
+};
 
 use crate::error::NyblWarning;
 use crate::parser::Stmt;

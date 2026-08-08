@@ -40,6 +40,7 @@ fn generated_driver() -> String {
                         sandbox,
                         module_name: Some(format!("{mode}_{count}")),
                         module_resolver: None,
+                        ..Options::default()
                     },
                 )
                 .expect("transpile type-heavy program"),
@@ -64,6 +65,7 @@ fn main() {
     let limits = ::nybl::NyblLimits {
         max_steps: 100_000,
         max_memory: 64 * 1024 * 1024,
+        ..NyblLimits::standard()
     };
 "#,
     );
