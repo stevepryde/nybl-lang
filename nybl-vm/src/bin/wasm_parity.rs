@@ -336,6 +336,7 @@ fn run_engine(
     let limits = NyblLimits {
         max_steps: 5_000_000,
         max_memory: 32 * 1024 * 1024,
+        ..NyblLimits::standard()
     };
     let mut host = RecordHost { prints: Vec::new() };
     let result = run(source, &mut host, &limits);
