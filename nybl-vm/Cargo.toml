@@ -16,6 +16,15 @@ categories = ["compilers"]
 [lib]
 name = "nybl_vm"
 
+# Native ↔ wasm execution-parity harness. CI builds it natively and
+# for wasm32-wasip1 (run under wasmtime) and byte-compares the two
+# transcripts. Needs std (stdout) and the bundled stdlib, so no_std
+# builds skip it.
+[[bin]]
+name = "wasm_parity"
+path = "src/bin/wasm_parity.rs"
+required-features = ["std", "nybl-std"]
+
 [dependencies]
 nybl = { version = "0.4.2", path = "../nybl", package = "nybl-lang", default-features = false }
 

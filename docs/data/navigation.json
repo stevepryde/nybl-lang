@@ -186,6 +186,11 @@
         "title": "Stateful instances",
         "source": "embedding/instances.md",
         "path": "/docs/embedding/instances/"
+      },
+      {
+        "title": "WebAssembly",
+        "source": "embedding/wasm.md",
+        "path": "/docs/embedding/wasm/"
       }
     ]
   }
