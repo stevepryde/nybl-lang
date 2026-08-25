@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://nybl-lang.com/sitemap.xml

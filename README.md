@@ -224,29 +224,19 @@ the publishing order for the crates.
 
 ## Website
 
-The Nybl website and documentation are built with
-[Zola](https://www.getzola.org/) and published to Cloudflare Pages.
-
-```sh
-bun install
-bun run site:serve
-```
-
-Use `bun run site:check` to validate content and internal links, and
-`bun run site:build` to create the deployable site in `docs/public/`.
+The [Nybl website](https://nybl-lang.com/) and
+[language guide](https://nybl-lang.com/docs/) are maintained in
+[`stevepryde/nybl-app/site`](https://github.com/stevepryde/nybl-app/tree/main/site).
+This repository owns the language crates, crate READMEs, Rustdoc, examples,
+and publishing metadata.
 
 ## AI and coding assistants
 
-[`llms.txt`](llms.txt) is the concise, spec-compliant entry point for coding
-tools that need to write Nybl programs or embed Nybl in a Rust application. The
-website build also publishes clean Markdown for every curated documentation
-page and a complete context bundle at
+[`llms.txt`](https://nybl-lang.com/llms.txt) is the concise, spec-compliant
+entry point for coding tools that need to write Nybl programs or embed Nybl in
+a Rust application. The website also publishes clean Markdown for every
+curated documentation page and a complete context bundle at
 [`/llms-full.txt`](https://nybl-lang.com/llms-full.txt).
-
-Run `bun run site:llms` to regenerate and validate these derived files locally.
-The generator follows `docs/data/navigation.json`, strips Zola front matter,
-rewrites internal documentation links to their Markdown forms, and fails when
-`llms.txt` references a missing generated page.
 
 ## License
 

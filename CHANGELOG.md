@@ -216,5 +216,5 @@ canonical license texts:
 
 ```sh
 cargo +1.88.0 check --workspace --all-targets --locked
-bun run release:check-licenses
+bun run scripts/check-package-licenses.ts
 ```

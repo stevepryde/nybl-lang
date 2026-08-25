@@ -3,8 +3,9 @@
 > **Status: implemented.** This record preserves the accepted design and
 > implementation criteria. The normative runtime contract is
 > `RUN-020`/`AC-RUN-016` in `specs/language-runtime.md`; the grammar and user
-> documentation under `docs/content/docs/` own the public syntax and teaching
-> material.
+> documentation under
+> [`nybl-app/site/content/docs/`](https://github.com/stevepryde/nybl-app/tree/main/site/content/docs)
+> own the public syntax and teaching material.
 
 Tracking issue: [#40](https://github.com/stevepryde/nybl-lang/issues/40).
 
