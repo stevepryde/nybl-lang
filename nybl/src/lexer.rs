@@ -166,6 +166,15 @@ pub struct SpannedToken {
     pub column: u32,
 }
 
+/// Steps a module load costs: one per lexer token, excluding end of input.
+/// Every engine charges it once per load, after lexing and before parsing.
+pub fn module_load_steps(tokens: &[SpannedToken]) -> u64 {
+    tokens
+        .iter()
+        .filter(|token| !matches!(token.token, Token::Eof))
+        .count() as u64
+}
+
 pub fn lex(source: &str) -> Result<Vec<SpannedToken>, NyblError> {
     let mut lexer = Lexer::new(source);
     let raw = lexer.lex_all()?;

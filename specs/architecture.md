@@ -44,11 +44,17 @@ depend on `nybl-sys`.
   clone/drop behaviour, and explicit high-risk preflight checks.
 - **ARCH-004:** Module loading uses host resolution, isolated module scope,
   cycle detection, and per-run or per-instance caching with equivalent
-  language behaviour across engines. A single shared step budget across
-  imported modules is the target; walker and VM sub-engines currently restart
-  their local step counter.
-- **ARCH-005:** Walker, VM, and sandboxed AOT function call depth is bounded
-  before native recursion can overflow; VM dispatch and loop control remain
+  language behaviour across engines. Loading a module on a cache miss is one
+  call frame: the walker sub-evaluator, nested VM, and AOT loader inherit and
+  write back the importer's step count, call depth, and nesting budget, and
+  charge the module's token cost before running its top level. Module
+  functions run on the importer's engine, so only top levels need this.
+- **ARCH-005:** Native recursion is bounded before it can overflow: the
+  parse-depth cap counts nested syntax and operator/postfix chain links, so
+  every AST pass recurses at most that deep; call depth caps active frames;
+  and the nesting budget caps the sum of active frames' static nesting depth
+  (walker AST bodies, VM chunk metadata, and AOT per-function literals carry
+  the same `nybl::ast_depth` value). VM dispatch and loop control remain
   iterative.
 - **ARCH-006:** Public constructors preserve memory-accounting ownership by
   keeping tracked collection storage encapsulated.

@@ -63,7 +63,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use std::collections::{BTreeMap, BTreeSet};
 
 use nybl::builtins::{self, error, error_fatal_with_hint, error_with_hint};
-use nybl::error::{NyblError, NyblWarning};
+use nybl::error::NyblError;
+use nybl::import_scope::{ImportScope, ImportedName};
 use nybl::methods;
 use nybl::ops;
 use nybl::parser::{ParamMode, Visibility};
@@ -189,6 +190,10 @@ struct Frame {
     /// Exact declaration invoked for a direct named-function frame. Bare
     /// self-recursion resolves here before host/name dispatch.
     current_function_entry: Option<Rc<FnEntry>>,
+    /// Nesting charged by this frame and every frame below it (including
+    /// importers of the module this VM runs), against
+    /// `NyblLimits::max_nesting`. Popping a frame releases its charge.
+    nesting_total: u32,
 }
 
 impl Frame {
@@ -214,6 +219,7 @@ impl Frame {
             prepared_calls: Vec::new(),
             pending_write_backs: Vec::new(),
             current_function_entry: None,
+            nesting_total: 0,
         }
     }
 
@@ -244,6 +250,7 @@ impl Frame {
             prepared_calls: Vec::new(),
             pending_write_backs: Vec::new(),
             current_function_entry: None,
+            nesting_total: 0,
         }
     }
 
@@ -583,6 +590,9 @@ struct CompiledModule {
     chunk: Arc<Chunk>,
     source: Arc<str>,
     builtin_usage: Arc<BTreeMap<String, u32>>,
+    /// Source-level step cost of loading this module (one per lexer token),
+    /// charged when an instance loads it, exactly as a lazy load would.
+    load_steps: u64,
 }
 
 type CompiledModuleGraph = Arc<BTreeMap<String, CompiledModule>>;
@@ -727,13 +737,16 @@ pub struct Vm<'h, H: NyblHost + ?Sized> {
     host: &'h mut H,
     steps: u64,
     step_budget: u64,
+    /// Frames active below this VM: a nested module VM inherits its
+    /// importer's call depth plus one frame for the load itself.
+    call_depth_base: usize,
     rand_state: u64,
     imports: ImportCache,
     /// `None` preserves the legacy host-resolved module path. `Some` is a
     /// complete compile-time-resolved graph and must never consult the host
     /// for source, including when the graph is empty.
     compiled_modules: Option<CompiledModuleGraph>,
-    imported_here: Vec<BTreeSet<String>>,
+    import_scopes: Vec<ImportScope>,
     limits: NyblLimits,
     /// Module this VM is running — tags newly declared types
     /// with their full identity so two modules declaring the
@@ -785,9 +798,6 @@ pub struct Vm<'h, H: NyblHost + ?Sized> {
     live_value_environments: LiveValueEnvironments,
     binding_origins: BTreeMap<String, BindingOrigin>,
     live_binding_origins: LiveBindingOrigins,
-    /// Non-fatal runtime diagnostics accumulated across the root VM and any
-    /// nested module VMs. Only a public operation boundary writes them.
-    runtime_warnings: Vec<NyblWarning>,
 }
 
 struct VmState {
@@ -797,7 +807,7 @@ struct VmState {
     rand_state: u64,
     imports: ImportCache,
     compiled_modules: Option<CompiledModuleGraph>,
-    imported_here: Vec<BTreeSet<String>>,
+    import_scopes: Vec<ImportScope>,
     current_module: String,
     struct_defs: BTreeMap<(String, String), Vec<String>>,
     enum_defs: BTreeMap<(String, String), Vec<(String, EnumVariantShape)>>,
@@ -814,7 +824,6 @@ struct VmState {
     live_value_environments: LiveValueEnvironments,
     binding_origins: BTreeMap<String, BindingOrigin>,
     live_binding_origins: LiveBindingOrigins,
-    runtime_warnings: Vec<NyblWarning>,
 }
 
 /// A loaded bytecode program whose globals and module state survive calls.
@@ -913,7 +922,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // The top frame resolves directly through the VM's live scope maps.
         // Keeping another strong reference to the root lexical context would
         // force copy-on-write publication to clone on every declaration.
-        let top = Frame::top(chunk, Rc::new(ModuleLexicalContext::default()));
+        let mut top = Frame::top(chunk, Rc::new(ModuleLexicalContext::default()));
+        // The top level is this VM's first active frame; an importer checks
+        // and inherits the budget before building a module VM.
+        top.nesting_total = top.chunk.nesting_depth;
         Self {
             frames: vec![top],
             stack: Vec::new(),
@@ -921,10 +933,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             host,
             steps: 0,
             step_budget,
+            call_depth_base: 0,
             rand_state: 0,
             imports: module_runtime.imports,
             compiled_modules,
-            imported_here: vec![BTreeSet::new()],
+            import_scopes: vec![ImportScope::default()],
             limits,
             current_module,
             struct_defs,
@@ -943,7 +956,6 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             live_value_environments: module_runtime.environments,
             binding_origins: BTreeMap::new(),
             live_binding_origins: module_runtime.origins,
-            runtime_warnings: Vec::new(),
         }
     }
 
@@ -955,7 +967,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             rand_state: self.rand_state,
             imports: self.imports,
             compiled_modules: self.compiled_modules,
-            imported_here: self.imported_here,
+            import_scopes: self.import_scopes,
             current_module: self.current_module,
             struct_defs: self.struct_defs,
             enum_defs: self.enum_defs,
@@ -972,7 +984,6 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             live_value_environments: self.live_value_environments,
             binding_origins: self.binding_origins,
             live_binding_origins: self.live_binding_origins,
-            runtime_warnings: self.runtime_warnings,
         }
     }
 
@@ -982,17 +993,24 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         limits: NyblLimits,
         memory: nybl::memory::MemoryContext,
     ) -> Self {
+        let mut frames = state.frames;
+        // The retained root frame is not executing during an instance call,
+        // so it charges no nesting; each call charges only its own frames.
+        if let Some(root) = frames.first_mut() {
+            root.nesting_total = 0;
+        }
         Self {
-            frames: state.frames,
+            frames,
             stack: state.stack,
             functions: state.functions,
             host,
             steps: 0,
             step_budget: limits.max_steps.saturating_mul(STEP_SCALE),
+            call_depth_base: 0,
             rand_state: state.rand_state,
             imports: state.imports,
             compiled_modules: state.compiled_modules,
-            imported_here: state.imported_here,
+            import_scopes: state.import_scopes,
             limits,
             current_module: state.current_module,
             struct_defs: state.struct_defs,
@@ -1011,7 +1029,6 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             live_value_environments: state.live_value_environments,
             binding_origins: state.binding_origins,
             live_binding_origins: state.live_binding_origins,
-            runtime_warnings: state.runtime_warnings,
         }
     }
 
@@ -1031,7 +1048,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         self.type_bindings.truncate(1);
         self.module_aliases.truncate(1);
         self.imported_functions.truncate(1);
-        self.imported_here.truncate(1);
+        self.import_scopes.truncate(1);
     }
 
     /// Grab a slot vec from the freelist or allocate a fresh one,
@@ -1060,56 +1077,50 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     }
 
     pub fn run(mut self) -> Result<(), NyblError> {
-        let result = (|| {
-            let mut last_line: u32 = 0;
-            while let Some((instr, line)) = self.fetch() {
-                last_line = line;
-                // Tick errors (resource-limit violations) are always
-                // fatal, so `unwind_to_try_call` will short-circuit
-                // them. The path still goes through the helper so
-                // the two error paths behave identically.
-                if let Err(err) = self.tick(line) {
+        self.check_root_nesting()?;
+        let mut last_line: u32 = 0;
+        while let Some((instr, line)) = self.fetch() {
+            last_line = line;
+            // Tick errors (resource-limit violations) are always
+            // fatal, so `unwind_to_try_call` will short-circuit
+            // them. The path still goes through the helper so
+            // the two error paths behave identically.
+            if let Err(err) = self.tick(line) {
+                let err = self.attach_frame_module_context(err);
+                self.unwind_to_try_call(err)?;
+                continue;
+            }
+            match self.dispatch(instr, line) {
+                Ok(Next::Continue) => {}
+                Ok(Next::Halt) => break,
+                Err(err) => {
                     let err = self.attach_frame_module_context(err);
                     self.unwind_to_try_call(err)?;
-                    continue;
-                }
-                match self.dispatch(instr, line) {
-                    Ok(Next::Continue) => {}
-                    Ok(Next::Halt) => break,
-                    Err(err) => {
-                        let err = self.attach_frame_module_context(err);
-                        self.unwind_to_try_call(err)?;
-                    }
                 }
             }
-            // Programs that allocate past the memory limit and then
-            // finish in fewer ticks than the periodic memory-check
-            // cadence (see `TICK_MEMCHECK_MASK`) would otherwise slip
-            // through silently. Catch them here — cheap, and a
-            // program ending always runs this exactly once.
-            if self.memory.__exceeded() {
-                return Err(error_fatal_with_hint(
-                    last_line,
-                    "Memory limit exceeded",
-                    "Your code is using too much memory. Check for large strings or arrays growing in loops.",
-                ));
-            }
-            Ok(())
-        })();
-        self.write_runtime_warnings();
-        result
+        }
+        // Programs that allocate past the memory limit and then
+        // finish in fewer ticks than the periodic memory-check
+        // cadence (see `TICK_MEMCHECK_MASK`) would otherwise slip
+        // through silently. Catch them here — cheap, and a
+        // program ending always runs this exactly once.
+        if self.memory.__exceeded() {
+            return Err(error_fatal_with_hint(
+                last_line,
+                "Memory limit exceeded",
+                "Your code is using too much memory. Check for large strings or arrays growing in loops.",
+            ));
+        }
+        Ok(())
     }
 
-    /// Deliver accumulated warnings once at an externally visible execution
-    /// boundary. The Vec exists in no_std builds too; only stderr delivery is
-    /// unavailable there.
-    fn write_runtime_warnings(&mut self) {
-        #[cfg(any(feature = "std", not(feature = "no_std")))]
-        for warning in self.runtime_warnings.drain(..) {
-            eprintln!("warning: {}", warning.message);
+    /// Reject a root program whose top level alone exceeds the nesting
+    /// budget, before it runs.
+    fn check_root_nesting(&self) -> Result<(), NyblError> {
+        if self.nesting_used() > self.limits.max_nesting {
+            return Err(nybl::error_messages::nesting_error(0));
         }
-        #[cfg(all(feature = "no_std", not(feature = "std")))]
-        self.runtime_warnings.clear();
+        Ok(())
     }
 
     // ─── Fetch / ip ──────────────────────────────────────────────
@@ -1246,7 +1257,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         self.type_bindings.push(BTreeMap::new());
         self.module_aliases.push(BTreeMap::new());
         self.imported_functions.push(BTreeMap::new());
-        self.imported_here.push(BTreeSet::new());
+        self.import_scopes.push(ImportScope::default());
     }
 
     fn pop_scope(&mut self) {
@@ -1269,7 +1280,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 self.type_bindings.pop();
                 self.module_aliases.pop();
                 self.imported_functions.pop();
-                self.imported_here.pop();
+                self.import_scopes.pop();
             }
         }
     }
@@ -1306,7 +1317,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let alias_scope_base = self.module_aliases.len();
         self.module_aliases.push(BTreeMap::new());
         self.imported_functions.push(BTreeMap::new());
-        self.imported_here.push(BTreeSet::new());
+        self.import_scopes.push(ImportScope::default());
         let mut frame = Frame::function(
             chunk,
             slots,
@@ -1323,8 +1334,51 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             wrap,
         );
         frame.defining_environment_module = frame.function_module.clone();
+        frame.nesting_total = self
+            .nesting_used()
+            .saturating_add(frame.chunk.nesting_depth);
         self.frames.push(frame);
         self.type_bindings.push(BTreeMap::new());
+    }
+
+    /// Nesting charged by every active frame.
+    fn nesting_used(&self) -> u32 {
+        self.frames.last().map_or(0, |frame| frame.nesting_total)
+    }
+
+    /// Reject a frame whose chunk would exceed the nesting budget. Called
+    /// after the arity and call-depth checks, before the frame is pushed.
+    fn check_nesting(&self, depth: u32, line: u32) -> Result<(), NyblError> {
+        if self.nesting_used().saturating_add(depth) > self.limits.max_nesting {
+            return Err(nybl::error_messages::nesting_error(line));
+        }
+        Ok(())
+    }
+
+    /// Frames active across this VM and the importers below it.
+    fn active_call_depth(&self) -> usize {
+        self.call_depth_base + self.frames.len().saturating_sub(1)
+    }
+
+    /// Charge a fixed source-level step cost (a module load).
+    fn charge_steps(&mut self, steps: u64, line: u32) -> Result<(), NyblError> {
+        self.steps = self.steps.saturating_add(steps.saturating_mul(STEP_SCALE));
+        if self.steps > self.step_budget {
+            return Err(nybl::error_messages::step_limit_error(line));
+        }
+        Ok(())
+    }
+
+    /// Record that a named function body binds its own name (unless a
+    /// parameter reuses it), so a flat `use` in the body treats that name as
+    /// the function's own declaration, exactly like the tree-walker.
+    fn bind_function_self_name(&mut self, name: Option<&str>, params: &[String], module: &str) {
+        if let Some(name) = name
+            && !params.iter().any(|param| param == name)
+            && let Some(scope) = self.import_scopes.last_mut()
+        {
+            scope.self_binding = Some((module.to_string(), name.to_string()));
+        }
     }
 
     fn apply_entry_alias_context(&mut self, entry: &FnEntry) {
@@ -1927,6 +1981,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                         .insert(origin.1, previous);
                 }
                 self.define_local(name.clone(), v);
+                if let Some(imports) = self.import_scopes.last_mut() {
+                    imports.forget(&name);
+                }
                 if self.is_module_top_scope() {
                     self.binding_origins
                         .insert(name.clone(), (self.current_module.clone(), name.clone()));
@@ -2402,7 +2459,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
 
             // ─── Functions ────────────────────────────────────────
             Instr::DefineFn(idx) => {
-                self.define_fn(idx);
+                self.define_fn(idx, line)?;
             }
             Instr::MakeLambda(idx) => {
                 self.make_lambda(idx, line)?;
@@ -3806,13 +3863,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         args: Vec<Value>,
         line: u32,
     ) -> Result<Next, NyblError> {
-        if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
-            return Err(error_with_hint(
-                line,
-                "Too many nested function calls (possible infinite recursion)",
-                "Check that your recursive function has a base case that stops calling itself.",
-            ));
+        if self.active_call_depth() >= MAX_CALL_DEPTH {
+            return Err(nybl::error_messages::call_depth_error(line));
         }
+        self.check_nesting(entry.chunk.nesting_depth, line)?;
         let args = self.pack_rest_arguments(args, &entry.param_modes, line)?;
         let slot_count = entry.chunk.slot_count as usize;
         let mut slots = self.take_slots(slot_count);
@@ -3836,6 +3890,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .last_mut()
             .expect("callee frame")
             .current_function_entry = Some(Rc::clone(&entry));
+        self.bind_function_self_name(
+            entry.exact_self_name.as_deref(),
+            &entry.params,
+            &entry.module_path,
+        );
         self.apply_entry_alias_context(&entry);
         Ok(Next::Continue)
     }
@@ -4140,13 +4199,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             let args = self.pop_n_values(argc, line)?;
             return self.enter_user_fn_args(entry, args, line);
         }
-        if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
-            return Err(error_with_hint(
-                line,
-                "Too many nested function calls (possible infinite recursion)",
-                "Check that your recursive function has a base case that stops calling itself.",
-            ));
+        if self.active_call_depth() >= MAX_CALL_DEPTH {
+            return Err(nybl::error_messages::call_depth_error(line));
         }
+        self.check_nesting(entry.chunk.nesting_depth, line)?;
 
         if self.stack.len() < argc {
             return Err(error(line, "VM: stack underflow"));
@@ -4199,6 +4255,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             .last_mut()
             .expect("callee frame")
             .current_function_entry = Some(Rc::clone(&entry));
+        self.bind_function_self_name(
+            entry.exact_self_name.as_deref(),
+            &entry.params,
+            &entry.module_path,
+        );
         self.apply_entry_alias_context(&entry);
         // A fresh type_bindings frame scopes any type decl
         // inside this fn to the fn body itself — same rule
@@ -5218,10 +5279,30 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
     }
 
-    fn define_fn(&mut self, idx: FnIdx) {
+    fn define_fn(&mut self, idx: FnIdx, line: u32) -> Result<(), NyblError> {
         let chunk = Arc::clone(&self.frames.last().expect("frame present").chunk);
         let fn_def = chunk.function(idx);
         let name = fn_def.name.clone();
+        // A flat `use` already bound this name in this scope; a declaration
+        // silently replacing the import (or being shadowed by it) would lose
+        // one of the two definitions.
+        if fn_def.checks_import_clash {
+            if let Some(imported) = self
+                .import_scopes
+                .last()
+                .and_then(|scope| scope.names.get(&name))
+            {
+                return Err(nybl::error_messages::function_replaces_import_error(
+                    &name,
+                    &imported.path,
+                    line,
+                ));
+            }
+            // A later flat import of this name in the same scope clashes.
+            if let Some(imports) = self.import_scopes.last_mut() {
+                imports.functions.insert(name.clone());
+            }
+        }
         let entry = Rc::new(FnEntry {
             exact_self_name: Some(name.clone()),
             params: fn_def.params.clone(),
@@ -5249,6 +5330,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 self.abi_declarations.push((name, entry));
             }
         }
+        Ok(())
     }
 
     /// Materialise a lambda expression as a `Value::Fn`. Each
@@ -5366,13 +5448,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         validate_user_arity(display_name, &func.param_modes, args.len(), false, line)?;
         let args = self.pack_rest_arguments(args, &func.param_modes, line)?;
 
-        if self.frames.len().saturating_sub(1) >= MAX_CALL_DEPTH {
-            return Err(error_with_hint(
-                line,
-                "Too many nested function calls (possible infinite recursion)",
-                "Check that your recursive function has a base case that stops calling itself.",
-            ));
+        if self.active_call_depth() >= MAX_CALL_DEPTH {
+            return Err(nybl::error_messages::call_depth_error(line));
         }
+        self.check_nesting(chunk.nesting_depth, line)?;
 
         // Lambda params + locals go into the flat `slots` array
         // (same fast path as named fns). Captures and the
@@ -5406,6 +5485,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             func.module_path.clone(),
             FrameWrap::None,
         );
+        let module = func
+            .module_path
+            .as_deref()
+            .unwrap_or(nybl::value::ROOT_MODULE_PATH);
+        self.bind_function_self_name(func.self_name.as_deref(), &func.params, module);
         if let Some(frame) = self.frames.last_mut() {
             frame.captured_names = func.captures.iter().map(|(name, _)| name.clone()).collect();
         }
@@ -5427,9 +5511,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let is_plain_glob = items.is_none() && alias.is_none();
         if is_plain_glob
             && self
-                .imported_here
+                .import_scopes
                 .last()
-                .is_some_and(|imports| imports.contains(path))
+                .is_some_and(|imports| imports.paths.contains(path))
         {
             return Ok(());
         }
@@ -5521,7 +5605,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
         // Functions and values are stored separately inside module artifacts,
         // but a flat import exposes one namespace. Sorting the combined
-        // projection makes warning order match the walker and generated AOT.
+        // projection makes the first reported clash match the walker and AOT.
         exports.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         // Selective filter: ensure every listed name exists, then
@@ -5637,31 +5721,62 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             // (the user explicitly asked).
             let skip_private = items.is_none() && !artifacts.explicit_surface;
             let module_top_scope = self.is_module_top_scope();
+            let incoming_origin = |name: &str| {
+                artifacts
+                    .binding_origins
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| (path.to_string(), name.to_string()))
+            };
+            // A flat import binds every selected name or none. A name this
+            // scope already binds to the same declaration (a diamond
+            // re-export, or a selective import followed by a glob) is
+            // already in place; any other existing binding is a clash.
+            let mut already_bound = BTreeSet::new();
+            for (name, _) in &exports {
+                if skip_private && nybl::naming::is_private(name) {
+                    continue;
+                }
+                match self.flat_binding_origin(name, module_top_scope, spec.local_scope) {
+                    None => {}
+                    Some(Some(existing)) if existing == incoming_origin(name) => {
+                        already_bound.insert(name.clone());
+                    }
+                    Some(_) => {
+                        return Err(nybl::error_messages::import_clash_error(name, path, line));
+                    }
+                }
+            }
+            for (type_name, origin) in &exposed_types {
+                if let Some(existing) = self
+                    .type_bindings
+                    .last()
+                    .and_then(|scope| scope.get(type_name))
+                    && existing != origin
+                {
+                    return Err(nybl::error_messages::import_clash_error(
+                        type_name, path, line,
+                    ));
+                }
+            }
             for (name, mut value) in exports {
                 if skip_private && nybl::naming::is_private(&name) {
                     continue;
                 }
-                let clashes = self
-                    .frames
-                    .last()
-                    .and_then(|f| f.scopes.last())
-                    .map(|s| s.contains_key(&name))
-                    .unwrap_or(false)
-                    || (module_top_scope && self.functions.contains_key(&name))
-                    // Slot-allocated locals / params never appear in
-                    // dynamic scope maps. Their shared lexical-scope
-                    // index plus this use site's binding frontier keeps
-                    // the same first-definition-wins check logarithmic.
-                    || self.local_scope_shadows(spec.local_scope, &name);
-                if clashes {
-                    if is_plain_glob {
-                        self.runtime_warnings.push(NyblWarning::at(
-                            nybl::error_messages::glob_shadow_warning(&name, path),
-                            line,
-                        ));
-                    }
+                if already_bound.contains(&name) {
                     continue;
                 }
+                self.import_scopes
+                    .last_mut()
+                    .expect("import scope")
+                    .names
+                    .insert(
+                        name.clone(),
+                        ImportedName {
+                            origin: incoming_origin(&name),
+                            path: path.to_string(),
+                        },
+                    );
                 if let Some(entry) = fn_entries.remove(&name) {
                     self.imported_functions
                         .last_mut()
@@ -5708,8 +5823,8 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
             // Bring the module's exposed types in by bare name
             // too — `Color::Red` now resolves to *this*
-            // module's Color. First-win on conflict matches the
-            // value-binding rule.
+            // module's Color. Clashing names were rejected above, so a
+            // bound name here already has this origin.
             for (type_name, origin) in &exposed_types {
                 let already_bound = self
                     .type_bindings
@@ -5732,12 +5847,52 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
 
         if is_plain_glob {
-            self.imported_here
+            self.import_scopes
                 .last_mut()
                 .expect("import scope")
+                .paths
                 .insert(path.to_string());
         }
         Ok(())
+    }
+
+    /// Origin of `name`'s binding in the current scope, as a flat `use`
+    /// sees it: `None` when unbound, `Some(None)` for a local declaration
+    /// (a `let`, parameter, or — at module top level — an executed `fn`),
+    /// and `Some(Some(origin))` for a name a flat `use` bound here or a
+    /// function body's own name. Mirrors the tree-walker.
+    fn flat_binding_origin(
+        &self,
+        name: &str,
+        module_top_scope: bool,
+        local_scope: Option<crate::chunk::LocalScopeSnapshot>,
+    ) -> Option<Option<nybl::import_scope::BindingOrigin>> {
+        // Slot-allocated locals / params never appear in dynamic scope maps.
+        // Their shared lexical-scope index plus this use site's binding
+        // frontier keeps the check logarithmic. A visible slot local is the
+        // current binding: an import over an earlier one would have failed,
+        // so it was declared after any import of the name in this scope.
+        if self.local_scope_shadows(local_scope, name) {
+            return Some(None);
+        }
+        if let Some(origin) = self
+            .import_scopes
+            .last()
+            .and_then(|scope| scope.known_origin(name))
+        {
+            return Some(Some(origin.clone()));
+        }
+        let bound = self
+            .frames
+            .last()
+            .and_then(|frame| frame.scopes.last())
+            .is_some_and(|scope| scope.contains_key(name))
+            || self
+                .import_scopes
+                .last()
+                .is_some_and(|scope| scope.functions.contains(name))
+            || (module_top_scope && self.functions.contains_key(name));
+        bound.then_some(None)
     }
 
     fn local_scope_shadows(
@@ -5891,47 +6046,57 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
         }
 
+        // A load runs the module's top level as one more active frame.
+        if self.active_call_depth() >= MAX_CALL_DEPTH {
+            return Err(nybl::error_messages::call_depth_error(line));
+        }
+
         let compiled = self
             .compiled_modules
             .as_ref()
             .and_then(|modules| modules.get(path))
             .cloned();
 
-        let source = if compiled.is_none() && self.compiled_modules.is_none() {
-            match self.host.resolve_module(path) {
-                Some(Ok(source)) => Some(source),
-                Some(Err(error)) => return Err(error),
-                None => return Err(error(line, format!("Module `{path}` not found"))),
+        let (chunk, source): (Arc<Chunk>, Arc<str>) = match compiled {
+            Some(module) => {
+                // Same cost and checkpoint as a lazy load of this source.
+                self.charge_steps(module.load_steps, line)?;
+                nybl::check::check_disabled_builtins(
+                    &module.builtin_usage,
+                    &self.limits.disabled_builtins,
+                )
+                .map_err(|error| error.with_module_source(path, module.source.as_ref()))?;
+                (module.chunk, module.source)
             }
-        } else {
-            None
+            None if self.compiled_modules.is_some() => {
+                // `compile_with_modules` constructs a closed graph from every
+                // nested chunk's use sites. Reaching this means trusted
+                // bytecode and its artifact disagree; never silently fall
+                // back to a host and compromise the compile-once contract.
+                return Err(error(
+                    line,
+                    format!("Module `{path}` is missing from the compiled module graph"),
+                ));
+            }
+            None => {
+                let source = match self.host.resolve_module(path) {
+                    Some(Ok(source)) => source,
+                    Some(Err(error)) => return Err(error),
+                    None => return Err(error(line, format!("Module `{path}` not found"))),
+                };
+                let chunk = self.compile_module_source(path, &source, line)?;
+                (Arc::new(chunk), Arc::from(source))
+            }
         };
-
-        if compiled.is_none() && self.compiled_modules.is_some() {
-            // `compile_with_modules` constructs a closed graph from every
-            // nested chunk's use sites. Reaching this means trusted bytecode
-            // and its artifact disagree; never silently fall back to a host
-            // and compromise the compile-once contract.
-            return Err(error(
-                line,
-                format!("Module `{path}` is missing from the compiled module graph"),
-            ));
-        }
+        self.check_nesting(chunk.nesting_depth, line)?;
 
         self.imports
             .borrow_mut()
             .insert(path.to_string(), ImportSlot::Loading);
 
-        let result = match compiled {
-            Some(module) => self
-                .evaluate_compiled_module(path, &module)
-                .map_err(|error| error.with_module_source(path, module.source.as_ref())),
-            None => {
-                let source = source.expect("legacy module source resolved");
-                self.evaluate_module(path, &source)
-                    .map_err(|error| error.with_module_source(path, source.as_str()))
-            }
-        };
+        let result = self
+            .evaluate_module_chunk(path, chunk)
+            .map_err(|error| error.with_module_source(path, source.as_ref()));
 
         match result {
             Ok(bindings) => {
@@ -5947,36 +6112,28 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
     }
 
-    /// Parse, compile, and execute a module in a nested VM that
-    /// shares the import cache and limits. Returns the module's
-    /// top-level `(name, Value)` bindings, with named fns reified
-    /// as `Value::Fn` carrying VM-compiled chunks so the caller's
-    /// `Call` / `CallValue` paths can dispatch them directly.
-    fn evaluate_module(
+    /// Lex, charge, parse, and compile a lazily resolved module. Loading
+    /// costs one step per token, charged to the importer before parsing; a
+    /// failed load is not refunded.
+    fn compile_module_source(
         &mut self,
-        module_path: &str,
+        path: &str,
         source: &str,
-    ) -> Result<ModuleArtifacts, NyblError> {
-        let stmts = nybl::parse(source)?;
-        // Modules load lazily at their `use` site, so this is the
-        // earliest point their source is visible — apply the same
-        // disabled-builtin gate the root program got, before any of
-        // the module's statements run.
-        nybl::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
-        let chunk = crate::compile(&stmts)?;
-        self.evaluate_module_chunk(module_path, Arc::new(chunk))
-    }
-
-    fn evaluate_compiled_module(
-        &mut self,
-        module_path: &str,
-        module: &CompiledModule,
-    ) -> Result<ModuleArtifacts, NyblError> {
-        nybl::check::check_disabled_builtins(
-            &module.builtin_usage,
-            &self.limits.disabled_builtins,
-        )?;
-        self.evaluate_module_chunk(module_path, Arc::clone(&module.chunk))
+        line: u32,
+    ) -> Result<Chunk, NyblError> {
+        let tokens =
+            nybl::lexer::lex(source).map_err(|error| error.with_module_source(path, source))?;
+        self.charge_steps(nybl::lexer::module_load_steps(&tokens), line)?;
+        (|| {
+            let stmts = nybl::parser::parse(tokens)?;
+            // Modules load lazily at their `use` site, so this is the
+            // earliest point their source is visible — apply the same
+            // disabled-builtin gate the root program got, before any of
+            // the module's statements run.
+            nybl::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
+            crate::compile(&stmts)
+        })()
+        .map_err(|error| error.with_module_source(path, source))
     }
 
     /// Execute one module's already-compiled top-level chunk. The resulting
@@ -5994,6 +6151,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             origins: Rc::clone(&self.live_binding_origins),
         };
         let limits = self.limits.clone();
+        let call_depth_base = self.active_call_depth() + 1;
+        let nesting_base = self.nesting_used();
+        let steps = self.steps;
         let mut sub = Vm::new_internal(
             chunk,
             self.host,
@@ -6005,11 +6165,15 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             self.function_origin.clone(),
             self.memory.clone(),
         );
+        // The module VM shares this operation's step budget, call depth,
+        // and nesting budget.
+        sub.steps = steps;
+        sub.call_depth_base = call_depth_base;
+        if let Some(top) = sub.frames.first_mut() {
+            top.nesting_total = nesting_base.saturating_add(top.chunk.nesting_depth);
+        }
         let module_result = sub.run_internal();
-        // Nested module VMs are an implementation detail of the root
-        // operation. Preserve their diagnostics (including transitive ones)
-        // and defer stderr delivery to that operation's public boundary.
-        self.runtime_warnings.append(&mut sub.runtime_warnings);
+        self.steps = sub.steps;
         if let Err(module_error) = module_result {
             sub.restore_instance_baseline();
             let failed_environment = sub
@@ -6184,7 +6348,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             self.type_bindings.truncate(frame.type_scope_base);
             self.module_aliases.truncate(frame.alias_scope_base);
             self.imported_functions.truncate(frame.alias_scope_base);
-            self.imported_here.truncate(frame.alias_scope_base);
+            self.import_scopes.truncate(frame.alias_scope_base);
             return Ok(Next::Halt);
         }
         // Pop the current frame, truncate any frame-local stack
@@ -6199,7 +6363,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         self.type_bindings.truncate(frame.caller_type_scope_depth());
         self.module_aliases.truncate(frame.alias_scope_base);
         self.imported_functions.truncate(frame.alias_scope_base);
-        self.imported_here.truncate(frame.alias_scope_base);
+        self.import_scopes.truncate(frame.alias_scope_base);
         // Iterator-protocol landing pads get their own return
         // handling — they don't just push the value; they
         // manipulate the caller's stack (and maybe jump) to
@@ -6637,7 +6801,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             self.type_bindings.truncate(frame.caller_type_scope_depth());
             self.module_aliases.truncate(frame.alias_scope_base);
             self.imported_functions.truncate(frame.alias_scope_base);
-            self.imported_here.truncate(frame.alias_scope_base);
+            self.import_scopes.truncate(frame.alias_scope_base);
             if !frame.slots.is_empty() {
                 self.return_slots(frame.slots);
             }
@@ -6885,8 +7049,11 @@ where
             ));
         }
     };
-    let statements =
-        nybl::parse(&source).map_err(|error| error.with_module_source(path, source.as_str()))?;
+    let tokens = nybl::lexer::lex(&source)
+        .map_err(|error| error.with_module_source(path, source.as_str()))?;
+    let load_steps = nybl::lexer::module_load_steps(&tokens);
+    let statements = nybl::parser::parse(tokens)
+        .map_err(|error| error.with_module_source(path, source.as_str()))?;
     let builtin_usage = nybl::check::collect_builtin_usage(&statements);
     let compiled = crate::compiler::compile_program(&statements)
         .map_err(|error| error.with_module_source(path, source.as_str()))?;
@@ -6899,6 +7066,7 @@ where
         chunk: Arc::new(compiled.chunk),
         source: Arc::from(source),
         builtin_usage: Arc::new(builtin_usage),
+        load_steps,
     };
     modules.insert(path.to_string(), module);
 
@@ -6966,9 +7134,8 @@ impl NyblInstance {
             NyblFnOrigin::__instance("vm"),
             memory.clone(),
         );
-        let execution = vm.run_internal();
-        vm.write_runtime_warnings();
-        execution?;
+        vm.check_root_nesting()?;
+        vm.run_internal()?;
         if memory.__exceeded() {
             return Err(instance_memory_error());
         }
@@ -7076,7 +7243,6 @@ impl NyblInstance {
                 value
             }
         };
-        vm.write_runtime_warnings();
         self.state = Some(vm.into_state());
         result
     }
@@ -7113,7 +7279,6 @@ impl NyblInstance {
                     .and_then(|_| vm.run_internal());
                 let value = execution.and_then(|_| vm.pop_value(0));
                 vm.restore_instance_baseline();
-                vm.write_runtime_warnings();
                 if self.memory.__exceeded() {
                     return Err(instance_memory_error());
                 }
@@ -7121,7 +7286,6 @@ impl NyblInstance {
             }
             Ok(values)
         })();
-        vm.write_runtime_warnings();
         self.state = Some(vm.into_state());
         result
     }
@@ -7178,7 +7342,6 @@ impl NyblInstance {
                 value
             }
         };
-        vm.write_runtime_warnings();
         self.state = Some(vm.into_state());
         result
     }
@@ -7231,7 +7394,6 @@ impl NyblInstance {
                 value
             }
         };
-        vm.write_runtime_warnings();
         self.state = Some(vm.into_state());
         result
     }
@@ -8052,7 +8214,7 @@ let read = fn() { return [missing, present] }"#,
                 ),
                 (
                     "facade".to_string(),
-                    "use leaf\nfn pop() { items.pop() }".to_string(),
+                    "use leaf.{items}\nfn pop() { items.pop() }".to_string(),
                 ),
             ]),
         };

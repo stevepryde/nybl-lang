@@ -89,11 +89,67 @@ pub fn no_such_method(kind: &str, method: &str) -> String {
     format!("{kind} doesn't have a .{method}() method")
 }
 
-/// Canonical runtime warning for a name rejected by a plain-glob import.
-///
-/// The caller adds the leading `warning: ` when writing the diagnostic.
-pub fn glob_shadow_warning(name: &str, path: &str) -> String {
-    format!("`{name}` from `{path}` shadowed by an existing binding — the first definition wins")
+/// Construct the error for a flat `use` that would bind `name` over an
+/// existing binding of a different declaration in the same scope.
+pub fn import_clash_error(name: &str, path: &str, line: u32) -> crate::error::NyblError {
+    let mut error = crate::error::NyblError::runtime(
+        format!("`{name}` is already defined — `use {path}` would import a different `{name}`"),
+        line,
+    );
+    error.friendly_hint = Some(format!(
+        "Import only the names you need with `use {path}.{{...}}`, or namespace the module with `use {path} as alias`."
+    ));
+    error
+}
+
+/// Construct the error for a `fn` declaration whose name a flat `use`
+/// already bound in the same scope.
+pub fn function_replaces_import_error(
+    name: &str,
+    path: &str,
+    line: u32,
+) -> crate::error::NyblError {
+    let mut error = crate::error::NyblError::runtime(
+        format!("`{name}` is already imported from `{path}` — `fn {name}` would replace it"),
+        line,
+    );
+    error.friendly_hint = Some(format!(
+        "Rename the function, or namespace the module with `use {path} as alias`."
+    ));
+    error
+}
+
+/// Message for exceeding the call-depth cap, shared by function calls and
+/// module loads (each counts as one frame).
+pub const CALL_DEPTH_MESSAGE: &str = "Too many nested function calls (possible infinite recursion)";
+/// Hint paired with [`CALL_DEPTH_MESSAGE`].
+pub const CALL_DEPTH_HINT: &str =
+    "Check that your recursive function has a base case that stops calling itself.";
+
+/// Construct the ordinary (catchable) call-depth error.
+pub fn call_depth_error(line: u32) -> crate::error::NyblError {
+    crate::builtins::error_with_hint(line, CALL_DEPTH_MESSAGE, CALL_DEPTH_HINT)
+}
+
+/// Message for exceeding [`crate::NyblLimits::max_nesting`].
+pub const NESTING_MESSAGE: &str = "Too much nested code across active function calls";
+/// Hint paired with [`NESTING_MESSAGE`].
+pub const NESTING_HINT: &str = "Reduce recursion depth or split deeply nested code into smaller functions (the host sets `max_nesting`).";
+
+/// Construct the ordinary (catchable) nesting-budget error.
+pub fn nesting_error(line: u32) -> crate::error::NyblError {
+    crate::builtins::error_with_hint(line, NESTING_MESSAGE, NESTING_HINT)
+}
+
+/// Message for exceeding [`crate::NyblLimits::max_steps`].
+pub const STEP_LIMIT_MESSAGE: &str = "Your code took too many steps (possible infinite loop)";
+/// Hint paired with [`STEP_LIMIT_MESSAGE`].
+pub const STEP_LIMIT_HINT: &str =
+    "Check your loops — make sure they have a condition that eventually stops them.";
+
+/// Construct the fatal step-limit error.
+pub fn step_limit_error(line: u32) -> crate::error::NyblError {
+    crate::builtins::error_fatal_with_hint(line, STEP_LIMIT_MESSAGE, STEP_LIMIT_HINT)
 }
 
 /// Actionable recovery paired with the canonical constant-mutation error.
@@ -186,14 +242,6 @@ mod tests {
         assert_eq!(
             NESTED_MUTATION_HINT,
             "Assign the value to a variable, mutate that variable, then assign it back."
-        );
-    }
-
-    #[test]
-    fn glob_shadow_warning_is_the_cross_engine_contract() {
-        assert_eq!(
-            glob_shadow_warning("alpha", "second"),
-            "`alpha` from `second` shadowed by an existing binding — the first definition wins"
         );
     }
 

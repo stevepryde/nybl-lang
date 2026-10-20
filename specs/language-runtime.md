@@ -10,13 +10,29 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **RUN-001 — Embeddable core.** `nybl-lang` must provide an embeddable,
   dynamically typed language whose ambient capabilities are limited to those
   explicitly exposed by `NyblHost`.
-- **RUN-002 — Sandbox termination.** A script that exceeds a runtime resource
-  boundary or exercises adversarial input must halt with a Nybl diagnostic; it
-  must not hang, panic, overflow the native stack, or abort the host process.
+- **RUN-002 — Sandbox termination and bounded stack.** A script that exceeds a
+  runtime resource boundary or exercises adversarial input must halt with a
+  Nybl diagnostic; it must not hang, panic, overflow the native stack, or abort
+  the host process. Native stack use is bounded by the limits: under default
+  limits a thread of 10 MiB (release builds) or 128 MiB (debug builds) suffices
+  for parsing and running any program in the walker, VM, or sandboxed AOT,
+  including its module loads. These sizes are about twice the worst measured
+  corpus shape (walker 4.9 MiB release, 64.7 MiB debug — nested `Ok(...)`
+  recursion that loads a parse-cap module from its deepest frame; VM 0.8 MiB
+  and 4.7 MiB; arm64 macOS, Rust 1.98) and scale roughly with `max_nesting`.
 - **RUN-003 — Resource accounting.** Walker and VM execution, plus AOT output
   emitted with sandboxing enabled, must enforce their applicable step,
-  tracked-memory, and call-depth boundaries. AOT sandboxing is opt-in; the CLI's
-  compiled binaries are currently emitted without runtime limits. Operations
+  tracked-memory, call-depth, and nesting boundaries. AOT sandboxing is
+  opt-in; the CLI's compiled binaries are currently emitted without runtime
+  limits. The nesting budget (`NyblLimits::max_nesting`, default 2048) is
+  charged with the static nesting depth of every active function, lambda, or
+  method body, loading module top level, and the root program, and released
+  when each exits; a call or load that would exceed it fails with the same
+  ordinary, catchable error at the same point in every engine. Loading a
+  module costs one step per lexer token (excluding end of input), charged to
+  the importer at the `use` line after lexing and before parsing, once per
+  load: cache hits are free, failed loads are not refunded, root source is not
+  charged, and precompiled VM modules charge the same cost. Operations
   that can amplify shared values into formatted strings or substring
   collections must preflight their exact bytes/cardinality before
   materialization and before exposing host output.
@@ -86,8 +102,8 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   operation and never retains it. Function values are callable only by the
   instance that created them; same-instance re-entry is rejected, while a host
   may nest a different instance without crossing state or accounting.
-- **RUN-018 — Persistent limits and failure state.** Step and call-depth state
-  reset for each instance operation, while tracked memory belongs to the
+- **RUN-018 — Persistent limits and failure state.** Step, call-depth, and
+  nesting state reset for each instance operation, while tracked memory belongs to the
   instance across calls. Errors unwind transient frames but do not roll back
   completed mutations. Step/depth failures leave an instance reusable; memory
   exhaustion leaves an instance reusable when unwinding releases the transient
@@ -166,8 +182,8 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **RUN-027 — Prepared and batch dispatch.** Walker and VM instances may
   pre-resolve a public value-only entry into an opaque instance-affine handle.
   Prepared calls preserve ordinary instance behavior. Host-side batches run in
-  order, stop on first error, keep completed effects, reset step/call-depth
-  accounting per item, retain persistent memory accounting, and enforce the
+  order, stop on first error, keep completed effects, reset step, call-depth,
+  and nesting accounting per item, retain persistent memory accounting, and enforce the
   existing same-instance re-entry fence. Script-level batches are one call and
   apply one step budget to the complete batch.
 
@@ -175,9 +191,9 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 
 - **AC-RUN-001:** A custom host exposing no functions cannot access ambient OS
   facilities, while a host-provided function is callable through `NyblHost`.
-- **AC-RUN-002:** Programs that exceed step, memory, call, parse, or safe value
-  processing boundaries return `Err(NyblError)` or another documented clean
-  termination without terminating the embedding process.
+- **AC-RUN-002:** Programs that exceed step, memory, call, nesting, parse, or
+  safe value processing boundaries return `Err(NyblError)` or another
+  documented clean termination without terminating the embedding process.
 - **AC-RUN-003:** The differential suites cover representative successful and
   failing programs and report no walker/VM/AOT semantic, output, or diagnostic
   drift outside documented resource-checkpoint differences.
@@ -219,7 +235,7 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   across named and callback calls, and reject wrong-instance functions and
   same-instance re-entry with equivalent diagnostics.
 - **AC-RUN-012:** Instance tests prove that hosts are borrowed per operation,
-  different instances can nest safely, step/call-depth budgets restart,
+  different instances can nest safely, step/call-depth/nesting budgets restart,
   memory accounts remain independent and persistent, transient frames unwind,
   transient memory peaks do not poison later calls, retained over-budget
   receipts fail fast until released, and mutations before ordinary or fatal
@@ -231,10 +247,17 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   function, lambda, and dead-code type/method sites, while checker tests cover
   source order, lexical frames, imported identities, shadowing, and ambiguous
   control flow without false-positive exhaustiveness warnings.
-- **AC-RUN-015:** Plain-glob value/function collisions remain first-definition
-  wins and emit the same runtime warning on stderr in the walker, VM, and both
-  native AOT modes. Selective and aliased imports, private names, absent
-  conditional exports, stdout, and binding/source order are unaffected.
+- **AC-RUN-015:** A plain-glob or selective `use` that would bind a name the
+  current scope already binds to a different declaration — a value binding,
+  parameter, module alias (`use m as helper`), executed `fn` declaration,
+  type, seeded built-in type, or another import — fails before binding anything, with the same message, line, and
+  hint in the walker, VM, and both native AOT modes; a `fn` declared in a
+  scope where a flat `use` already bound its name fails likewise. A name
+  already bound to the same declaration (diamond re-exports, selective then
+  glob of one module) is left as is, a later `let` shadows, re-importing a
+  path is a no-op, and aliased imports, private names skipped by globs, and
+  absent conditional exports bind nothing that can clash. Nothing is written
+  to stderr.
 - **AC-RUN-016:** Parser, checker, walker/VM differential, and native AOT tests
   cover explicit marker agreement through direct and first-class callables,
   deterministic preflight/evaluation order, mutable/grouped target acceptance,
@@ -258,6 +281,23 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   value-only/ref fences, arity, retained state, ordered batch failure, and
   per-item step resets. Embedding benchmarks compare ordinary, prepared,
   host-side batch, and script-level batch dispatch on the same host workload.
+- **AC-RUN-020:** A stack-bound test per engine (walker, VM, sandboxed AOT)
+  runs an adversarial corpus at the parse-depth cap under default limits on a
+  thread of the RUN-002 size for its profile and gets a clean nesting,
+  call-depth, parse-depth, or step error from every shape: deep recursion
+  through nested `if`-expressions, lists, dicts, unary operators, matches,
+  patterns, calls, methods, callbacks, and `Ok`/`Err`/enum tuple and
+  struct-variant construction; recursion that fills the nesting budget and
+  then loads a module nested at the parse cap from its deepest frame;
+  recursion that loads a chain of libraries from its deepest frame; a 70-module import chain; operator and
+  postfix chains past the cap; and a module top level that exhausts the
+  shared step budget.
+- **AC-RUN-021:** Cross-engine tests show the nesting budget trips at the same
+  call, follows `max_nesting`, is catchable, and restarts per instance call;
+  a first-time `use` is one frame of shared call depth; a module top level
+  shares its importer's step budget; and a module load costs exactly its
+  token count once (lazy, cached, and precompiled VM loads agree) while root
+  source is free.
 
 ## Design notes
 

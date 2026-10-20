@@ -34,8 +34,8 @@ Net result (release, Apple silicon):
 
 ```toml
 [dependencies]
-nybl-lang = "0.4"
-nybl-vm = "0.4"
+nybl-lang = "0.5"
+nybl-vm = "0.5"
 ```
 
 ```rust
@@ -116,8 +116,8 @@ including hand-built or deserialized bytecode.
 
 ```toml
 [dependencies]
-nybl-lang = { version = "0.4", default-features = false, features = ["no_std", "nybl-std"] }
-nybl-vm   = { version = "0.4", default-features = false, features = ["no_std", "nybl-std"] }
+nybl-lang = { version = "0.5", default-features = false, features = ["no_std", "nybl-std"] }
+nybl-vm   = { version = "0.5", default-features = false, features = ["no_std", "nybl-std"] }
 ```
 
 Tested and working end-to-end on `wasm32-unknown-unknown` with `lol_alloc` as the global allocator.

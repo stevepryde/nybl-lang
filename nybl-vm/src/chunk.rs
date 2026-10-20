@@ -811,6 +811,11 @@ pub struct Chunk {
     /// becomes the binding visible to the body. Ref write-backs use the same
     /// map rather than assuming every positional parameter owns a slot.
     pub parameter_slots: Vec<SlotIdx>,
+    /// Static nesting depth of the source this chunk was compiled from
+    /// (see [`nybl::ast_depth`]). The VM charges it against
+    /// `NyblLimits::max_nesting` while a frame runs this chunk, exactly as
+    /// the tree-walker charges the AST body.
+    pub nesting_depth: u32,
 }
 
 /// Compiled struct type record.
@@ -956,6 +961,12 @@ pub struct FnDef {
     /// `capture_names[i]`'s value at `MakeLambda` time.
     pub capture_names: Vec<String>,
     pub capture_sources: Vec<CaptureSource>,
+    /// Whether executing this named declaration must check (and record for
+    /// later imports) that no flat `use` bound the same name in its lexical
+    /// scope. The compiler clears it when that scope keeps no runtime import
+    /// record (a function block without `use`) or when a slot local declared
+    /// earlier in the scope is the name's current binding.
+    pub checks_import_clash: bool,
 }
 
 /// Where a captured name's value comes from when a lambda is

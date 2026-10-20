@@ -2211,6 +2211,43 @@ type ImportCase = (
 
 const IMPORTS_CORPUS: &[ImportCase] = &[
     (
+        "import_then_named_fn_of_the_same_name_clashes",
+        r#"use money
+fn helper() { return "mine" }
+print(helper())"#,
+        &[(
+            "money",
+            "fn helper() { return \"library\" }\nfn total() { return 1 }",
+        )],
+    ),
+    (
+        "flat_imports_of_one_declaration_bind_once",
+        r#"use left
+use right
+use dep.{pick}
+use dep
+use dep
+print(pick(), shared(), base_value)
+print(try_call(fn() { let _hidden = 1
+    use surface }))
+let _hidden = 2
+use dep
+print(_hidden)"#,
+        &[
+            ("base", "fn shared() { return 1 }\nlet base_value = 2"),
+            ("left", "use base"),
+            ("right", "use base"),
+            ("dep", "fn pick() { return 3 }\nlet _hidden = 4"),
+            ("surface", "let _hidden = 5\npub { _hidden }"),
+        ],
+    ),
+    (
+        "flat_import_of_a_builtin_type_name_clashes",
+        r#"print("before")
+use builtin_shadow"#,
+        &[("builtin_shadow", "struct Result { value }")],
+    ),
+    (
         "explicit_public_surfaces_filter_globs_aliases_types_and_reexports",
         r#"use leaf as leaf
 use leaf
@@ -2433,14 +2470,12 @@ print(match named { api.Signal::Named { value } => value, _ => 0 })"#,
         ],
     ),
     (
-        "reexported_type_origins_diamond_and_first_win",
+        "reexported_type_origins_diamond_binds_once_and_different_types_clash",
         r#"use diamond as diamond
-use order_ab as ab
-use order_ba as ba
 let shared = diamond.Shared { value: 1 }
-let first = ab.Same { a: 2 }
-let second = ba.Same { b: 3 }
-print(shared.value, first.a, second.b)"#,
+print(shared.value)
+print(try_call(fn() { use order_ab as ab }))
+print(try_call(fn() { use order_ba as ba }))"#,
         &[
             ("leaf", "struct Shared { value }"),
             ("left", "use leaf"),
@@ -2594,11 +2629,11 @@ print(final_value.api)"#,
         ],
     ),
     (
-        "reexported_module_aliases_private_and_first_win",
+        "reexported_module_aliases_private_and_clashing_flat_names",
         r#"use private_selected.{_api}
-use module_first.{make}
-use value_first.{api} as value_holder
-print(_api.Point { value: 3 }.value, make().value, value_holder.api)"#,
+print(_api.Point { value: 3 }.value)
+print(try_call(fn() { use module_first.{make} }))
+print(try_call(fn() { use value_first.{api} as value_holder }))"#,
         &[
             ("dep", "struct Point { value }"),
             ("wrapper", "use dep as api"),
@@ -3287,28 +3322,28 @@ print(t.Point { first: 1 }.first)"#,
         ],
     ),
     (
-        "import_selective_function_preserves_named_fn",
+        "import_selective_function_clashes_with_named_fn",
         r#"fn pick() { return 1 }
 use dep.{pick}
 print(pick())"#,
         &[("dep", "fn pick() { return 42 }")],
     ),
     (
-        "import_glob_function_preserves_named_fn",
+        "import_glob_function_clashes_with_named_fn",
         r#"fn pick() { return 1 }
 use dep
 print(pick())"#,
         &[("dep", "fn pick() { return 42 }")],
     ),
     (
-        "import_glob_value_export_preserves_named_fn",
+        "import_glob_value_export_clashes_with_named_fn",
         r#"fn pick() { return 1 }
 use dep
 print(pick())"#,
         &[("dep", "let pick = 42")],
     ),
     (
-        "import_glob_in_fn_body_preserves_slot_local_and_param",
+        "import_glob_in_fn_body_clashes_with_slot_local_and_param",
         r#"fn local_case() {
     let picked = "local"
     use dep
@@ -3318,9 +3353,14 @@ fn param_case(picked) {
     use dep
     return picked
 }
-print(local_case())
-print(param_case("param"))
-print(param_case("again"))"#,
+fn later_let_case() {
+    use dep
+    let picked = "later"
+    return picked
+}
+print(try_call(local_case))
+print(try_call(fn() { return param_case("param") }))
+print(later_let_case())"#,
         &[("dep", "fn picked() { return \"imported\" }")],
     ),
     (
@@ -3452,12 +3492,13 @@ if true {
         ],
     ),
     (
-        "import_selective_value_shadowing_is_lexical_and_first_win",
+        "import_selective_value_shadowing_is_lexical_and_clashes_in_scope",
         r#"let value = 1
 if true {
     use shadow_values.{value}
     print(value)
 }
+print(value)
 if true {
     let value = 10
     use shadow_values.{value}
@@ -3466,12 +3507,13 @@ if true {
         &[("shadow_values", "let value = 2")],
     ),
     (
-        "import_glob_value_shadowing_is_lexical_and_first_win",
+        "import_glob_value_shadowing_is_lexical_and_clashes_in_scope",
         r#"let value = 1
 if true {
     use shadow_values
     print(value)
 }
+print(value)
 if true {
     let value = 10
     use shadow_values
@@ -3480,19 +3522,25 @@ if true {
         &[("shadow_values", "let value = 2")],
     ),
     (
-        "import_bare_type_conflicts_are_first_win_per_scope",
-        r#"if true {
+        "import_bare_type_conflicts_clash_per_scope",
+        r#"fn selected() {
     use first_types.{Point}
     use second_types.{Point}
-    let selected = Point { first: 41 }
-    print(selected.first + 1)
+}
+fn globbed() {
+    use first_types
+    use second_types
 }
 if true {
     use first_types
+    print(Point { first: 41 }.first + 1)
+}
+if true {
     use second_types
-    let globbed = Point { first: 40 }
-    print(globbed.first + 2)
-}"#,
+    print(Point { second: 40 }.second + 2)
+}
+print(try_call(selected))
+print(try_call(globbed))"#,
         &[
             ("first_types", "struct Point { first }"),
             ("second_types", "struct Point { second }"),

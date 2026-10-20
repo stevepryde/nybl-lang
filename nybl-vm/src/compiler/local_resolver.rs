@@ -177,6 +177,13 @@ impl LocalResolver {
         self.visible.get(name)
     }
 
+    /// Whether the innermost lexical scope has declared `name` so far.
+    pub(super) fn declared_in_innermost_scope(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|scope| scope.first_bindings.contains_key(name))
+    }
+
     /// Capture the shared scope and source-order frontier visible at one use.
     pub(super) fn innermost_scope_snapshot(&mut self) -> LocalScopeSnapshot {
         let scope = self.scopes.last_mut().expect("resolver always has a scope");

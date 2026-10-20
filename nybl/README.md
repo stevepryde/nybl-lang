@@ -23,7 +23,7 @@ Hand your users or your AI a real programming language at runtime, without shipp
   deep mutable caller places, with rollback on errors
 - **Variadic functions and explicit module surfaces** — final `..rest`
   parameters and `pub { ... }` export allow-lists
-- **Resource limits** (`NyblLimits`) — step and tracked-memory budgets, plus a fixed function-call depth cap
+- **Resource limits** (`NyblLimits`) — step, tracked-memory, and code-nesting budgets, plus a fixed function-call depth cap; module loads share them and cost one step per token
 
 For a faster runtime (2–3× this crate's tree-walker, same semantics), add [`nybl-vm`](https://crates.io/crates/nybl-vm). For an AOT path to native Rust, see [`nybl-compile`](https://crates.io/crates/nybl-compile).
 
@@ -33,13 +33,13 @@ For a faster runtime (2–3× this crate's tree-walker, same semantics), add [`n
 - **Zero Rust deps** Nothing to audit in your supply chain.
 - **`no_std` support** via the `no_std` feature (uses the `libm` crate internally for float math, nothing else).
 - **WASM-compatible.** Builds clean for `wasm32-unknown-unknown`. Use it in browsers, edge workers, or wherever you can run Rust.
-- **Sandboxed by default.** `NyblLimits` caps step count and tracked memory, and the runtime caps function-call depth, so runaway user scripts halt cleanly.
+- **Sandboxed by default.** `NyblLimits` caps step count, tracked memory, and nesting across active calls (`max_nesting`), and the runtime caps function-call depth, so runaway user scripts halt cleanly. Native stack use is bounded too: under default limits a thread of 10 MiB (release) or 128 MiB (debug) suffices for any program, and the requirement scales roughly with `max_nesting`.
 
 ## Quick start
 
 ```toml
 [dependencies]
-nybl-lang = "0.4"
+nybl-lang = "0.5"
 ```
 
 ```rust
@@ -130,7 +130,7 @@ guide](https://nybl-lang.com/docs/embedding/#opaque-host-values-and-methods).
 A minimal std build — core language only, no bundled Nybl stdlib:
 
 ```toml
-nybl-lang = { version = "0.4", default-features = false, features = ["std"] }
+nybl-lang = { version = "0.5", default-features = false, features = ["std"] }
 ```
 
 For compatibility, omitting both `std` and `no_std` also retains std behavior;
@@ -150,7 +150,7 @@ their backing storage into its own account.
 
 ```toml
 [dependencies]
-nybl-lang = { version = "0.4", default-features = false, features = ["no_std", "nybl-std"] }
+nybl-lang = { version = "0.5", default-features = false, features = ["no_std", "nybl-std"] }
 ```
 
 Build for `wasm32-unknown-unknown` as usual. See [`nybl-vm`](https://crates.io/crates/nybl-vm) for the faster runtime if you need it.

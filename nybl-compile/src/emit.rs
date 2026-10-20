@@ -107,6 +107,8 @@ struct FunctionSite {
     visibility: Visibility,
     line: u32,
     abi_eligible: bool,
+    /// Static nesting depth of the body (see `nybl::ast_depth`).
+    nesting: u32,
 }
 
 #[derive(Clone, Default)]
@@ -1490,7 +1492,16 @@ struct EmissionScope {
     mutated_locals: HashSet<String>,
     plain_glob_imports: HashSet<String>,
     function_sites: HashMap<String, usize>,
-    claimed_functions: HashSet<String>,
+    /// Names whose current binding in this nested scope came from a flat
+    /// `use`: name -> (Rust local holding the bound origin, `None` when the
+    /// export was absent; the `use` path). Mirrors the walker's per-scope
+    /// import records; a later local declaration removes the entry.
+    import_records: HashMap<String, (String, String)>,
+    /// A named function body's own name and defining module, unless a
+    /// parameter or local reuses it.
+    self_binding: Option<(String, String)>,
+    /// `fn` declarations reached in this nested scope.
+    declared_functions: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -1798,8 +1809,9 @@ impl Emitter {
         }
     }
 
-    /// Imported types are first-win within one lexical frame. A
-    /// new inner frame remains free to shadow an outer binding.
+    /// Imported types bind once per lexical frame (a different type of
+    /// the same name is a runtime clash). A new inner frame remains free
+    /// to shadow an outer binding.
     fn bind_imported_type(&mut self, name: &str, module_path: &str) {
         if let Some(frame) = self.type_bindings.last_mut() {
             frame
@@ -1940,7 +1952,69 @@ impl Emitter {
     fn bind_local(&mut self, name: &str) {
         if let Some(top) = self.scope_stack.last_mut() {
             top.locals.insert(name.to_string());
+            // A local declaration now owns the name.
+            top.import_records.remove(name);
+            if top
+                .self_binding
+                .as_ref()
+                .is_some_and(|(_, own)| own == name)
+            {
+                top.self_binding = None;
+            }
         }
+    }
+
+    /// Statically known state of `name` in the current nested scope, as
+    /// arguments for `__nybl_check_scoped_import`: the import record
+    /// expression, whether a local owns the name, and the function's own
+    /// name origin.
+    fn scoped_import_state(&self, name: &str) -> (String, bool, String) {
+        let scope = self.scope_stack.last();
+        let recorded = scope
+            .and_then(|scope| scope.import_records.get(name))
+            .map_or_else(
+                || "::std::option::Option::None".to_string(),
+                |(record, _)| format!("{record}.as_ref()"),
+            );
+        let local = scope.is_some_and(|scope| {
+            scope.locals.contains(name) || scope.declared_functions.contains(name)
+        });
+        let self_origin = scope
+            .and_then(|scope| scope.self_binding.as_ref())
+            .filter(|(_, own)| own == name)
+            .map_or_else(
+                || "::std::option::Option::None".to_string(),
+                |(module, own)| {
+                    format!(
+                        "::std::option::Option::Some(({}, {}))",
+                        rust_string_literal(module),
+                        rust_string_literal(own)
+                    )
+                },
+            );
+        (recorded, local, self_origin)
+    }
+
+    /// Record that a flat `use` of `path` bound `name` in this nested scope,
+    /// returning the Rust local that holds the bound origin.
+    fn record_scoped_import(&mut self, name: &str, path: &str) -> String {
+        if let Some((record, _)) = self
+            .scope_stack
+            .last()
+            .and_then(|scope| scope.import_records.get(name))
+        {
+            return record.clone();
+        }
+        let record = self.fresh_tmp();
+        self.line(&format!(
+            "let mut {record}: ::std::option::Option<(::std::string::String, ::std::string::String)> = ::std::option::Option::None;"
+        ));
+        self.scope_stack
+            .last_mut()
+            .expect("imports are emitted inside a scope")
+            .import_records
+            .insert(name.to_string(), (record.clone(), path.to_string()));
+        record
     }
 
     fn mark_constant(&mut self, name: &str) {
@@ -2826,6 +2900,7 @@ impl Emitter {
         &mut self,
         name: &str,
         params: &[Parameter],
+        body: &[Stmt],
         visibility: Visibility,
         line: u32,
         abi_eligible: bool,
@@ -2839,6 +2914,7 @@ impl Emitter {
             visibility,
             line,
             abi_eligible,
+            nesting: nybl::ast_depth::body_depth(body),
         });
         self.functions
             .sites_by_module_name
@@ -2888,20 +2964,6 @@ impl Emitter {
             .iter()
             .rev()
             .find_map(|scope| scope.function_sites.get(name).copied())
-    }
-
-    fn claim_function_in_current_scope(&mut self, name: &str) {
-        self.scope_stack
-            .last_mut()
-            .expect("function claims are emitted inside a scope")
-            .claimed_functions
-            .insert(name.to_string());
-    }
-
-    fn function_claimed_in_current_scope(&self, name: &str) -> bool {
-        self.scope_stack
-            .last()
-            .is_some_and(|scope| scope.claimed_functions.contains(name))
     }
 
     fn exact_function_site_call_src(
@@ -3135,6 +3197,14 @@ impl Emitter {
         self.emit_run_program(stmts)?;
         self.emit_function_site_dispatcher();
         self.emit_function_site_catalogue();
+        if self.opts.sandbox {
+            writeln!(
+                self.out,
+                "/// Static nesting depth of the root top level, charged while it runs.\nconst __NYBL_ROOT_NESTING: u32 = {};\n",
+                nybl::ast_depth::body_depth(stmts),
+            )
+            .unwrap();
+        }
         self.emit_fn_value_wrappers();
         self.emit_public_entry();
         if self.opts.emit_main && module_name.is_none() {
@@ -3265,10 +3335,10 @@ impl Emitter {
     ///   it under `m`.
     ///
     /// Shadow conflicts on injected names are emitted as a
-    /// transpile-time error for aliased forms. Flat imports remain
-    /// first-win; plain globs additionally emit the same runtime
-    /// warning as the walker when an available export loses a
-    /// same-frame conflict.
+    /// transpile-time error for aliased forms. A flat import of a name
+    /// the scope already binds to a different declaration fails at
+    /// runtime with the walker's clash error; one already bound to the
+    /// same declaration is left as is.
     fn emit_use_stmt(
         &mut self,
         path: &str,
@@ -3297,7 +3367,7 @@ impl Emitter {
         // what every form ultimately reads from.
         let tmp = self.fresh_tmp();
         self.line(&format!(
-            "let {tmp} = {load}(ctx)?;",
+            "let {tmp} = {load}(ctx, {line})?;",
             tmp = tmp,
             load = module_load_fn_name(path)
         ));
@@ -3343,8 +3413,8 @@ impl Emitter {
         };
         // A module's values and functions are one import namespace even
         // though the analysis stores their origins separately. Emit the
-        // combined surface lexicographically so multi-name warning order is
-        // byte-identical to the walker and VM.
+        // combined surface lexicographically so the first reported clash
+        // matches the walker and VM.
         expose_bindings.sort();
         let expose_types: Vec<(String, String)> = match items {
             Some(list) => list
@@ -3453,82 +3523,34 @@ impl Emitter {
                 self.bind_module_alias(alias_name, &expose_types);
             }
             None => {
-                // Non-aliased: inject each binding as a local.
-                // Types don't need a Rust local (they're
-                // compile-time metadata in the AOT), but they
-                // do need a `type_bindings` entry so
-                // construction + pattern sites can resolve
-                // the bare name to the right module path.
+                // Non-aliased: inject each binding as a local, or into the
+                // module's persistent bindings at its top level. A name the
+                // scope already binds to a different declaration is a clash;
+                // one already bound to the same declaration is left as is.
+                // Types don't need a Rust local (they're compile-time
+                // metadata in the AOT), but they do need a `type_bindings`
+                // entry so construction + pattern sites can resolve the bare
+                // name to the right module path.
+                let module_lit = rust_string_literal(&self.current_module);
+                let path_lit = rust_string_literal(path);
                 for name in &expose_bindings {
+                    let ident = rust_user_ident(name);
+                    let name_lit = rust_string_literal(name);
                     if module_top_scope {
-                        // Native named functions claim their binding at the
-                        // declaration's source position. If that claim already
-                        // won, the runtime rejects this flat import; mirror the
-                        // same source-ordered decision in static storage
-                        // resolution so later calls reach the named function.
-                        if !self.opts.sandbox && self.function_claimed_in_current_scope(name) {
-                            // The claim statically guarantees the shadow, so
-                            // the glob warning is unconditional — mirroring
-                            // the walker/VM, which warn before skipping the
-                            // clashing export.
-                            if items.is_none() {
-                                self.line(&format!(
-                                    "__nybl_warn_glob_shadow({}, {});",
-                                    rust_string_literal(name),
-                                    rust_string_literal(path),
-                                ));
-                            }
-                            continue;
-                        }
                         if self.opts.sandbox {
                             self.line(&format!(
-                                "__nybl_import_export(ctx, {}, {}, {}, {}, {tmp}.{ident}.clone(), {}, {line})?;",
-                                rust_string_literal(&self.current_module),
-                                rust_string_literal(name),
-                                rust_string_literal(path),
-                                rust_string_literal(name),
-                                items.is_none(),
-                                ident = rust_user_ident(name),
+                                "__nybl_import_export(ctx, {module_lit}, {name_lit}, {path_lit}, {tmp}.{ident}.clone(), {line})?;",
                             ));
                             self.bind_optional_import(name, OptionalImportBinding::Persistent);
                         } else if entry.effective_value_exports.contains(name) {
-                            let import = format!(
-                                "__nybl_import_binding_alias(ctx, {}, {}, {}, {});",
-                                rust_string_literal(&self.current_module),
-                                rust_string_literal(name),
-                                rust_string_literal(path),
-                                rust_string_literal(name),
-                            );
-                            if items.is_none() {
-                                self.line(&format!(
-                                    "if __nybl_has_binding(ctx, {}, {}) {{ __nybl_warn_glob_shadow({}, {}); }} else {{ {import} }}",
-                                    rust_string_literal(&self.current_module),
-                                    rust_string_literal(name),
-                                    rust_string_literal(name),
-                                    rust_string_literal(path),
-                                ));
-                            } else {
-                                self.line(&import);
-                            }
+                            self.line(&format!(
+                                "__nybl_import_flat_alias(ctx, {module_lit}, {name_lit}, {path_lit}, {line})?;",
+                            ));
                             self.bind_persistent(name);
                         } else {
-                            let import = format!(
-                                "__nybl_import_binding_value(ctx, {}, {}, {tmp}.{ident}.clone());",
-                                rust_string_literal(&self.current_module),
-                                rust_string_literal(name),
-                                ident = rust_user_ident(name),
-                            );
-                            if items.is_none() {
-                                self.line(&format!(
-                                    "if __nybl_has_binding(ctx, {}, {}) {{ __nybl_warn_glob_shadow({}, {}); }} else {{ {import} }}",
-                                    rust_string_literal(&self.current_module),
-                                    rust_string_literal(name),
-                                    rust_string_literal(name),
-                                    rust_string_literal(path),
-                                ));
-                            } else {
-                                self.line(&import);
-                            }
+                            self.line(&format!(
+                                "__nybl_import_flat_value(ctx, {module_lit}, {name_lit}, {path_lit}, {tmp}.{ident}.clone(), {line})?;",
+                            ));
                             self.bind_persistent(name);
                         }
                         if let Some(module_export) = entry.effective_module_exports.get(name) {
@@ -3537,81 +3559,67 @@ impl Emitter {
                         }
                         continue;
                     }
-                    // Every non-aliased import form is first-win in
-                    // the current frame. An outer-frame binding is
-                    // not a clash: this new Rust block should shadow
-                    // it just like the walker and VM value scopes.
-                    if self.is_local_in_current_scope(name)
-                        || (self.is_module_top_scope()
-                            && self.fn_info.all_fns.contains(name)
-                            && !self.has_module_alias_candidate(name))
-                    {
-                        if items.is_none() {
-                            if self.opts.sandbox {
-                                self.line(&format!(
-                                    "if {tmp}.{ident}.is_some() {{ __nybl_warn_glob_shadow({}, {}); }}",
-                                    rust_string_literal(name),
-                                    rust_string_literal(path),
-                                    ident = rust_user_ident(name),
-                                ));
-                            } else {
-                                self.line(&format!(
-                                    "__nybl_warn_glob_shadow({}, {});",
-                                    rust_string_literal(name),
-                                    rust_string_literal(path),
-                                ));
-                            }
-                        }
-                        continue;
-                    }
+                    let had_record = self
+                        .scope_stack
+                        .last()
+                        .is_some_and(|scope| scope.import_records.contains_key(name));
+                    let (recorded, local, self_origin) = self.scoped_import_state(name);
+                    let check = format!(
+                        "__nybl_check_scoped_import(ctx, {recorded}, {local}, {self_origin}, {name_lit}, {path_lit}, {line})?"
+                    );
                     if self.opts.sandbox {
                         let candidate = self.fresh_tmp();
-                        self.line(&format!(
-                            "let {candidate} = {tmp}.{ident}.clone();",
-                            ident = rust_user_ident(name),
-                        ));
-                        if let Some(OptionalImportBinding::Local {
-                            value,
-                            function_site,
-                        }) = self.optional_import_in_current_scope(name)
+                        self.line(&format!("let {candidate} = {tmp}.{ident}.clone();"));
+                        let (value, function_site) = match self
+                            .optional_import_in_current_scope(name)
                         {
-                            if items.is_none() {
+                            Some(OptionalImportBinding::Local {
+                                value,
+                                function_site,
+                            }) if had_record || !local => (value, function_site),
+                            _ => {
+                                let function_site = self.fresh_tmp();
+                                let value = self.fresh_tmp();
                                 self.line(&format!(
-                                    "if {value}.is_some() && {candidate}.is_some() {{ __nybl_warn_glob_shadow({}, {}); }}",
-                                    rust_string_literal(name),
-                                    rust_string_literal(path),
+                                    "let mut {function_site}: ::std::option::Option<usize> = ::std::option::Option::None;"
                                 ));
+                                self.line(&format!(
+                                    "let mut {value}: ::std::option::Option<::nybl::value::Value> = ::std::option::Option::None;"
+                                ));
+                                (value, function_site)
                             }
-                            self.line(&format!(
-                                "if {value}.is_none() {{ {function_site} = __nybl_export_function_site(&{candidate}); {value} = __nybl_export_value(ctx, {candidate}, {line})?; }}"
-                            ));
-                        } else {
-                            let function_site = self.fresh_tmp();
-                            let value = self.fresh_tmp();
-                            self.line(&format!(
-                                "let mut {function_site}: ::std::option::Option<usize> = __nybl_export_function_site(&{candidate});"
-                            ));
-                            self.line(&format!(
-                                "let mut {value}: ::std::option::Option<::nybl::value::Value> = __nybl_export_value(ctx, {candidate}, {line})?;"
-                            ));
-                            self.bind_optional_import(
-                                name,
-                                OptionalImportBinding::Local {
-                                    value,
-                                    function_site,
-                                },
-                            );
-                        }
+                        };
+                        let record = self.record_scoped_import(name, path);
+                        self.line(&format!(
+                            "if {candidate}.is_some() && {check} {{ {function_site} = __nybl_export_function_site(&{candidate}); {value} = __nybl_export_value(ctx, {candidate}, {line})?; {record} = ::std::option::Option::Some(__nybl_flat_import_origin(ctx, {path_lit}, {name_lit})); }}"
+                        ));
+                        self.bind_optional_import(
+                            name,
+                            OptionalImportBinding::Local {
+                                value,
+                                function_site,
+                            },
+                        );
                         if let Some(module_export) = entry.effective_module_exports.get(name) {
                             self.bind_module_export(name, module_export);
                         }
                         continue;
                     }
+                    // Unsandboxed exports are always present, so the existing
+                    // binding decides statically whether this import binds a
+                    // new local; the runtime check only compares origins.
+                    if had_record || local || self_origin != "::std::option::Option::None" {
+                        self.line(&format!("let _ = {check};"));
+                        continue;
+                    }
                     self.line(&format!(
                         "let mut {ident}: ::nybl::value::Value = {tmp}.{ident}.clone();",
-                        ident = rust_user_ident(name),
                     ));
                     self.bind_local(name);
+                    let record = self.record_scoped_import(name, path);
+                    self.line(&format!(
+                        "{record} = ::std::option::Option::Some(__nybl_flat_import_origin(ctx, {path_lit}, {name_lit}));"
+                    ));
                     if let Some(module_export) = entry.effective_module_exports.get(name) {
                         self.bind_module_export(name, module_export);
                         self.scope_stack
@@ -3626,7 +3634,7 @@ impl Emitter {
                 }
                 for (type_name, origin) in &expose_types {
                     self.line(&format!(
-                        "__nybl_bind_imported_type(&mut __nybl_type_bindings, {}, {});",
+                        "__nybl_bind_imported_type(&mut __nybl_type_bindings, {}, {}, {path_lit}, {line})?;",
                         rust_string_literal(type_name),
                         rust_string_literal(origin),
                     ));
@@ -3654,9 +3662,13 @@ impl Emitter {
         let method_slots = self.types.module_method_slots(name);
         let load = module_load_fn_name(name);
         let exports = module_exports_type_name(name);
+        let load_steps = nybl::lexer::lex(&entry.source)
+            .map(|tokens| nybl::lexer::module_load_steps(&tokens))
+            .map_err(|error| error.with_module_source(name, entry.source.as_str()))?;
+        let load_nesting = nybl::ast_depth::body_depth(&entry.ast);
         writeln!(
             self.out,
-            "fn {load}(ctx: &mut Ctx<'_>) -> Result<{exports}, ::nybl::error::NyblError> {{",
+            "fn {load}(ctx: &mut Ctx<'_>, line: u32) -> Result<{exports}, ::nybl::error::NyblError> {{",
         )
         .unwrap();
         self.indent = 1;
@@ -3679,6 +3691,15 @@ impl Emitter {
         self.line("        return Ok(loaded.clone());");
         self.line("    }");
         self.line("}");
+        if self.opts.sandbox {
+            // A load is one frame: shared call depth, its token cost charged
+            // to the importer, then the module top level's nesting.
+            self.line(&format!(
+                "__nybl_enter_module_load(ctx, line, {load_steps}, {load_nesting})?;"
+            ));
+        } else {
+            self.line("let _ = line;");
+        }
         if has_type_sites {
             self.line(&format!(
                 "let __saved_type_defs = __nybl_take_module_type_defs(ctx, {});",
@@ -3732,6 +3753,16 @@ impl Emitter {
         self.line(&format!(
             r#"ctx.module_cache.insert("{name}".to_string(), ::std::boxed::Box::new(__ModuleLoading));"#
         ));
+        // This load's top-level import records and export origins start
+        // fresh, like the walker's module sub-evaluator.
+        self.line(&format!(
+            "ctx.top_import_records.remove({});",
+            rust_string_literal(name)
+        ));
+        self.line(&format!(
+            "ctx.export_origins.retain(|(module, _), _| module != {});",
+            rust_string_literal(name)
+        ));
         self.line(&format!(
             "ctx.module_aliases.retain(|(module, _), _| module != {});",
             rust_string_literal(name)
@@ -3774,11 +3805,13 @@ impl Emitter {
             .unwrap_or_default();
         let mut direct_function_index = 0;
         for stmt in &entry.ast {
-            if let StmtKind::FnDecl { name, .. } = &stmt.kind {
+            if let StmtKind::FnDecl { .. } = &stmt.kind {
                 let site = direct_function_sites[direct_function_index];
                 direct_function_index += 1;
-                self.line(&format!("__nybl_activate_function(ctx, {site});"));
-                self.claim_function_in_current_scope(name);
+                self.line(&format!(
+                    "__nybl_activate_top_function(ctx, {site}, {})?;",
+                    stmt.line
+                ));
                 continue;
             }
             self.emit_stmt(stmt)?;
@@ -3846,6 +3879,9 @@ impl Emitter {
         self.callable_mutations.pop();
         self.indent -= 1;
         self.line("})();");
+        if self.opts.sandbox {
+            self.line(&format!("__nybl_leave_aot_call(ctx, {load_nesting});"));
+        }
         self.line("if __load_result.is_err() {");
         self.indent += 1;
         if has_type_sites {
@@ -3959,6 +3995,7 @@ impl Emitter {
                     let site = self.register_function_site(
                         name,
                         params,
+                        body,
                         *visibility,
                         stmt.line,
                         abi_eligible,
@@ -4512,7 +4549,7 @@ impl Emitter {
         }
         if self.opts.sandbox {
             self.out.push_str(
-                "    fn invoke(\n        ctx: &mut Ctx<'_>,\n        adapter: __NyblMethodFn,\n        obj: &::nybl::value::Value,\n        args: &[::nybl::value::Value],\n        line: u32,\n    ) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {\n        __nybl_enter_aot_call(ctx, line)?;\n        let result = adapter(ctx, obj, args, line);\n        __nybl_leave_aot_call(ctx);\n        result\n    }\n",
+                "    fn invoke(\n        ctx: &mut Ctx<'_>,\n        adapter: __NyblMethodFn,\n        obj: &::nybl::value::Value,\n        args: &[::nybl::value::Value],\n        line: u32,\n    ) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {\n        let nesting = __nybl_user_method_nesting(adapter);\n        __nybl_enter_aot_call(ctx, line, nesting)?;\n        let result = adapter(ctx, obj, args, line);\n        __nybl_leave_aot_call(ctx, nesting);\n        result\n    }\n",
             );
         }
         self.out
@@ -4551,7 +4588,7 @@ impl Emitter {
         self.out.push_str("        _ => Ok(None),\n    }\n}\n\n");
         if self.opts.sandbox {
             self.out.push_str(
-                "fn __nybl_call_preflighted_user_method(ctx: &mut Ctx<'_>, adapter: __NyblMethodFn, obj: &::nybl::value::Value, args: &[::nybl::value::Value], line: u32) -> Result<::nybl::value::Value, ::nybl::error::NyblError> { __nybl_enter_aot_call(ctx, line)?; let result = adapter(ctx, obj, args, line); __nybl_leave_aot_call(ctx); result }\n\n",
+                "fn __nybl_call_preflighted_user_method(ctx: &mut Ctx<'_>, adapter: __NyblMethodFn, obj: &::nybl::value::Value, args: &[::nybl::value::Value], line: u32) -> Result<::nybl::value::Value, ::nybl::error::NyblError> { let nesting = __nybl_user_method_nesting(adapter); __nybl_enter_aot_call(ctx, line, nesting)?; let result = adapter(ctx, obj, args, line); __nybl_leave_aot_call(ctx, nesting); result }\n\n",
             );
         } else {
             self.out.push_str(
@@ -4652,13 +4689,28 @@ impl Emitter {
         self.out.push_str("        _ => false,\n    }\n}\n\n");
 
         self.out.push_str(
+            "fn __nybl_user_method_nesting(adapter: __NyblMethodFn) -> u32 {\n    match adapter as usize {\n",
+        );
+        for site in &self.types.method_sites {
+            writeln!(
+                self.out,
+                "        value if value == {adapter} as *const () as usize => {nesting},",
+                adapter = method_site_adapter_name(site.id),
+                nesting = nybl::ast_depth::body_depth(&site.body),
+            )
+            .unwrap();
+        }
+        self.out.push_str("        _ => 0,\n    }\n}\n\n");
+
+        self.out.push_str(
             "fn __nybl_call_preflighted_user_method_outcome(\n    ctx: &mut Ctx<'_>,\n    adapter: __NyblMethodFn,\n    obj: ::nybl::value::Value,\n    args: ::std::vec::Vec<::nybl::value::Value>,\n    line: u32,\n) -> Result<__NyblMethodOutcome, ::nybl::error::NyblError> {\n    match adapter as usize {\n",
         );
         for site in &self.types.method_sites {
             let invoke = if self.opts.sandbox {
                 format!(
-                    "{{ __nybl_enter_aot_call(ctx, line)?; let result = {}(ctx, obj, args, line); __nybl_leave_aot_call(ctx); result }}",
-                    method_site_outcome_adapter_name(site.id)
+                    "{{ __nybl_enter_aot_call(ctx, line, {nesting})?; let result = {}(ctx, obj, args, line); __nybl_leave_aot_call(ctx, {nesting}); result }}",
+                    method_site_outcome_adapter_name(site.id),
+                    nesting = nybl::ast_depth::body_depth(&site.body),
                 )
             } else {
                 format!(
@@ -4771,12 +4823,13 @@ impl Emitter {
             ::std::vec::Vec<::nybl::value::Value>,
         ) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>,
     >,
+    nesting: u32,
     args: ::std::vec::Vec<::nybl::value::Value>,
     line: u32,
 ) -> Result<__NyblCallOutcome, ::nybl::error::NyblError> {
-    __nybl_enter_aot_call(ctx, line)?;
+    __nybl_enter_aot_call(ctx, line, nesting)?;
     let result = callable(ctx, args);
-    __nybl_leave_aot_call(ctx);
+    __nybl_leave_aot_call(ctx, nesting);
     let outcome = result?;
     __nybl_check_memory(ctx, line)?;
     Ok(outcome)
@@ -4839,25 +4892,9 @@ impl Emitter {
                 },
             )
             .replace(
-                "/*__NYBL_CALL_DEPTH_ENTER__*/",
-                if self.opts.sandbox {
-                    "    __nybl_enter_aot_call(ctx, line)?;\n"
-                } else {
-                    ""
-                },
-            )
-            .replace(
-                "/*__NYBL_CALL_DEPTH_LEAVE__*/",
-                if self.opts.sandbox {
-                    "    __nybl_leave_aot_call(ctx);\n"
-                } else {
-                    ""
-                },
-            )
-            .replace(
                 "/*__NYBL_CALL_VALUE_INVOKE__*/",
                 if self.opts.sandbox {
-                    "__nybl_invoke_aot_callable(ctx, callable, args, line)"
+                    "__nybl_invoke_aot_callable(ctx, callable, nesting, args, line)"
                 } else {
                     "callable(ctx, args)"
                 },
@@ -4873,7 +4910,7 @@ impl Emitter {
             .replace(
                 "/*__NYBL_TRY_ATTEMPT_INVOKE__*/",
                 if self.opts.sandbox {
-                    "        __nybl_invoke_aot_callable(ctx, callable_fn, ::std::vec::Vec::new(), line)\n"
+                    "        __nybl_invoke_aot_callable(ctx, callable_fn, nesting, ::std::vec::Vec::new(), line)\n"
                 } else {
                     "    let attempted = callable_fn(ctx, ::std::vec::Vec::new());\n"
                 },
@@ -4885,7 +4922,7 @@ impl Emitter {
             .replace(
                 "/*__NYBL_RESULT_INVOKE__*/",
                 if self.opts.sandbox {
-                    "    let result = __nybl_invoke_aot_callable(ctx, callable_fn, ::std::vec![payload], line)?;\n"
+                    "    let result = __nybl_invoke_aot_callable(ctx, callable_fn, nesting, ::std::vec![payload], line)?;\n"
                 } else {
                     "    let result = callable_fn(ctx, ::std::vec![payload])?;\n"
                 },
@@ -4918,7 +4955,8 @@ impl Emitter {
                 .join(", ");
             writeln!(
                 self.out,
-                "    __NyblFunctionSite {{ id: {id}, module_path: {module}, name: {name}, params: &[{params}], param_modes: &[{param_modes}], is_public: {is_public}, abi_eligible: {abi_eligible}, line: {line} }},",
+                "    __NyblFunctionSite {{ id: {id}, module_path: {module}, name: {name}, params: &[{params}], param_modes: &[{param_modes}], is_public: {is_public}, abi_eligible: {abi_eligible}, line: {line}, nesting: {nesting} }},",
+                nesting = site.nesting,
                 id = site.id,
                 module = rust_string_literal(&site.module_path),
                 name = rust_string_literal(&site.name),
@@ -5055,39 +5093,29 @@ fn __nybl_import_export(
     ctx: &mut Ctx<'_>,
     module_path: &str,
     name: &str,
-    origin_module_path: &str,
-    origin_name: &str,
+    path: &str,
     export: ::std::option::Option<__NyblExport>,
-    warn_on_shadow: bool,
     line: u32,
 ) -> Result<(), ::nybl::error::NyblError> {
-    let key = (module_path.to_string(), name.to_string());
-    let shadows_existing = __nybl_has_binding(ctx, module_path, name)
-        || ctx.active_function_sites.contains_key(&key)
-        || ctx.module_imported_function_sites.contains_key(&key);
-    if export.is_some() && shadows_existing {
-        if warn_on_shadow {
-            __nybl_warn_glob_shadow(name, origin_module_path);
-        }
+    // An absent conditional export binds nothing.
+    let ::std::option::Option::Some(export) = export else {
+        return Ok(());
+    };
+    if !__nybl_check_top_import(ctx, module_path, name, path, line)? {
         return Ok(());
     }
     match export {
-        ::std::option::Option::Some(__NyblExport::Value(_)) => {
-            __nybl_import_binding_alias(
-                ctx,
-                module_path,
-                name,
-                origin_module_path,
-                origin_name,
-            );
+        __NyblExport::Value(_) => {
+            __nybl_import_binding_alias(ctx, module_path, name, path, name);
         }
-        ::std::option::Option::Some(__NyblExport::Function(site_id)) => {
+        __NyblExport::Function(site_id) => {
             let value = __nybl_function_site_value(ctx, site_id, line)?;
             __nybl_import_binding_value(ctx, module_path, name, value);
-            ctx.module_imported_function_sites.insert(key, site_id);
+            ctx.module_imported_function_sites
+                .insert((module_path.to_string(), name.to_string()), site_id);
         }
-        ::std::option::Option::None => {}
     }
+    __nybl_record_top_import(ctx, module_path, name, path);
     Ok(())
 }
 
@@ -5175,6 +5203,7 @@ fn __nybl_function_site_value(
         ::std::vec::Vec::new(),
         Some(site.name.to_string()),
         0u16,
+        site.nesting,
         line,
         callable,
     )
@@ -5250,9 +5279,10 @@ fn __nybl_function_site_value(
             if self.opts.sandbox {
                 writeln!(
                     self.out,
-                    "fn {guarded}(ctx: &mut Ctx<'_>{signature_args}, line: u32) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{\n    __nybl_enter_aot_call(ctx, line)?;\n    let result = {body}(ctx{call_args});\n    __nybl_leave_aot_call(ctx);\n    result\n}}\n",
+                    "fn {guarded}(ctx: &mut Ctx<'_>{signature_args}, line: u32) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{\n    __nybl_enter_aot_call(ctx, line, {nesting})?;\n    let result = {body}(ctx{call_args});\n    __nybl_leave_aot_call(ctx, {nesting});\n    result\n}}\n",
                     guarded = guarded_function_site_fn_name(site.id),
                     body = function_site_fn_name(site.id),
+                    nesting = site.nesting,
                 )
                 .unwrap();
             } else {
@@ -5319,7 +5349,7 @@ fn __nybl_function_site_value(
         );
         if self.opts.sandbox {
             self.out.push_str(
-                "fn __nybl_call_function_site(\n    ctx: &mut Ctx<'_>,\n    site_id: usize,\n    args: ::std::vec::Vec<::nybl::value::Value>,\n    line: u32,\n) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {\n    __nybl_enter_aot_call(ctx, line)?;\n    let result = __nybl_call_function_site_inner(ctx, site_id, args, line).map(|outcome| outcome.value);\n    __nybl_leave_aot_call(ctx);\n    result\n}\n\n",
+                "fn __nybl_call_function_site(\n    ctx: &mut Ctx<'_>,\n    site_id: usize,\n    args: ::std::vec::Vec<::nybl::value::Value>,\n    line: u32,\n) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {\n    let nesting = __NYBL_FUNCTION_SITES[site_id].nesting;\n    __nybl_enter_aot_call(ctx, line, nesting)?;\n    let result = __nybl_call_function_site_inner(ctx, site_id, args, line).map(|outcome| outcome.value);\n    __nybl_leave_aot_call(ctx, nesting);\n    result\n}\n\n",
             );
         } else {
             self.out.push_str(
@@ -5413,11 +5443,13 @@ fn __nybl_function_site_value(
             .unwrap_or_default();
         let mut direct_function_index = 0;
         for stmt in stmts {
-            if let StmtKind::FnDecl { name, .. } = &stmt.kind {
+            if let StmtKind::FnDecl { .. } = &stmt.kind {
                 let site = direct_function_sites[direct_function_index];
                 direct_function_index += 1;
-                self.line(&format!("__nybl_activate_function(ctx, {site});"));
-                self.claim_function_in_current_scope(name);
+                self.line(&format!(
+                    "__nybl_activate_top_function(ctx, {site}, {})?;",
+                    stmt.line
+                ));
                 continue;
             }
             self.emit_stmt(stmt)?;
@@ -5608,7 +5640,22 @@ fn __nybl_function_site_value(
 
             StmtKind::FnDecl { name, .. } => {
                 let site = self.function_site_for_stmt(stmt);
+                // A flat `use` already bound this name in this scope.
+                if let Some((record, path)) = self
+                    .scope_stack
+                    .last()
+                    .and_then(|scope| scope.import_records.get(name))
+                {
+                    self.line(&format!(
+                        "if {record}.is_some() {{ return Err(::nybl::error_messages::function_replaces_import_error({}, {}, {line})); }}",
+                        rust_string_literal(name),
+                        rust_string_literal(path),
+                    ));
+                }
                 self.line(&format!("__nybl_activate_function(ctx, {site});"));
+                if let Some(scope) = self.scope_stack.last_mut() {
+                    scope.declared_functions.insert(name.clone());
+                }
                 if self.function_name_has_single_site(name) {
                     self.bind_function_site(name, site);
                 }
@@ -6091,6 +6138,12 @@ fn __nybl_function_site_value(
         self.push_scope();
         if let Some((name, site)) = self_site {
             self.bind_function_site(name, site);
+            // The body binds its own name to this declaration (a parameter
+            // of the same name replaces it below).
+            self.scope_stack
+                .last_mut()
+                .expect("function body scope")
+                .self_binding = Some((self.current_module.clone(), name.to_string()));
         }
         for (index, p) in params.iter().enumerate() {
             self.bind_local(&p.name);
@@ -8492,9 +8545,10 @@ fn __nybl_function_site_value(
         } else {
             String::new()
         };
+        let nesting = nybl::ast_depth::body_depth(body);
 
         Ok(format!(
-            "{{ {capture_prelude}let __opaque_body_depth = {opaque_body_depth}; let __callable: ::std::rc::Rc<dyn for<'__a> Fn(&mut Ctx<'__a>, ::std::vec::Vec<::nybl::value::Value>) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>> = ::std::rc::Rc::new(move |ctx, mut args| {{ let __modes = &[{modes_slice}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error(\"lambda\", __modes, args.len(), {line})); }} args = __nybl_pack_rest_args(args, __modes, {line}, &ctx.memory)?; let _ = &args; {type_bindings_init}{capture_moves}{param_binds}let __nybl_value_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{ {body_src} #[allow(unreachable_code)] Ok(::nybl::value::Value::None) }})(); let value = __nybl_value_result?; {memory_check}{param_sync}Ok(__NyblCallOutcome {{ value, args: {final_args} }}) }}); __nybl_wrap_callable({wrap_ctx}{params_array}, {modes_array}, ::std::vec::Vec::new(), None, __opaque_body_depth, {line}, __callable)? }}",
+            "{{ {capture_prelude}let __opaque_body_depth = {opaque_body_depth}; let __callable: ::std::rc::Rc<dyn for<'__a> Fn(&mut Ctx<'__a>, ::std::vec::Vec<::nybl::value::Value>) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>> = ::std::rc::Rc::new(move |ctx, mut args| {{ let __modes = &[{modes_slice}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error(\"lambda\", __modes, args.len(), {line})); }} args = __nybl_pack_rest_args(args, __modes, {line}, &ctx.memory)?; let _ = &args; {type_bindings_init}{capture_moves}{param_binds}let __nybl_value_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{ {body_src} #[allow(unreachable_code)] Ok(::nybl::value::Value::None) }})(); let value = __nybl_value_result?; {memory_check}{param_sync}Ok(__NyblCallOutcome {{ value, args: {final_args} }}) }}); __nybl_wrap_callable({wrap_ctx}{params_array}, {modes_array}, ::std::vec::Vec::new(), None, __opaque_body_depth, {nesting}, {line}, __callable)? }}",
         ))
     }
 }

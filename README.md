@@ -14,9 +14,11 @@ A small, dynamically-typed, **embeddable** programming language for Rust hosts �
   and call methods through `NyblHost::call_method` without exposing Rust
   payloads to the language.
 - **Sandboxed by default.** No filesystem, network, clock, or ambient I/O.
-  `NyblLimits` caps steps and tracked bytes, and every sandboxed engine also
-  enforces a fixed function-call depth. A runaway script halts cleanly with a
-  diagnostic, not a hung process.
+  `NyblLimits` caps steps, tracked bytes, and code nesting across active
+  calls, and every sandboxed engine also enforces a fixed function-call
+  depth shared with module loads. A runaway script halts cleanly with a
+  diagnostic, not a hung process, and native stack use is bounded: under
+  default limits a 10 MiB thread (release builds) is enough for any program.
 - **Three engines, one language.** Walker, bytecode VM, or AOT-to-Rust transpiler — same parser, same semantics, same error shapes. Switch engines with a one-line change.
 - **One-shot or persistent.** Run isolated scripts, or load a `NyblInstance`
   whose `pub fn` entries, globals, modules, callbacks, types, methods, and RNG
@@ -100,7 +102,7 @@ print(PI)
 
 ## Quick start — CLI
 
-Building or installing Nybl 0.4 requires Rust 1.88 or newer.
+Building or installing Nybl 0.5 requires Rust 1.88 or newer.
 
 ```
 cargo install nybl-cli
@@ -118,9 +120,9 @@ cargo install nybl-cli
 
 ```toml
 [dependencies]
-nybl-lang = "0.4"
-nybl-vm   = "0.4"       # optional — drop in for 2–3× speed
-nybl-sys  = "0.4"       # ready-made filesystem / stdio / env / time host
+nybl-lang = "0.5"
+nybl-vm   = "0.5"       # optional — drop in for 2–3× speed
+nybl-sys  = "0.5"       # ready-made filesystem / stdio / env / time host
 ```
 
 ```rust
@@ -199,8 +201,8 @@ build therefore disables defaults and explicitly selects `no_std`:
 
 ```toml
 [dependencies]
-nybl-lang = { version = "0.4", default-features = false, features = ["no_std"] }
-nybl-vm   = { version = "0.4", default-features = false, features = ["no_std"] }
+nybl-lang = { version = "0.5", default-features = false, features = ["no_std"] }
+nybl-vm   = { version = "0.5", default-features = false, features = ["no_std"] }
 ```
 
 Memory accounting in the walker, VM, and generated sandbox runtime is carried

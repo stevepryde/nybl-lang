@@ -33,7 +33,7 @@ When you want to wire the transpiler into your own build pipeline (a `build.rs`,
 
 ```toml
 [dependencies]
-nybl-compile = "0.4"
+nybl-compile = "0.5"
 ```
 
 ```rust
@@ -46,7 +46,7 @@ let rust_source = transpile(
 // write rust_source to src/main.rs and run `cargo build`…
 ```
 
-`Options` controls the output shape: standalone program vs. library, module name wrapping, sandbox mode for step/memory enforcement, and the module resolver callback for `use` statements.
+`Options` controls the output shape: standalone program vs. library, module name wrapping, sandbox mode for step, memory, call-depth, and nesting enforcement (module loads share the budgets and cost one step per token, as in the walker and VM), and the module resolver callback for `use` statements.
 
 ### Persistent sandboxed output
 

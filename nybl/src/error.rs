@@ -32,8 +32,8 @@ pub struct NyblError {
     /// for accurate snippet rendering.
     /// Boxed so the cold error path doesn't bloat `NyblError` itself:
     /// every recursive parser frame returns `Result<_, NyblError>` by
-    /// value, and an inline context (~48 bytes) pushed 128-deep parses
-    /// past a 2 MiB thread stack before the depth guard could fire.
+    /// value, and an inline context (~48 bytes) grew every frame of a
+    /// 128-deep parse (see `safety_deep_parse_nesting_fits_a_pinned_stack`).
     pub source_context: Option<Box<SourceContext>>,
     /// Fatal errors can't be caught by `try_call`; they always
     /// unwind to the engine boundary. This is the load-bearing

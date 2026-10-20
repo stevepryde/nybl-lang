@@ -46,6 +46,7 @@ pub(crate) struct CompiledProgram {
 
 pub(crate) fn compile_program(program: &[Stmt]) -> Result<CompiledProgram, NyblError> {
     let mut compiler = Compiler::new();
+    compiler.chunk.nesting_depth = nybl::ast_depth::body_depth(program);
     compiler.compile_block_no_scope(program)?;
     compiler.emit(Instr::Halt, 0);
     Ok(compiler.finish_program())
@@ -74,6 +75,12 @@ struct Compiler {
     /// point. Slot-resolved function blocks do not contribute; slow-path
     /// blocks and match-arm binding scopes do.
     runtime_scope_depth: usize,
+    /// Whether the innermost lexical scope at the emission point keeps a
+    /// runtime import record (module/slow-path scopes, function bodies, and
+    /// function blocks that contain a `use`). A function block without one
+    /// can't have imported anything, so declarations in it skip the
+    /// fn-replaces-import check.
+    block_imports: bool,
     loops: Vec<LoopCtx>,
     /// Stack of active resolvers. Empty at module top-level. A
     /// fn/lambda compile pushes a fresh resolver; nested fn/lambda
@@ -128,6 +135,7 @@ impl Compiler {
             name_index: NamePoolIndex::default(),
             fusion_floor: 0,
             runtime_scope_depth: 0,
+            block_imports: true,
             loops: Vec::new(),
             resolvers: Vec::new(),
             free_vars: None,
@@ -555,13 +563,7 @@ impl Compiler {
     /// still tracks block-local bindings.
     fn compile_scoped_block(&mut self, stmts: &[Stmt], line: u32) -> Result<(), NyblError> {
         let fast = self.current_resolver().is_some();
-        let needs_runtime_import_scope = fast
-            && stmts.iter().any(|stmt| {
-                matches!(
-                    &stmt.kind,
-                    StmtKind::Use { .. } | StmtKind::StructDecl { .. } | StmtKind::EnumDecl { .. }
-                )
-            });
+        let needs_runtime_import_scope = fast && needs_runtime_import_scope(stmts);
         if fast {
             self.current_resolver_mut().unwrap().push_scope();
             if needs_runtime_import_scope {
@@ -570,7 +572,11 @@ impl Compiler {
         } else {
             self.push_runtime_scope(line);
         }
-        self.compile_block_no_scope(stmts)?;
+        let saved_block_imports =
+            core::mem::replace(&mut self.block_imports, !fast || needs_runtime_import_scope);
+        let result = self.compile_block_no_scope(stmts);
+        self.block_imports = saved_block_imports;
+        result?;
         if fast {
             if needs_runtime_import_scope {
                 self.pop_runtime_scope(line);
@@ -723,7 +729,21 @@ impl Compiler {
                     runtime_scope_base,
                     sidecar: Some(LoopStateKind::Iterator),
                 });
-                self.compile_block_no_scope(body)?;
+                // Like any other function block, a loop body that imports or
+                // declares types gets its own runtime scope so those bindings
+                // stay local to the iteration, as in the tree-walker.
+                let body_import_scope = fast && needs_runtime_import_scope(body);
+                if body_import_scope {
+                    self.push_runtime_scope(line);
+                }
+                let saved_block_imports =
+                    core::mem::replace(&mut self.block_imports, !fast || body_import_scope);
+                let result = self.compile_block_no_scope(body);
+                self.block_imports = saved_block_imports;
+                result?;
+                if body_import_scope {
+                    self.pop_runtime_scope(line);
+                }
                 if fast {
                     self.current_resolver_mut().unwrap().pop_scope();
                 } else {
@@ -750,7 +770,11 @@ impl Compiler {
                 body,
                 visibility,
             } => {
-                let def = self.compile_function(name, params, body)?;
+                let mut def = self.compile_function(name, params, body)?;
+                def.checks_import_clash = self.block_imports
+                    && !self
+                        .current_resolver()
+                        .is_some_and(|resolver| resolver.declared_in_innermost_scope(name));
                 let idx = self.add_function(def);
                 if self.resolvers.is_empty() && self.runtime_scope_depth == 0 {
                     self.root_function_visibility.insert(idx.0, *visibility);
@@ -1634,11 +1658,14 @@ impl Compiler {
 
         // Compile the body into the new chunk. Catch errors so we
         // still restore state on the way out.
+        self.chunk.nesting_depth = nybl::ast_depth::body_depth(body);
+        let saved_block_imports = core::mem::replace(&mut self.block_imports, true);
         let result = (|| {
             self.compile_block_no_scope(body)?;
             self.emit(Instr::ReturnNone, 0);
             Ok::<(), NyblError>(())
         })();
+        self.block_imports = saved_block_imports;
 
         // Snapshot what we need from the function's compile
         // state before restoring the outer one.
@@ -1730,8 +1757,20 @@ impl Compiler {
             slot_count,
             capture_names,
             capture_sources,
+            checks_import_clash: false,
         })
     }
+}
+
+/// Whether a function block binds names at runtime (imports or type
+/// declarations) and therefore needs its own runtime scope.
+fn needs_runtime_import_scope(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|stmt| {
+        matches!(
+            &stmt.kind,
+            StmtKind::Use { .. } | StmtKind::StructDecl { .. } | StmtKind::EnumDecl { .. }
+        )
+    })
 }
 
 fn binop_for_compound(op: AssignOp) -> Instr {

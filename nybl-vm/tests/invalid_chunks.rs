@@ -428,6 +428,7 @@ fn execute_recursively_validates_function_chunks_and_capture_metadata() {
         slot_count: 1,
         capture_names: vec![],
         capture_sources: vec![],
+        checks_import_clash: false,
     };
     let mut outer = chunk_with(Instr::DefineFn(FnIdx(0)));
     outer.functions.push(function);
@@ -455,6 +456,7 @@ fn shared_function_chunk_dags_are_validated_once_without_recursive_traversal() {
             slot_count: 0,
             capture_names: vec![],
             capture_sources: vec![],
+            checks_import_clash: false,
         };
         shared = Arc::new(Chunk {
             code: vec![Instr::ReturnNone],
@@ -475,6 +477,7 @@ fn shared_function_chunk_dags_are_validated_once_without_recursive_traversal() {
             slot_count: 0,
             capture_names: vec![],
             capture_sources: vec![],
+            checks_import_clash: false,
         }],
         ..Chunk::new()
     };
@@ -498,6 +501,7 @@ fn execute_rejects_sparse_or_absurd_function_slot_metadata() {
         slot_count: u32::MAX,
         capture_names: vec![],
         capture_sources: vec![],
+        checks_import_clash: false,
     };
     let mut outer = chunk_with(Instr::DefineFn(FnIdx(0)));
     outer.functions.push(function);
@@ -525,6 +529,7 @@ fn shared_chunks_are_validated_for_each_distinct_parameter_layout() {
             slot_count: 1,
             capture_names: vec![],
             capture_sources: vec![],
+            checks_import_clash: false,
         }
     };
     let mut outer = chunk_with(Instr::Halt);
@@ -559,6 +564,7 @@ fn parameter_binding_metadata_must_match_names_and_slots() {
         slot_count,
         capture_names: vec![],
         capture_sources: vec![],
+        checks_import_clash: false,
     };
     let outer = |function| Chunk {
         code: vec![Instr::DefineFn(FnIdx(0)), Instr::Halt],
@@ -615,6 +621,7 @@ fn rest_parameter_metadata_must_be_unique_and_final() {
         slot_count: modes.len() as u32,
         capture_names: vec![],
         capture_sources: vec![],
+        checks_import_clash: false,
     };
     let outer = |function| Chunk {
         code: vec![Instr::DefineFn(FnIdx(0)), Instr::Halt],

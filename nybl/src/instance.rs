@@ -758,7 +758,7 @@ mod tests {
         );
         modules.insert(
             "facade".to_string(),
-            "use leaf\nfn pop() { items.pop() }".to_string(),
+            "use leaf.{items}\nfn pop() { items.pop() }".to_string(),
         );
         let mut host = ModuleHost { modules };
         let mut instance = NyblInstance::load(

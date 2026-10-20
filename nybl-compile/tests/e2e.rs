@@ -852,7 +852,7 @@ fn main() {
     let entries = __nybl_instance_entry_points(&state);
     println!("{}", entries.iter().map(|entry| format!("{}/{}", entry.name(), entry.arity())).collect::<Vec<_>>().join(","));
     let site = state.abi_declarations.iter().copied().find(|site| __NYBL_FUNCTION_SITES[*site].name == "first" && __NYBL_FUNCTION_SITES[*site].is_public).unwrap();
-    let mut ctx = Ctx { host: &mut host, state: &mut state, memory, steps: 0, call_depth: 0, max_steps: limits.max_steps };
+    let mut ctx = Ctx { host: &mut host, state: &mut state, memory, steps: 0, call_depth: 0, max_steps: limits.max_steps, nesting_used: 0, max_nesting: limits.max_nesting };
     println!("{}", __nybl_call_function_site(&mut ctx, site, vec![::nybl::value::Value::Int(7)], 0).unwrap());
     println!("{}", __nybl_call_active_function(&mut ctx, "<root>", "first", vec![::nybl::value::Value::Int(7)], 0).unwrap());
 }
@@ -1405,16 +1405,6 @@ fn e2e_sandbox_optional_imports_preserve_presence_and_lambda_snapshots() {
             "sandbox_persistent_import_lambda_snapshot",
             "12",
         ),
-        (
-            "use m\nlet saved = fn() { return h() }\nfn h() { return 20 }\nprint(saved())\nprint(h())",
-            "sandbox_import_before_function_stays_bound_and_captured",
-            "12\n12",
-        ),
-        (
-            "fn h() { return 20 }\nuse m\nprint(h())",
-            "sandbox_function_before_import_blocks_binding",
-            "20",
-        ),
     ] {
         let run = run_aot_with_modules_and_opts(source, name, &[("m", module)], &opts);
         assert_eq!(
@@ -1424,6 +1414,28 @@ fn e2e_sandbox_optional_imports_preserve_presence_and_lambda_snapshots() {
             run.stderr
         );
         assert_eq!(run.stdout, expected);
+    }
+
+    // A present optional export clashes with a same-scope `fn` in either order.
+    for (source, name, message) in [
+        (
+            "use m\nlet saved = fn() { return h() }\nfn h() { return 20 }",
+            "sandbox_import_then_function_clash",
+            "`h` is already imported from `m` — `fn h` would replace it",
+        ),
+        (
+            "fn h() { return 20 }\nuse m\nprint(h())",
+            "sandbox_function_then_import_clash",
+            "`h` is already defined — `use m` would import a different `h`",
+        ),
+    ] {
+        let run = run_aot_with_modules_and_opts(source, name, &[("m", module)], &opts);
+        assert_eq!(run.status, Some(1), "{name} should fail: {}", run.stdout);
+        assert!(
+            run.stderr.contains(message),
+            "{name} stderr: {}",
+            run.stderr
+        );
     }
 
     let run = run_aot_with_modules_and_opts(
@@ -2681,7 +2693,7 @@ fn assert_aot_modes_match_with_modules(test_name: &str, code: &str, modules: &[(
     }
 }
 
-fn cross_engine_warning_runs(
+fn cross_engine_import_runs(
     test_name: &str,
     code: &str,
     modules: &[(&str, &str)],
@@ -2761,7 +2773,9 @@ fn main() {
         "aot-sandbox" => __aot_sandbox::run(&mut host, &::nybl::NyblLimits::standard()),
         other => panic!("unknown engine: {{other}}"),
     }};
-    result.unwrap();
+    if let Err(error) = result {{
+        println!("error: {{}} (line {{:?}})", error.message, error.line);
+    }}
 }}
 "#
     ));
@@ -2780,7 +2794,7 @@ fn main() {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .output()
-                .expect("run cross-engine warning driver");
+                .expect("run cross-engine import driver");
             (
                 engine.to_string(),
                 AotRun {
@@ -2796,133 +2810,96 @@ fn main() {
         .collect()
 }
 
-fn expected_glob_warnings(path: &str, names: &[&str]) -> String {
-    names
-        .iter()
-        .map(|name| {
-            format!(
-                "warning: {}\n",
-                nybl::error_messages::glob_shadow_warning(name, path)
-            )
-        })
-        .collect()
-}
-
-#[test]
-#[ignore]
-fn e2e_glob_shadow_warnings_match_all_engines_and_module_boundaries() {
-    let code = r#"use root_first
-use root_second
-fn nested() {
-    use function_first
-    use function_second
-    return alpha + beta() + delta + gamma()
-}
-print(alpha + beta() + delta + gamma())
-print(nested())
-use wrapper as wrapped
-print(wrapped.marker)"#;
-    let mixed_first =
-        "fn gamma() { return 1 }\nlet delta = 1\nfn beta() { return 1 }\nlet alpha = 1";
-    let mixed_second =
-        "let delta = 2\nfn gamma() { return 2 }\nlet alpha = 2\nfn beta() { return 2 }";
-    let modules = &[
-        ("root_first", mixed_first),
-        ("root_second", mixed_second),
-        ("function_first", mixed_first),
-        ("function_second", mixed_second),
-        ("internal_first", mixed_first),
-        ("internal_second", mixed_second),
-        (
-            "wrapper",
-            "use internal_first\nuse internal_second\nlet marker = alpha + beta() + delta + gamma()",
-        ),
-    ];
-    let runs = cross_engine_warning_runs("glob_warning_all_engines", code, modules);
-    let expected = [
-        expected_glob_warnings("root_second", &["alpha", "beta", "delta", "gamma"]),
-        expected_glob_warnings("function_second", &["alpha", "beta", "delta", "gamma"]),
-        expected_glob_warnings("internal_second", &["alpha", "beta", "delta", "gamma"]),
-    ]
-    .concat();
-    let expected_stdout = &runs[0].1.stdout;
-
-    for (engine, run) in &runs {
+/// Every engine (walker, VM, both native AOT modes) must print the same
+/// output, including the same clash errors, and write nothing to stderr.
+fn assert_import_runs_agree(runs: &[(String, AotRun)], expected_stdout: &str) {
+    for (engine, run) in runs {
         assert_eq!(
             run.status,
             Some(0),
-            "{engine} warning contract program failed:\n{}\n--- generated ---\n{}",
+            "{engine} import contract program failed:\n{}\n--- generated ---\n{}",
             run.stderr,
             run.rust_src,
         );
-        assert_eq!(
-            &run.stdout, expected_stdout,
-            "{engine} changed stdout while reporting warnings"
-        );
-        assert_eq!(
-            run.stderr, expected,
-            "{engine} warning text/count/order diverged"
-        );
+        assert_eq!(run.stdout, expected_stdout, "{engine} stdout diverged");
+        assert_eq!(run.stderr, "", "{engine} wrote to stderr");
     }
 }
 
 #[test]
 #[ignore]
-fn e2e_glob_shadow_warnings_cover_claimed_fns_and_slot_locals() {
-    // Orderings from issue #117: a named fn declared *before* the
-    // glob import claims its binding statically (both against a fn
-    // export and a value export of the same name), and a fn-body
-    // import clashing with a slot-allocated local / parameter.
-    // Every engine must warn identically, once per executed `use`
-    // (so twice for the double-called `caller`).
-    let code = r#"fn dup() { return 1 }
-fn dupval() { return 2 }
-use top_module
-fn caller(dup) {
-    let local = 3
-    use fn_module
-    return dup + local
+fn e2e_flat_import_clashes_are_errors_in_all_engines_without_stderr() {
+    let code = r#"fn local_clash() {
+    let alpha = 0
+    use first
+    return alpha
 }
-print(dup() + dupval())
-print(caller(40))
-print(caller(50))"#;
+fn param_clash(alpha) {
+    use first
+    return alpha
+}
+fn glob_clash() {
+    use first
+    use second
+    return alpha
+}
+fn diamond() {
+    use left
+    use right
+    return shared() + base
+}
+fn selective_then_glob() {
+    use first.{alpha}
+    use first
+    return alpha + beta()
+}
+fn let_after_use() {
+    use first
+    let alpha = 5
+    return alpha + beta()
+}
+fn fn_after_use() {
+    use first
+    fn beta() { return 0 }
+    return beta()
+}
+print(try_call(local_clash))
+print(try_call(fn() { return param_clash(1) }))
+print(try_call(glob_clash))
+print(try_call(diamond))
+print(try_call(selective_then_glob))
+print(try_call(let_after_use))
+print(try_call(fn_after_use))
+fn dup() { return 1 }
+use top_module"#;
+    let first = "let alpha = 1\nfn beta() { return 1 }";
     let modules = &[
-        ("top_module", "fn dup() { return 10 }\nlet dupval = 20"),
-        ("fn_module", "let local = 30\nfn dup() { return 40 }"),
+        ("first", first),
+        ("second", "let alpha = 2\nfn beta() { return 2 }"),
+        ("base", "let base = 10\nfn shared() { return 1 }"),
+        ("left", "use base"),
+        ("right", "use base"),
+        ("top_module", "fn dup() { return 10 }"),
     ];
-    let runs = cross_engine_warning_runs("glob_warning_claimed_fns_and_slot_locals", code, modules);
+    let runs = cross_engine_import_runs("flat_import_clashes_all_engines", code, modules);
     let expected = [
-        expected_glob_warnings("top_module", &["dup", "dupval"]),
-        expected_glob_warnings("fn_module", &["dup", "local"]),
-        expected_glob_warnings("fn_module", &["dup", "local"]),
+        "Result::Err(RuntimeError { message: \"`alpha` is already defined — `use first` would import a different `alpha`\", line: 3 })",
+        "Result::Err(RuntimeError { message: \"`alpha` is already defined — `use first` would import a different `alpha`\", line: 7 })",
+        "Result::Err(RuntimeError { message: \"`alpha` is already defined — `use second` would import a different `alpha`\", line: 12 })",
+        "Result::Ok(11)",
+        "Result::Ok(2)",
+        "Result::Ok(6)",
+        "Result::Err(RuntimeError { message: \"`beta` is already imported from `first` — `fn beta` would replace it\", line: 32 })",
+        "error: `dup` is already defined — `use top_module` would import a different `dup` (line Some(43))",
     ]
-    .concat();
-    let expected_stdout = &runs[0].1.stdout;
-
-    for (engine, run) in &runs {
-        assert_eq!(
-            run.status,
-            Some(0),
-            "{engine} warning contract program failed:\n{}\n--- generated ---\n{}",
-            run.stderr,
-            run.rust_src,
-        );
-        assert_eq!(
-            &run.stdout, expected_stdout,
-            "{engine} changed stdout while reporting warnings"
-        );
-        assert_eq!(
-            run.stderr, expected,
-            "{engine} warning text/count/order diverged"
-        );
-    }
+    .join("\n");
+    assert_import_runs_agree(&runs, &expected);
 }
 
 #[test]
 #[ignore]
-fn e2e_non_glob_private_and_absent_exports_are_silent_in_all_engines() {
+fn e2e_aliased_private_and_absent_imports_bind_silently_in_all_engines() {
     let code = r#"use first.{alpha, beta}
-use second.{alpha, beta}
 use second as module
 use private
 use absent
@@ -2936,23 +2913,8 @@ print(alpha + beta() + module.alpha)"#;
             "if false { let alpha = 4; fn beta() { return 4 } }",
         ),
     ];
-    let runs = cross_engine_warning_runs("glob_warning_negative_all_engines", code, modules);
-    let expected_stdout = &runs[0].1.stdout;
-
-    for (engine, run) in &runs {
-        assert_eq!(
-            run.status,
-            Some(0),
-            "{engine} negative warning program failed:\n{}\n--- generated ---\n{}",
-            run.stderr,
-            run.rust_src,
-        );
-        assert_eq!(&run.stdout, expected_stdout, "{engine} stdout diverged");
-        assert_eq!(
-            run.stderr, "",
-            "{engine} warned for selective, aliased, private, or absent exports"
-        );
-    }
+    let runs = cross_engine_import_runs("aliased_private_absent_all_engines", code, modules);
+    assert_import_runs_agree(&runs, "4");
 }
 
 fn assert_aot_compiles_without_warnings_with_modules(
@@ -3137,49 +3099,26 @@ fn transitive(n) { return increment(increment(n)) }"#,
 
 #[test]
 #[ignore]
-fn e2e_aot_modes_preserve_root_and_module_function_first_win() {
-    assert_aot_modes_match_with_modules(
-        "function_first_win_root",
-        r#"fn pick() { return 11 }
+fn e2e_function_and_flat_import_of_one_name_clash_in_either_order() {
+    // Root and module top levels, both orders. Module loads fail inside
+    // `try_call`; the root's own `use` then `fn` ends the program.
+    let code = r#"print(try_call(fn() { use decl_first }))
+print(try_call(fn() { use import_first }))
 use b
-fn read() { return pick() }
-print(read())"#,
-        &[("b", "fn pick() { return 22 }")],
-    );
-    assert_aot_modes_match_with_modules(
-        "function_first_win_root_import_first",
-        r#"use b
-fn pick() { return 11 }
-fn read() { return pick() }
-print(read())"#,
-        &[("b", "fn pick() { return 22 }")],
-    );
-    assert_aot_modes_match_with_modules(
-        "function_first_win_module",
-        "use a\nprint(read())",
-        &[
-            (
-                "a",
-                r#"fn pick() { return 11 }
-use b
-fn read() { return pick() }"#,
-            ),
-            ("b", "fn pick() { return 22 }"),
-        ],
-    );
-    assert_aot_modes_match_with_modules(
-        "function_first_win_module_import_first",
-        "use a\nprint(read())",
-        &[
-            (
-                "a",
-                r#"use b
-fn pick() { return 11 }
-fn read() { return pick() }"#,
-            ),
-            ("b", "fn pick() { return 22 }"),
-        ],
-    );
+fn pick() { return 11 }"#;
+    let modules = &[
+        ("b", "fn pick() { return 22 }"),
+        ("decl_first", "fn pick() { return 11 }\nuse b"),
+        ("import_first", "use b\nfn pick() { return 11 }"),
+    ];
+    let runs = cross_engine_import_runs("function_import_clash_orders", code, modules);
+    let expected = [
+        "Result::Err(RuntimeError { message: \"`pick` is already defined — `use b` would import a different `pick`\", line: 2 })",
+        "Result::Err(RuntimeError { message: \"`pick` is already imported from `b` — `fn pick` would replace it\", line: 2 })",
+        "error: `pick` is already imported from `b` — `fn pick` would replace it (line Some(4))",
+    ]
+    .join("\n");
+    assert_import_runs_agree(&runs, &expected);
 }
 
 #[test]
@@ -4275,4 +4214,345 @@ fn lexical_function_shadows_disabled_builtin_in_generated_code() {
     );
     assert_eq!(run.status, Some(0), "stderr:\n{}", run.stderr);
     assert_eq!(run.stdout, "9");
+}
+
+// ─── Resource accounting shared across calls and module loads ─────
+
+#[path = "../../nybl-vm/tests/support/stack_corpus.rs"]
+mod stack_corpus;
+
+/// Thread stack RUN-002 documents for release builds (generated programs
+/// are built with `--release`); see `nybl-vm/tests/stack_bound.rs`.
+const RELEASE_STACK: usize = 10 * 1024 * 1024;
+
+/// Generated-driver source for a host that serves `modules` and records
+/// prints, shared by the sandbox accounting tests below.
+fn sandbox_driver_prelude(modules: &[(String, String)]) -> String {
+    let mut src = String::from(
+        r#"
+struct DriverHost {
+    modules: ::std::collections::HashMap<::std::string::String, ::std::string::String>,
+}
+
+impl ::nybl::NyblHost for DriverHost {
+    fn call(
+        &mut self,
+        _name: &str,
+        _args: &[::nybl::value::Value],
+        _line: u32,
+    ) -> Option<Result<::nybl::value::Value, ::nybl::error::NyblError>> {
+        None
+    }
+
+    fn on_print(&mut self, message: &str) {
+        println!("{}", message);
+    }
+
+    fn resolve_module(
+        &mut self,
+        name: &str,
+    ) -> Option<Result<::std::string::String, ::nybl::error::NyblError>> {
+        self.modules.get(name).cloned().map(Ok)
+    }
+}
+
+fn driver_host() -> DriverHost {
+    let mut modules = ::std::collections::HashMap::new();
+"#,
+    );
+    for (name, source) in modules {
+        src.push_str(&format!(
+            "    modules.insert({name:?}.to_string(), {source:?}.to_string());\n"
+        ));
+    }
+    src.push_str("    DriverHost { modules }\n}\n");
+    src
+}
+
+fn run_scratch(dir: &std::path::Path, args: &[&str]) -> AotRun {
+    let output = Command::new("cargo")
+        .arg("run")
+        .arg("--quiet")
+        .arg("--release")
+        .arg("--")
+        .args(args)
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run scratch driver");
+    AotRun {
+        status: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        rust_src: String::new(),
+    }
+}
+
+/// Run `code` through the walker, VM, and sandboxed AOT with the limits
+/// built by the Rust expression `limits`, each on a thread of the
+/// documented release stack, and return each engine's stdout (prints, then
+/// any error with its line).
+fn sandbox_parity_runs(
+    test_name: &str,
+    code: &str,
+    modules: &[(&str, &str)],
+    limits: &str,
+) -> Vec<(&'static str, AotRun)> {
+    let modules: Vec<(String, String)> = modules
+        .iter()
+        .map(|(name, source)| (name.to_string(), source.to_string()))
+        .collect();
+    let sandbox = transpile(
+        code,
+        &Options {
+            emit_main: false,
+            use_nybl_sys: false,
+            sandbox: true,
+            module_name: Some("__aot_sandbox".to_string()),
+            module_resolver: Some(modules_from_map(
+                modules
+                    .iter()
+                    .map(|(name, source)| (name.as_str(), source.as_str())),
+            )),
+            ..Options::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("failed to transpile {test_name}: {}", error.message));
+    let mut rust_src = sandbox;
+    rust_src.push_str(&sandbox_driver_prelude(&modules));
+    rust_src.push_str(&format!(
+        r#"
+fn main() {{
+    let engine = ::std::env::args().nth(1).expect("engine argument");
+    let result = ::std::thread::Builder::new()
+        .stack_size({RELEASE_STACK})
+        .spawn(move || {{
+            let mut host = driver_host();
+            let limits: ::nybl::NyblLimits = {limits};
+            match engine.as_str() {{
+                "walker" => ::nybl::run({code:?}, &mut host, &limits),
+                "vm" => ::nybl_vm::run({code:?}, &mut host, &limits),
+                "aot-sandbox" => __aot_sandbox::run(&mut host, &limits),
+                other => panic!("unknown engine: {{other}}"),
+            }}
+        }})
+        .expect("spawn engine thread")
+        .join()
+        .expect("engine thread panicked");
+    if let Err(error) = result {{
+        println!("error: {{}} (line {{:?}})", error.message, error.line);
+    }}
+}}
+"#
+    ));
+    let dir = write_scratch_project(test_name, &rust_src);
+    ["walker", "vm", "aot-sandbox"]
+        .into_iter()
+        .map(|engine| {
+            let mut run = run_scratch(&dir, &[engine]);
+            run.rust_src = rust_src.clone();
+            (engine, run)
+        })
+        .collect()
+}
+
+/// Run a test body that parses or transpiles code at the parse-depth cap on
+/// a thread with the documented stack for this (test) build's profile.
+fn on_documented_stack(test: impl FnOnce() + Send + 'static) {
+    let size = if cfg!(debug_assertions) {
+        128 * 1024 * 1024
+    } else {
+        RELEASE_STACK
+    };
+    std::thread::Builder::new()
+        .stack_size(size)
+        .spawn(test)
+        .expect("spawn test thread")
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+#[track_caller]
+fn assert_sandbox_runs_agree(runs: &[(&'static str, AotRun)], expected_stdout: &str) {
+    for (engine, run) in runs {
+        assert_eq!(
+            run.status,
+            Some(0),
+            "{engine} driver failed:\n{}\n--- generated ---\n{}",
+            run.stderr,
+            run.rust_src
+        );
+        assert_eq!(run.stdout, expected_stdout, "{engine} stdout diverged");
+    }
+}
+
+#[test]
+#[ignore]
+fn e2e_sandbox_nesting_and_module_frames_match_walker_and_vm() {
+    on_documented_stack(sandbox_nesting_and_module_frames);
+}
+
+fn sandbox_nesting_and_module_frames() {
+    // The root (6), a lambda (4), and 65-deep frames: the 31st call is the
+    // last that fits the default 2048. A first-time `use` is one more frame
+    // of shared call depth (so `m2`'s own call is the 65th frame inside the
+    // lambda), and a 70-module chain stops at the cap.
+    let code = format!(
+        r#"fn d(k) {{
+    print(k)
+    return {}d(k + 1){}
+}}
+print(try_call(fn() {{ return d(1) }}).is_err())
+fn e(k) {{
+    if k == 1 {{
+        use m
+        return value
+    }}
+    return e(k - 1)
+}}
+fn f(k) {{
+    if k == 1 {{
+        use m2
+        return value
+    }}
+    return f(k - 1)
+}}
+print(e(62))
+print(try_call(fn() {{ return f(62) }}))
+use chain0"#,
+        "[".repeat(60),
+        "]".repeat(60)
+    );
+    let chain: Vec<(String, String)> = (0..70)
+        .map(|index| {
+            let source = if index < 69 {
+                format!("use chain{}\nlet link = {index}", index + 1)
+            } else {
+                format!("let link = {index}")
+            };
+            (format!("chain{index}"), source)
+        })
+        .collect();
+    let mut modules = vec![
+        ("m", "fn one() { return 1 }\nlet value = one()"),
+        ("m2", "fn one() { return 1 }\nlet value = one()"),
+    ];
+    modules.extend(
+        chain
+            .iter()
+            .map(|(name, source)| (name.as_str(), source.as_str())),
+    );
+    let runs = sandbox_parity_runs(
+        "sandbox_nesting_and_module_frames",
+        &code,
+        &modules,
+        "::nybl::NyblLimits::standard()",
+    );
+    let mut expected: Vec<String> = (1..=31).map(|depth| depth.to_string()).collect();
+    expected.push("true".to_string());
+    expected.push("1".to_string());
+    expected.push(
+        "Result::Err(RuntimeError { message: \"Too many nested function calls (possible infinite recursion)\", line: 2 })"
+            .to_string(),
+    );
+    expected.push(
+        "error: Too many nested function calls (possible infinite recursion) (line Some(1))"
+            .to_string(),
+    );
+    assert_sandbox_runs_agree(&runs, &format!("{}\n", expected.join("\n")));
+}
+
+#[test]
+#[ignore]
+fn e2e_sandbox_module_load_cost_matches_walker_and_vm() {
+    // `fn f() { return [1, ... 1] }` with 100 elements is 208 tokens.
+    let module = format!("fn f() {{ return [{}] }}", vec!["1"; 100].join(", "));
+    let modules = [("m", module.as_str())];
+    let limits = |max_steps: u64| {
+        format!("::nybl::NyblLimits {{ max_steps: {max_steps}, ..::nybl::NyblLimits::standard() }}")
+    };
+    let below = sandbox_parity_runs("sandbox_load_cost_below", "use m", &modules, &limits(207));
+    assert_sandbox_runs_agree(
+        &below,
+        "error: Your code took too many steps (possible infinite loop) (line Some(1))\n",
+    );
+    let above = sandbox_parity_runs(
+        "sandbox_load_cost_above",
+        "use m as first\nuse m as second",
+        &modules,
+        &limits(211),
+    );
+    assert_sandbox_runs_agree(&above, "");
+}
+
+#[test]
+#[ignore]
+fn e2e_sandbox_stack_corpus_ends_cleanly_on_the_documented_stack() {
+    on_documented_stack(sandbox_stack_corpus);
+}
+
+fn sandbox_stack_corpus() {
+    let shapes = stack_corpus::corpus();
+    let mut rust_src = String::new();
+    for (index, shape) in shapes.iter().enumerate() {
+        let module = transpile(
+            &shape.source,
+            &Options {
+                emit_main: false,
+                use_nybl_sys: false,
+                sandbox: true,
+                module_name: Some(format!("shape_{index}")),
+                module_resolver: Some(modules_from_map(
+                    shape
+                        .modules
+                        .iter()
+                        .map(|(name, source)| (name.as_str(), source.as_str())),
+                )),
+                ..Options::default()
+            },
+        );
+        match module {
+            Ok(module) => rust_src.push_str(&module),
+            Err(error) => {
+                // A shape the transpiler rejects (parse depth) never runs.
+                assert!(
+                    shape.accepts(&error.message),
+                    "{}: {}",
+                    shape.name,
+                    error.message
+                );
+                rust_src.push_str(&format!(
+                    "pub mod shape_{index} {{ pub fn run<H: ::nybl::NyblHost>(_: &mut H, _: &::nybl::NyblLimits) -> Result<(), ::nybl::error::NyblError> {{ Err(::nybl::error::NyblError::runtime({:?}, 0)) }} }}\n",
+                    error.message
+                ));
+            }
+        }
+    }
+    rust_src.push_str(&sandbox_driver_prelude(&[]));
+    rust_src.push_str(&format!(
+        "fn main() {{\n    ::std::thread::Builder::new().stack_size({RELEASE_STACK}).spawn(|| {{\n        let limits = ::nybl::NyblLimits::standard();\n"
+    ));
+    for (index, shape) in shapes.iter().enumerate() {
+        rust_src.push_str(&format!(
+            "        let message = match shape_{index}::run(&mut driver_host(), &limits) {{ Ok(()) => \"succeeded\".to_string(), Err(error) => error.message }};\n        println!(\"{}\\t{{}}\", message);\n",
+            shape.name
+        ));
+    }
+    rust_src.push_str(
+        "    }).expect(\"spawn corpus thread\").join().expect(\"corpus thread panicked\");\n}\n",
+    );
+    let dir = write_scratch_project("sandbox_stack_corpus", &rust_src);
+    let run = run_scratch(&dir, &[]);
+    assert_eq!(run.status, Some(0), "corpus driver failed:\n{}", run.stderr);
+    let outcomes: Vec<(&str, &str)> = run
+        .stdout
+        .lines()
+        .map(|line| line.split_once('\t').expect("shape outcome line"))
+        .collect();
+    assert_eq!(outcomes.len(), shapes.len(), "{}", run.stdout);
+    for (shape, (name, message)) in shapes.iter().zip(outcomes) {
+        assert_eq!(shape.name, name);
+        assert!(shape.accepts(message), "{name}: {message}");
+    }
 }

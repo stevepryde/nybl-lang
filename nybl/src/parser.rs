@@ -906,12 +906,27 @@ impl Parser {
     }
 
     fn enter(&mut self) -> Result<(), NyblError> {
-        if self.depth >= MAX_PARSE_DEPTH {
-            return Err(self.error(self.peek_line(), "Code is nested too deeply"));
+        if !self.try_enter() {
+            return Err(self.too_deep());
         }
-
-        self.depth += 1;
         Ok(())
+    }
+
+    /// Charge one level of the parse-depth budget. Chain loops use this
+    /// directly so their frames don't hold an extra `Result` temporary:
+    /// they run once per precedence level of every nested expression.
+    fn try_enter(&mut self) -> bool {
+        if self.depth >= MAX_PARSE_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn too_deep(&self) -> NyblError {
+        self.error(self.peek_line(), "Code is nested too deeply")
     }
 
     fn leave(&mut self) {
@@ -1673,10 +1688,17 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut left = self.parse_and()?;
         while matches!(self.peek(), Token::PipePipe) {
             let (line, column) = self.peek_pos();
             self.advance();
+            if !self.try_enter() {
+                return Err(self.too_deep());
+            }
             let right = self.parse_and()?;
             left = Expr {
                 kind: ExprKind::BinaryOp {
@@ -1688,14 +1710,22 @@ impl Parser {
                 column,
             };
         }
+        self.depth = chain_base;
         Ok(left)
     }
 
     fn parse_and(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut left = self.parse_equality()?;
         while matches!(self.peek(), Token::AmpAmp) {
             let (line, column) = self.peek_pos();
             self.advance();
+            if !self.try_enter() {
+                return Err(self.too_deep());
+            }
             let right = self.parse_equality()?;
             left = Expr {
                 kind: ExprKind::BinaryOp {
@@ -1707,10 +1737,15 @@ impl Parser {
                 column,
             };
         }
+        self.depth = chain_base;
         Ok(left)
     }
 
     fn parse_equality(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut left = self.parse_comparison()?;
         while matches!(self.peek(), Token::EqEq | Token::BangEq) {
             let (line, column) = self.peek_pos();
@@ -1720,6 +1755,9 @@ impl Parser {
                 BinOp::NotEq
             };
             self.advance();
+            if !self.try_enter() {
+                return Err(self.too_deep());
+            }
             let right = self.parse_comparison()?;
             left = Expr {
                 kind: ExprKind::BinaryOp {
@@ -1731,10 +1769,15 @@ impl Parser {
                 column,
             };
         }
+        self.depth = chain_base;
         Ok(left)
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut left = self.parse_addition()?;
         while matches!(
             self.peek(),
@@ -1748,6 +1791,9 @@ impl Parser {
                 _ => BinOp::GtEq,
             };
             self.advance();
+            if !self.try_enter() {
+                return Err(self.too_deep());
+            }
             let right = self.parse_addition()?;
             left = Expr {
                 kind: ExprKind::BinaryOp {
@@ -1759,10 +1805,15 @@ impl Parser {
                 column,
             };
         }
+        self.depth = chain_base;
         Ok(left)
     }
 
     fn parse_addition(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut left = self.parse_multiply()?;
         while matches!(self.peek(), Token::Plus | Token::Minus) {
             let (line, column) = self.peek_pos();
@@ -1772,6 +1823,9 @@ impl Parser {
                 BinOp::Sub
             };
             self.advance();
+            if !self.try_enter() {
+                return Err(self.too_deep());
+            }
             let right = self.parse_multiply()?;
             left = Expr {
                 kind: ExprKind::BinaryOp {
@@ -1783,10 +1837,15 @@ impl Parser {
                 column,
             };
         }
+        self.depth = chain_base;
         Ok(left)
     }
 
     fn parse_multiply(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut left = self.parse_unary()?;
         while matches!(self.peek(), Token::Star | Token::Slash | Token::Percent) {
             let (line, column) = self.peek_pos();
@@ -1796,6 +1855,9 @@ impl Parser {
                 _ => BinOp::Mod,
             };
             self.advance();
+            if !self.try_enter() {
+                return Err(self.too_deep());
+            }
             let right = self.parse_unary()?;
             left = Expr {
                 kind: ExprKind::BinaryOp {
@@ -1807,6 +1869,7 @@ impl Parser {
                 column,
             };
         }
+        self.depth = chain_base;
         Ok(left)
     }
 
@@ -1868,11 +1931,18 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self) -> Result<Expr, NyblError> {
+        // Each chain link nests the AST one level deeper without recursing,
+        // so it charges the parse-depth budget; all links are released when
+        // the chain ends.
+        let chain_base = self.depth;
         let mut expr = self.parse_primary()?;
 
         loop {
             match self.peek() {
                 Token::LParen => {
+                    if !self.try_enter() {
+                        return Err(self.too_deep());
+                    }
                     let (line, column) = self.peek_pos();
                     self.advance();
                     let args = self.parse_args()?;
@@ -1887,6 +1957,9 @@ impl Parser {
                     };
                 }
                 Token::LBracket => {
+                    if !self.try_enter() {
+                        return Err(self.too_deep());
+                    }
                     let (line, column) = self.peek_pos();
                     self.advance();
                     let index = self.with_struct_literal(true, |p| p.parse_expr())?;
@@ -1901,6 +1974,9 @@ impl Parser {
                     };
                 }
                 Token::Dot => {
+                    if !self.try_enter() {
+                        return Err(self.too_deep());
+                    }
                     let (line, column) = self.peek_pos();
                     self.advance();
                     let (name, _) = self.expect_ident()?;
@@ -1969,6 +2045,7 @@ impl Parser {
             }
         }
 
+        self.depth = chain_base;
         Ok(expr)
     }
 
@@ -3222,6 +3299,46 @@ mod depth_tests {
             .expect_err("one level beyond the nesting limit should fail");
         assert_eq!(error.message, "Code is nested too deeply");
         assert_eq!(over_limit.depth, 0);
+    }
+
+    fn chain_depth_error(source: &str) -> Option<String> {
+        crate::parse(source)
+            .err()
+            .map(|error| error.message)
+            .filter(|message| message == "Code is nested too deeply")
+    }
+
+    #[test]
+    fn long_operator_and_postfix_chains_count_toward_the_depth_cap() {
+        // Every link nests the AST one level deeper, so a chain longer than
+        // the cap is rejected even though the parser loops rather than
+        // recursing over it.
+        for (link, open) in [
+            (" + 1", "let x = 1"),
+            (" * 1", "let x = 1"),
+            (" == 1", "let x = 1"),
+            (" < 1", "let x = 1"),
+            (" && true", "let x = true"),
+            (" || true", "let x = true"),
+            ("[0]", "let x = y"),
+            (".to_str()", "let x = y"),
+            (".field", "let x = y"),
+            ("(1)", "let x = f"),
+        ] {
+            let long = format!("{open}{}", link.repeat(MAX_PARSE_DEPTH + 1));
+            assert!(chain_depth_error(&long).is_some(), "{long:.40}");
+            let short = format!("{open}{}", link.repeat(MAX_PARSE_DEPTH / 2));
+            assert!(crate::parse(&short).is_ok(), "{short:.40}");
+        }
+    }
+
+    #[test]
+    fn chain_links_are_released_when_the_chain_ends() {
+        // Many sibling chains, each well inside the cap, never accumulate.
+        let statements = vec!["let x = 1 + 1 + 1 + 1 + 1"; MAX_PARSE_DEPTH * 2].join("\n");
+        crate::parse(&statements).expect("independent chains parse");
+        let arguments = vec!["1 + 1 + 1"; MAX_PARSE_DEPTH * 2].join(", ");
+        crate::parse(&format!("f({arguments})")).expect("sibling arguments parse");
     }
 
     #[test]

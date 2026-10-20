@@ -12,9 +12,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
-# Rust 1.88 is the minimum toolchain for the complete 0.4 workspace,
+# Rust 1.88 is the minimum toolchain for the complete 0.5 workspace,
 # including the CLI dependency graph. Keep this in sync with the
 # release check documented in CHANGELOG.md and specs/stack.md.
 rust-version = "1.88"

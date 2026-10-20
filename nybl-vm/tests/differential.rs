@@ -3191,38 +3191,58 @@ print(x)"#),
 }
 
 #[test]
-fn function_local_use_frontiers_preserve_shadowing_and_duplicate_parameters_diff() {
+fn function_local_use_frontiers_detect_parameter_and_earlier_let_clashes_diff() {
     set_modules(&[
-        (
-            "parameters",
-            "let parameter = 10\nlet first = 20\nlet from_parameters = 30",
-        ),
+        ("parameters", "let parameter = 10\nlet from_parameters = 30"),
+        ("lets", "let first = 20"),
         ("future", "let future = 40"),
         ("nested", "let inner = 45\nlet nested_value = 50"),
+        ("values", "let nested_value = 50"),
     ]);
+    // A function-local `use` sees parameters (including repeated
+    // spellings) and earlier lets in its own lexical scope.
+    for (source, name, path) in [
+        (
+            "fn inspect(parameter, parameter) {\n    use parameters\n}\ninspect(6, 7)",
+            "parameter",
+            "parameters",
+        ),
+        (
+            "fn inspect() {\n    let first = 1\n    let first = 2\n    use lets\n}\ninspect()",
+            "first",
+            "lets",
+        ),
+        (
+            "fn inspect() {\n    if true {\n        let inner = 4\n        let inner = 5\n        use nested\n    }\n}\ninspect()",
+            "inner",
+            "nested",
+        ),
+    ] {
+        assert_eq!(
+            run_err(source),
+            format!("`{name}` is already defined — `use {path}` would import a different `{name}`"),
+            "{source}"
+        );
+    }
+
+    // Later lets shadow an import, and an outer-scope parameter is not a
+    // clash for a block-local import.
     let outcome = run_both(
-        r#"fn inspect(parameter, parameter) {
-    let first = 1
-    let first = 2
-    use parameters
-    print(parameter, first, from_parameters)
+        r#"fn inspect(parameter) {
     use future
     print(future)
     let future = 3
     print(future)
     if true {
-        let inner = 4
-        let inner = 5
-        use nested
-        print(inner, nested_value)
+        use values
+        print(parameter, nested_value)
     }
 }
-inspect(6, 7)"#,
+inspect(6)"#,
         &standard(),
     );
-
     assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
-    assert_eq!(outcome.prints, ["7 2 30", "40", "3", "5 50"]);
+    assert_eq!(outcome.prints, ["40", "3", "6 50"]);
 }
 
 #[test]
@@ -3460,11 +3480,14 @@ use dep as dep"#,
 }
 
 #[test]
-fn selective_and_glob_function_imports_preserve_existing_named_fn_diff() {
+fn selective_and_glob_function_imports_reject_an_existing_named_fn_diff() {
     set_modules(&[("dep", "fn pick() { return 42 }")]);
     for import in ["use dep.{pick}", "use dep"] {
         let source = format!("fn pick() {{ return 1 }}\n{import}\nprint(pick())");
-        assert_eq!(say(&source), "1");
+        assert_eq!(
+            run_err(&source),
+            "`pick` is already defined — `use dep` would import a different `pick`"
+        );
     }
 }
 
@@ -3818,7 +3841,7 @@ print(match named { api.Signal::Named { value } => value, _ => 0 })"#,
 }
 
 #[test]
-fn reexported_type_origins_preserve_diamonds_and_first_win_diff() {
+fn reexported_type_origins_preserve_diamonds_and_reject_different_types_diff() {
     set_modules(&[
         ("leaf", "struct Shared { value }"),
         ("left", "use leaf"),
@@ -3833,8 +3856,8 @@ fn reexported_type_origins_preserve_diamonds_and_first_win_diff() {
     ]);
     let outcome = run_both(
         r#"use diamond as diamond
-use order_ab as ab
-use order_ba as ba
+use fa as ab
+use fb as ba
 let shared = diamond.Shared { value: 1 }
 let first = ab.Same { a: 2 }
 let second = ba.Same { b: 3 }
@@ -3843,6 +3866,13 @@ print(shared.value, first.a, second.b)"#,
     );
     assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
     assert_eq!(outcome.prints, ["1 2 3"]);
+
+    for (module, second) in [("order_ab", "fb"), ("order_ba", "fa")] {
+        assert_eq!(
+            run_err(&format!("use {module} as facade")),
+            format!("`Same` is already defined — `use {second}` would import a different `Same`")
+        );
+    }
 }
 
 #[test]
@@ -3858,15 +3888,18 @@ fn reexported_type_privacy_and_local_overwrite_rules_diff() {
     let outcome = run_both(
         r#"use leaf as direct
 use selective as selected
-use local_before as before
 use local_after as after
 print(direct._Hidden { value: 1 }.value)
 print(selected._Hidden { value: 2 }.value)
-print(before.Public { local: 3 }.local, after.Public { local: 4 }.local)"#,
+print(after.Public { local: 4 }.local)"#,
         &standard(),
     );
     assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
-    assert_eq!(outcome.prints, ["1", "2", "3 4"]);
+    assert_eq!(outcome.prints, ["1", "2", "4"]);
+    assert_eq!(
+        run_err("use local_before as before"),
+        "`Public` is already defined — `use leaf` would import a different `Public`"
+    );
 
     let error = run_err("use glob as facade\nfacade._Hidden { value: 1 }");
     assert!(error.contains("_Hidden"), "got: {error}");
@@ -4009,20 +4042,19 @@ fn reexported_module_aliases_obey_order_privacy_and_isolation_diff() {
     assert!(selected.is_ok(), "unexpected error: {:?}", selected.error);
     assert_eq!(selected.prints, ["4"]);
 
-    for (module, expected) in [
-        ("module_first", "5"),
-        ("value_first", "11"),
-        ("local_after", "12"),
-        ("local_before", "13"),
+    let local_after = run_both("use local_after\nprint(api)", &standard());
+    assert!(local_after.is_ok(), "{:?}", local_after.error);
+    assert_eq!(local_after.prints, ["12"]);
+    for (module, second) in [
+        ("module_first", "values"),
+        ("value_first", "wa"),
+        ("local_before", "wa"),
     ] {
-        let source = if module == "module_first" {
-            format!("use {module}\nprint(api.Point {{ a: 5 }}.a)")
-        } else {
-            format!("use {module}\nprint(api)")
-        };
-        let outcome = run_both(&source, &standard());
-        assert!(outcome.is_ok(), "{module}: {:?}", outcome.error);
-        assert_eq!(outcome.prints, [expected], "{module}");
+        assert_eq!(
+            run_err(&format!("use {module}")),
+            format!("`api` is already defined — `use {second}` would import a different `api`"),
+            "{module}"
+        );
     }
 
     for source in ["use private_glob.{_api}", "use nested.{api}"] {
@@ -4109,16 +4141,24 @@ fn result() { return api.Point { value: 23 } }"#,
 
     let outcome = run_both(
         r#"use copies.{from_copy, from_reassigned}
-use flat_fn_first.{result} as first
-use flat_module_first.{result} as second
 print(from_copy(1).value, from_reassigned(2).value)
-print(first.result(), second.result().value)
 use module_fn_then_value.{api} as final_value
 print(final_value.api)"#,
         &standard(),
     );
     assert!(outcome.is_ok(), "unexpected error: {:?}", outcome.error);
-    assert_eq!(outcome.prints, ["1 2", "21 23", "25"]);
+    assert_eq!(outcome.prints, ["1 2", "25"]);
+
+    // A flat import and a function declaration of the same name can't
+    // share a scope, in either order.
+    assert_eq!(
+        run_err("use flat_fn_first.{result} as first"),
+        "`api` is already defined — `use wrapper` would import a different `api`"
+    );
+    assert_eq!(
+        run_err("use flat_module_first.{result} as second"),
+        "`api` is already imported from `wrapper` — `fn api` would replace it"
+    );
 }
 
 #[test]
@@ -7001,5 +7041,59 @@ fn fuzz_extended_diff() {
         let stmt_count = 8 + ((i as usize) % 16);
         let program = g.gen_program(stmt_count);
         let _ = run_both(&program, &standard());
+    }
+}
+
+// ─── Flat import clashes ───────────────────────────────────────────
+
+#[test]
+fn flat_import_clash_rules_diff() {
+    set_modules(&[
+        ("dep", "fn pick() { return 42 }\nlet _hidden = 7"),
+        ("other", "fn pick() { return 43 }"),
+        ("base", "fn pick() { return 44 }"),
+        ("left", "use base"),
+        ("right", "use base"),
+        ("types", "struct Point { value }"),
+        ("builtin_shadow", "struct Result { value }"),
+        ("surface", "let _hidden = 8\npub { _hidden }"),
+        (
+            "money",
+            "fn helper() { return \"library\" }\nfn total() { return 1 }",
+        ),
+    ]);
+    let clash = |name: &str, path: &str| {
+        format!("`{name}` is already defined — `use {path}` would import a different `{name}`")
+    };
+    for (source, expected) in [
+        ("fn pick() { return 1 }\nuse dep", clash("pick", "dep")),
+        ("let pick = 1\nuse dep", clash("pick", "dep")),
+        ("use other as pick\nuse dep", clash("pick", "dep")),
+        ("fn f(pick) {\n    use dep\n}\nf(1)", clash("pick", "dep")),
+        ("use dep\nuse other", clash("pick", "other")),
+        ("struct Point { other }\nuse types", clash("Point", "types")),
+        ("use builtin_shadow", clash("Result", "builtin_shadow")),
+        ("let _hidden = 1\nuse surface", clash("_hidden", "surface")),
+        (
+            "use money\nfn helper() { return \"mine\" }\nprint(helper())",
+            "`helper` is already imported from `money` — `fn helper` would replace it".to_string(),
+        ),
+    ] {
+        assert_eq!(run_err(source), expected, "{source}");
+    }
+
+    for (source, expected) in [
+        // Two paths to the same declaration bind it once.
+        ("use left\nuse right\nprint(pick())", "44"),
+        ("use dep.{pick}\nuse dep\nprint(pick())", "42"),
+        // A later `let` is ordinary shadowing.
+        ("use dep\nlet pick = 5\nprint(pick)", "5"),
+        // Glob imports skip private names; re-importing a path is a no-op.
+        ("let _hidden = 1\nuse dep\nprint(_hidden)", "1"),
+        ("use dep\nuse dep\nprint(pick())", "42"),
+        // Aliased imports bind only the alias.
+        ("let pick = 1\nuse dep as d\nprint(pick, d.pick())", "1 42"),
+    ] {
+        assert_eq!(say(source), expected, "{source}");
     }
 }

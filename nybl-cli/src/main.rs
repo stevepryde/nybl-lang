@@ -55,8 +55,8 @@ fn main() -> ExitCode {
         }
     };
     match cmd {
-        args::Command::Repl => repl::run(),
-        args::Command::Run { file, no_vm } => run::run_file(&file, no_vm),
+        args::Command::Repl => on_script_stack(repl::run),
+        args::Command::Run { file, no_vm } => on_script_stack(move || run::run_file(&file, no_vm)),
         args::Command::Compile {
             file,
             output,
@@ -70,6 +70,26 @@ fn main() -> ExitCode {
         args::Command::Version => {
             println!("nybl {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Run Nybl code on a thread with the stack RUN-002 documents for this build
+/// profile rather than the main thread, whose size is platform-defined (1 MiB
+/// on Windows).
+fn on_script_stack(run: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode {
+    let size = if cfg!(debug_assertions) {
+        128 * 1024 * 1024
+    } else {
+        10 * 1024 * 1024
+    };
+    match std::thread::Builder::new().stack_size(size).spawn(run) {
+        Ok(handle) => handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+        Err(error) => {
+            eprintln!("error: couldn't start the script thread: {error}");
+            ExitCode::FAILURE
         }
     }
 }

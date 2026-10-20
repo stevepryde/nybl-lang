@@ -170,6 +170,7 @@ use alloc::{collections::BTreeSet, string::String, vec::Vec};
 #[cfg(any(feature = "std", not(feature = "no_std")))]
 use std::collections::BTreeSet;
 
+pub mod ast_depth;
 #[doc(hidden)]
 pub mod ast_visit;
 pub mod builtins;
@@ -179,6 +180,8 @@ pub mod error_messages;
 #[doc(hidden)]
 pub mod formatting;
 pub mod host;
+#[doc(hidden)]
+pub mod import_scope;
 mod instance;
 pub mod lexer;
 pub mod math;
@@ -259,24 +262,40 @@ pub struct NyblLimits {
     /// catch them. Names that are not engine builtins are allowed
     /// and never match. Empty (the default) disables nothing.
     pub disabled_builtins: BTreeSet<String>,
+    /// Budget for code nesting across active frames. Each running function,
+    /// lambda, or method body, each loading module top level, and the root
+    /// program charge their static nesting depth (see [`ast_depth`]) while
+    /// they are active; a call or `use` that would exceed the budget fails
+    /// with an ordinary, `try_call`-catchable error. Together with the fixed
+    /// call-depth and parse-depth caps this bounds the native stack an
+    /// execution can use, so a host can size its threads from Nybl's limits
+    /// (see the crate README for the per-profile sizes).
+    pub max_nesting: u32,
 }
 
+/// Default [`NyblLimits::max_nesting`] for both presets.
+pub const DEFAULT_MAX_NESTING: u32 = 2048;
+
 impl NyblLimits {
-    /// The general-purpose preset: 10,000 steps and 10 MiB of tracked memory.
+    /// The general-purpose preset: 10,000 steps, 10 MiB of tracked memory, and
+    /// a nesting budget of [`DEFAULT_MAX_NESTING`].
     pub fn standard() -> Self {
         Self {
             max_steps: 10_000,
             max_memory: 10 * 1024 * 1024, // 10 MB
             disabled_builtins: BTreeSet::new(),
+            max_nesting: DEFAULT_MAX_NESTING,
         }
     }
 
-    /// A smaller preset for demos: 1,000 steps and 1 MiB of tracked memory.
+    /// A smaller preset for demos: 1,000 steps, 1 MiB of tracked memory, and
+    /// a nesting budget of [`DEFAULT_MAX_NESTING`].
     pub fn demo() -> Self {
         Self {
             max_steps: 1_000,
             max_memory: 1024 * 1024, // 1 MB
             disabled_builtins: BTreeSet::new(),
+            max_nesting: DEFAULT_MAX_NESTING,
         }
     }
 
@@ -289,6 +308,13 @@ impl NyblLimits {
     ) -> Self {
         self.disabled_builtins
             .extend(names.into_iter().map(Into::into));
+        self
+    }
+
+    /// Builder-style helper that sets [`Self::max_nesting`]:
+    /// `NyblLimits::standard().with_max_nesting(512)`.
+    pub fn with_max_nesting(mut self, max_nesting: u32) -> Self {
+        self.max_nesting = max_nesting;
         self
     }
 }
@@ -2443,26 +2469,49 @@ repeat 1000 {
     }
 
     #[test]
-    fn safety_deep_parse_nesting_fits_a_2_mib_stack() {
-        // Unlike the walker test above, the *parser's* depth cap must
-        // hold within the default ~2 MiB stack of a spawned thread —
-        // embedders commonly parse on worker threads, and a parse of
-        // hostile input that aborts the process instead of returning
-        // "nested too deeply" breaks the sandbox promise. This pins
-        // the frame-size budget deliberately: growing `NyblError` (or
-        // parser frames) past what MAX_PARSE_DEPTH levels fit in
-        // 2 MiB must fail here, not in embedders' processes.
+    fn safety_deep_parse_nesting_fits_a_pinned_stack() {
+        // Parsing hostile input at the depth cap must return "nested too
+        // deeply" rather than abort, on a stack well inside the RUN-002
+        // thread size. This pins the parser's frame budget deliberately:
+        // the worst shapes measured 0.8 MiB in release and 4.5 MiB in debug
+        // (nested `match`; arm64 macOS, Rust 1.98), so growing `NyblError`
+        // or parser frames by a large factor fails here, not in embedders'
+        // processes.
+        let stack = if cfg!(debug_assertions) {
+            9 * 1024 * 1024
+        } else {
+            2 * 1024 * 1024
+        };
+        let nest =
+            |open: &str, close: &str| format!("let x = {}1{}", open.repeat(200), close.repeat(200));
+        let shapes = [
+            nest("(", ")"),
+            nest("[", "]"),
+            nest("{ \"a\": ", " }"),
+            nest("Ok(", ")"),
+            nest("if true { ", " } else { 0 }"),
+            format!(
+                "let y = {}",
+                (0..200).fold("x".to_string(), |expr, _| format!(
+                    "match x {{ _ => {expr} }}"
+                ))
+            ),
+        ];
         let handle = std::thread::Builder::new()
-            .stack_size(2 * 1024 * 1024)
-            .spawn(|| {
-                let code = "(".repeat(200) + "1" + &")".repeat(200);
-                parse(&code).unwrap_err().message
+            .stack_size(stack)
+            .spawn(move || {
+                shapes
+                    .iter()
+                    .map(|code| parse(code).unwrap_err().message)
+                    .collect::<Vec<_>>()
             })
             .expect("spawn parse test thread");
-        let msg = handle
+        let messages = handle
             .join()
-            .expect("deep parse must not overflow a 2 MiB stack");
-        assert!(msg.contains("nested too deeply"), "got: {msg}");
+            .expect("deep parse must not overflow the pinned stack");
+        for message in messages {
+            assert!(message.contains("nested too deeply"), "got: {message}");
+        }
     }
 
     #[test]
@@ -3728,23 +3777,24 @@ print(doubled_pi)"#,
     }
 
     #[test]
-    fn glob_use_shadowing_is_a_warning_first_wins() {
-        // Under the new semantics, glob imports emit a warning
-        // (rather than an error) when a name they'd bring in is
-        // already bound. The first definition wins and the
-        // program continues. A user who genuinely wants the
-        // imported value can use the selective or aliased form
-        // to opt in explicitly.
+    fn glob_use_over_an_existing_binding_is_an_error() {
+        // A glob import that would bind a name the scope already defines
+        // fails instead of silently keeping either definition.
         let mut host = ModuleHost::new(&[("m", "let x = 99")]);
-        run(
+        let err = run(
             r#"let x = 1
 use m
 print(x)"#,
             &mut host,
             &NyblLimits::standard(),
         )
-        .expect("run ok");
-        assert_eq!(host.prints(), vec!["1".to_string()]);
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "`x` is already defined — `use m` would import a different `x`"
+        );
+        assert_eq!(err.line, Some(2));
+        assert!(host.prints().is_empty());
     }
 
     #[test]

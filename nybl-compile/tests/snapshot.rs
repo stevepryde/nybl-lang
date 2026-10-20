@@ -224,34 +224,9 @@ fn non_sandbox_lifted_fns_resolve_bare_imported_calls_from_context() {
     contains_all(
         &out,
         &[
-            "__nybl_import_binding_value(ctx, \"<root>\", \"increment\"",
+            "__nybl_import_flat_value(ctx, \"<root>\", \"increment\"",
             "__nybl_binding_value(ctx, \"<root>\", \"increment\")",
             "__nybl_call_named_value(ctx, __callee",
-        ],
-    );
-}
-
-#[test]
-fn non_sandbox_named_functions_claim_first_win_before_flat_imports() {
-    let out = compile_with_modules(
-        "fn pick() { return 11 }\nuse b\nfn read() { return pick() }\nprint(read())",
-        &[("b", "fn pick() { return 22 }")],
-    )
-    .expect("transpile first-win named function");
-    assert!(
-        out.contains("__nybl_activate_function(ctx, 0);"),
-        "root function activation missing:\n{out}"
-    );
-    assert!(
-        !out.contains("__nybl_import_binding_value(ctx, \"<root>\", \"pick\""),
-        "a statically losing flat import should not become binding storage:\n{out}"
-    );
-    contains_all(
-        &out,
-        &[
-            "__nybl_has_binding(ctx, module_path, name)",
-            "__nybl_binding_value(ctx, \"<root>\", \"pick\")",
-            "ctx.active_function_sites",
         ],
     );
 }
@@ -272,8 +247,8 @@ fn flat_value_imports_emit_origin_aliases_through_facades() {
     contains_all(
         &out,
         &[
-            "__nybl_import_binding_alias(ctx, \"facade\", \"count\", \"leaf\", \"count\")",
-            "__nybl_import_binding_alias(ctx, \"<root>\", \"count\", \"facade\", \"count\")",
+            "__nybl_import_flat_alias(ctx, \"facade\", \"count\", \"leaf\", ",
+            "__nybl_import_flat_alias(ctx, \"<root>\", \"count\", \"facade\", ",
             "__nybl_resolve_binding_key(ctx, module_path, name)",
             "__nybl_binding_mut_option(ctx, \"leaf\", \"count\")",
         ],
@@ -558,7 +533,7 @@ fn lambda_records_opaque_capture_depth_before_move() {
         &out,
         &[
             "__nybl_wrap_callable(",
-            "__opaque_body_depth, 2, __callable)?",
+            "__opaque_body_depth, 3, 2, __callable)?",
             "NyblFn::try_new_compiled_in_module_with_origin_and_modes(",
             "param_modes,",
             "opaque_body_depth,",
@@ -1003,8 +978,8 @@ fn sandbox_catalogues_repeated_function_declarations_by_unique_site() {
     contains_all(
         &out,
         &[
-            "__NyblFunctionSite { id: 0, module_path: \"<root>\", name: \"entry\", params: &[\"x\"], param_modes: &[::nybl::parser::ParamMode::Value], is_public: true, abi_eligible: true, line: 1 }",
-            "__NyblFunctionSite { id: 1, module_path: \"<root>\", name: \"entry\", params: &[\"x\", \"y\"], param_modes: &[::nybl::parser::ParamMode::Value, ::nybl::parser::ParamMode::Value], is_public: true, abi_eligible: true, line: 2 }",
+            "__NyblFunctionSite { id: 0, module_path: \"<root>\", name: \"entry\", params: &[\"x\"], param_modes: &[::nybl::parser::ParamMode::Value], is_public: true, abi_eligible: true, line: 1, nesting: 3 }",
+            "__NyblFunctionSite { id: 1, module_path: \"<root>\", name: \"entry\", params: &[\"x\", \"y\"], param_modes: &[::nybl::parser::ParamMode::Value, ::nybl::parser::ParamMode::Value], is_public: true, abi_eligible: true, line: 2, nesting: 3 }",
         ],
     );
 }
@@ -1272,7 +1247,7 @@ fn two() { use shared; return helper(2) }"#;
     .expect("transpile two function-local imports");
 
     assert_eq!(*calls.borrow(), 1, "resolver must run once per module path");
-    let load_site = format!("= __mod_{}_load(ctx)?;", module_slug("shared"));
+    let load_site = format!("= __mod_{}_load(ctx, ", module_slug("shared"));
     assert_eq!(
         out.matches(&load_site).count(),
         2,
@@ -1427,7 +1402,7 @@ let after = build()"#,
     contains_all(
         &output,
         &[
-            "__nybl_bind_imported_type(&mut __nybl_type_bindings, \"Point\", \"types\")",
+            "__nybl_bind_imported_type(&mut __nybl_type_bindings, \"Point\", \"types\", ",
             "__nybl_publish_imported_type_binding(ctx, \"<root>\", \"Point\", \"types\")",
         ],
     );
@@ -1888,7 +1863,7 @@ fn diamond_imports_emit_shared_dependency_bindings_in_each_module_scope() {
     .expect("transpile diamond import");
 
     assert_eq!(
-        out.matches("= __mod_736861726564_load(ctx)?;").count(),
+        out.matches("= __mod_736861726564_load(ctx, ").count(),
         2,
         "each dependent module needs its own shared-import binding declarations:\n{out}"
     );
@@ -1902,7 +1877,7 @@ fn import_idempotency_is_local_to_the_generated_binding_scope() {
     )
     .expect("transpile repeated plain import");
     assert_eq!(
-        repeated.matches("= __mod_736861726564_load(ctx)?;").count(),
+        repeated.matches("= __mod_736861726564_load(ctx, ").count(),
         1,
         "a repeated plain glob in one scope should remain a no-op:\n{repeated}"
     );
@@ -1916,7 +1891,7 @@ fn two() { use shared; return helper(2) }"#,
     .expect("transpile function-local imports");
     assert_eq!(
         distinct_functions
-            .matches("= __mod_736861726564_load(ctx)?;")
+            .matches("= __mod_736861726564_load(ctx, ")
             .count(),
         3,
         "the root alias and both function scopes must each emit their own load/bind site:\n{distinct_functions}"
@@ -1931,7 +1906,7 @@ let two = fn() { use shared; return helper(2) }"#,
     .expect("transpile lambda-local imports");
     assert_eq!(
         distinct_lambdas
-            .matches("= __mod_736861726564_load(ctx)?;")
+            .matches("= __mod_736861726564_load(ctx, ")
             .count(),
         3,
         "the root alias and both lambda scopes must each emit their own load/bind site:\n{distinct_lambdas}"
@@ -1943,7 +1918,7 @@ let two = fn() { use shared; return helper(2) }"#,
     )
     .expect("transpile repeated aliases");
     assert_eq!(
-        aliases.matches("= __mod_736861726564_load(ctx)?;").count(),
+        aliases.matches("= __mod_736861726564_load(ctx, ").count(),
         2,
         "aliases are shaped bindings and must never enter the plain-glob idempotency cache:\n{aliases}"
     );

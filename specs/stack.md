@@ -24,6 +24,15 @@
 - **Testing:** Cargo unit/integration tests plus VM differential and AOT
   three-way suites. `cargo clippy --workspace --all-targets` is the code-health
   target, and the explicit Rust 1.88 command above is the release MSRV gate.
+- **Release checks:** CI's test jobs build the debug profile and skip
+  `#[ignore]`d suites, so before publishing run:
+  - `cargo test --release -p nybl-vm --test stack_bound --test module_accounting`
+    (the RUN-002 release stack bound for the walker and VM);
+  - `cargo test -p nybl-compile --test e2e -- --ignored` (native and sandboxed
+    AOT parity, including the sandboxed stack corpus on the release thread
+    size and module accounting);
+  - `cargo test -p nybl-compile --test three_way -- --ignored --test-threads=1`
+    (the cases share one scratch driver directory).
 - **AOT runtime mode:** `nybl-compile` supports opt-in sandbox emission, while
   `nybl-cli compile` currently emits unsandboxed binaries.
 - **Website and documentation:** The Zola site, language guide, and LLM exports

@@ -2,7 +2,7 @@
 
 The `nybl` command-line tool for the [Nybl](https://github.com/stevepryde/nybl-lang) programming language.
 
-Building or installing Nybl 0.4 requires Rust 1.88 or newer.
+Building or installing Nybl 0.5 requires Rust 1.88 or newer.
 
 ```sh
 cargo install nybl-cli

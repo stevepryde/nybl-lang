@@ -26,6 +26,7 @@ use crate::builtins::{
     self, error, error_at, error_fatal_with_hint, error_with_hint, error_with_hint_at,
 };
 use crate::error::NyblError;
+use crate::import_scope::{ImportScope, ImportedName};
 use crate::lexer::StringPart;
 use crate::methods;
 use crate::ops;
@@ -638,7 +639,15 @@ pub struct Evaluator<'h, H: NyblHost + ?Sized> {
     /// statement the counter happened to cross the limit on — see
     /// `tick`.
     loop_lines: Vec<u32>,
+    /// Function frames active on this evaluator.
     call_depth: usize,
+    /// Frames active below this evaluator: an imported module's
+    /// sub-evaluator inherits its importer's depth plus one frame for the
+    /// load itself, so call depth is shared across module boundaries.
+    call_depth_base: usize,
+    /// Static nesting depth charged by active frames against
+    /// `NyblLimits::max_nesting`; inherited by module sub-evaluators.
+    nesting_used: u32,
     /// Defining module for each active function call. This keeps module-owned
     /// sibling lookup private to that function instead of leaking aliased
     /// functions into the caller-visible `functions` map.
@@ -653,11 +662,11 @@ pub struct Evaluator<'h, H: NyblHost + ?Sized> {
     /// the same cache — every sub-evaluator inherits the parent's
     /// `Rc` clone in `new_nested`.
     imports: ImportCache,
-    /// Paths already injected into *this* evaluator's scope (not
-    /// shared with sub-evaluators). Re-importing the same path at
-    /// the same level is a no-op — matches Python's `import x;
-    /// import x` behaviour.
-    imported_here: Vec<alloc_import::collections::BTreeSet<String>>,
+    /// Imports applied to each lexical scope of *this* evaluator (not
+    /// shared with sub-evaluators): plain-glob paths, so re-importing the
+    /// same path at the same level is a no-op, and the origin of every name
+    /// a flat `use` bound, for clash detection.
+    import_scopes: Vec<ImportScope>,
     /// Set by `try` when it sees an `Err(...)` variant and wants
     /// the enclosing fn to early-return with that value. The
     /// expression that raised stuffs the value here and returns
@@ -673,20 +682,6 @@ pub struct Evaluator<'h, H: NyblHost + ?Sized> {
     /// Captures seeded into the active closure frame. Explicit `ref`
     /// arguments may not target these second-class bindings.
     active_capture_bindings: alloc_import::collections::BTreeSet<BindingIdentity>,
-    /// Non-fatal runtime warnings accumulated during execution —
-    /// currently only `use`-time name-shadowing events (glob
-    /// imports bringing in a name that's already bound). Nested
-    /// module evaluators transfer theirs into this root queue.
-    runtime_warnings: Vec<crate::error::NyblWarning>,
-}
-
-fn write_runtime_warnings(warnings: &mut Vec<crate::error::NyblWarning>) {
-    #[cfg(any(feature = "std", not(feature = "no_std")))]
-    for warning in warnings.drain(..) {
-        eprintln!("warning: {}", warning.message);
-    }
-    #[cfg(all(feature = "no_std", not(feature = "std")))]
-    warnings.clear();
 }
 
 impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
@@ -721,17 +716,18 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             steps: 0,
             loop_lines: Vec::new(),
             call_depth: 0,
+            call_depth_base: 0,
+            nesting_used: 0,
             function_modules: Vec::new(),
             alias_scope_floors: Vec::new(),
             limits,
             memory,
             rand_state: 0,
             imports: Rc::new(RefCell::new(alloc_import::collections::BTreeMap::new())),
-            imported_here: vec![alloc_import::collections::BTreeSet::new()],
+            import_scopes: vec![ImportScope::default()],
             pending_try_return: None,
             active_ref_bindings: alloc_import::collections::BTreeSet::new(),
             active_capture_bindings: alloc_import::collections::BTreeSet::new(),
-            runtime_warnings: Vec::new(),
         }
     }
 
@@ -781,21 +777,24 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             steps: 0,
             loop_lines: Vec::new(),
             call_depth: 0,
+            call_depth_base: 0,
+            nesting_used: 0,
             function_modules: Vec::new(),
             alias_scope_floors: Vec::new(),
             limits,
             memory,
             rand_state: 0,
             imports,
-            imported_here: vec![alloc_import::collections::BTreeSet::new()],
+            import_scopes: vec![ImportScope::default()],
             pending_try_return: None,
             active_ref_bindings: alloc_import::collections::BTreeSet::new(),
             active_capture_bindings: alloc_import::collections::BTreeSet::new(),
-            runtime_warnings: Vec::new(),
         }
     }
 
     pub fn run(mut self, stmts: &[Stmt]) -> Result<(), NyblError> {
+        // The root top level is the first active frame.
+        self.enter_nesting(crate::ast_depth::body_depth(stmts), 0)?;
         let mut result = self.exec_block(stmts);
         if result.is_ok() && self.memory.__exceeded() {
             result = Err(error_fatal_with_hint(
@@ -804,9 +803,6 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 "Your code is using too much memory. Check for large strings or arrays growing in loops.",
             ));
         }
-        // Surface warnings only after the root evaluator (including every
-        // imported-module evaluator) has finished.
-        write_runtime_warnings(&mut self.runtime_warnings);
         match result? {
             Signal::Break => {
                 return Err(error(0, "break used outside of a loop"));
@@ -852,6 +848,35 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         Ok(())
     }
 
+    /// Charge a fixed step cost (a module load) against the step budget.
+    fn charge_steps(&mut self, steps: u64, line: u32) -> Result<(), NyblError> {
+        self.steps = self.steps.saturating_add(steps);
+        if self.steps > self.limits.max_steps {
+            return Err(crate::error_messages::step_limit_error(line));
+        }
+        Ok(())
+    }
+
+    /// Frames active across this evaluator and the importers below it.
+    fn active_call_depth(&self) -> usize {
+        self.call_depth_base + self.call_depth
+    }
+
+    /// Charge a frame's static nesting depth; the frame releases it with
+    /// [`Self::leave_nesting`] on every exit path.
+    fn enter_nesting(&mut self, depth: u32, line: u32) -> Result<(), NyblError> {
+        let used = self.nesting_used.saturating_add(depth);
+        if used > self.limits.max_nesting {
+            return Err(crate::error_messages::nesting_error(line));
+        }
+        self.nesting_used = used;
+        Ok(())
+    }
+
+    fn leave_nesting(&mut self, depth: u32) {
+        self.nesting_used = self.nesting_used.saturating_sub(depth);
+    }
+
     // ─── Scope ─────────────────────────────────────────────────────
 
     fn push_scope(&mut self) {
@@ -861,8 +886,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         self.type_bindings.push(BTreeMap::new());
         self.module_aliases.push(BTreeMap::new());
         self.imported_functions.push(BTreeMap::new());
-        self.imported_here
-            .push(alloc_import::collections::BTreeSet::new());
+        self.import_scopes.push(ImportScope::default());
     }
 
     fn pop_scope(&mut self) {
@@ -870,7 +894,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         self.type_bindings.pop();
         self.module_aliases.pop();
         self.imported_functions.pop();
-        self.imported_here.pop();
+        self.import_scopes.pop();
     }
 
     fn module_alias(&self, name: &str) -> Option<&Rc<crate::value::NyblModule>> {
@@ -940,6 +964,35 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
 
     fn is_module_top_scope(&self) -> bool {
         self.call_depth == 0 && self.scopes.len() == 1
+    }
+
+    /// Origin of `name`'s binding in the current scope, as a flat `use`
+    /// sees it: `None` when unbound, `Some(None)` for a local declaration
+    /// (a `let`, parameter, or — at module top level — an executed `fn`),
+    /// and `Some(Some(origin))` for a name a flat `use` bound here or a
+    /// function body's own name.
+    fn flat_binding_origin(
+        &self,
+        name: &str,
+        module_top_scope: bool,
+    ) -> Option<Option<crate::import_scope::BindingOrigin>> {
+        if let Some(origin) = self
+            .import_scopes
+            .last()
+            .and_then(|scope| scope.known_origin(name))
+        {
+            return Some(Some(origin.clone()));
+        }
+        (self
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.contains_key(name))
+            || self
+                .import_scopes
+                .last()
+                .is_some_and(|scope| scope.functions.contains(name))
+            || (module_top_scope && self.functions.contains_key(name)))
+        .then_some(None)
     }
 
     /// Resolve a type reference to the module it was declared
@@ -1538,6 +1591,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                         .insert(origin.1, previous);
                 }
                 self.define(name.clone(), val);
+                if let Some(imports) = self.import_scopes.last_mut() {
+                    imports.forget(name);
+                }
                 if self.is_module_top_scope() {
                     self.binding_origins
                         .insert(name.clone(), (self.current_module.clone(), name.clone()));
@@ -1763,6 +1819,23 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 body,
                 visibility,
             } => {
+                // A flat `use` already bound this name in this scope; a
+                // declaration silently replacing the import (or being
+                // shadowed by it) would lose one of the two definitions.
+                if let Some(imported) = self
+                    .import_scopes
+                    .last()
+                    .and_then(|scope| scope.names.get(name))
+                {
+                    return Err(crate::error_messages::function_replaces_import_error(
+                        name,
+                        &imported.path,
+                        stmt.line,
+                    ));
+                }
+                if let Some(imports) = self.import_scopes.last_mut() {
+                    imports.functions.insert(name.clone());
+                }
                 let is_direct_root = self.is_module_top_scope()
                     && self.current_module == crate::value::ROOT_MODULE_PATH;
                 let module_path = self
@@ -1929,8 +2002,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     ///
     /// - `use foo`                 — glob: inject all public
     ///   (non-`_`-prefixed) exports into the caller's scope.
-    ///   Name collisions emit a `NyblWarning` and the first
-    ///   binding wins (already-present beats newcomer).
+    ///   A name the scope already binds to a different
+    ///   declaration is an error; one bound to the same
+    ///   declaration is left as is.
     /// - `use foo.{a, b}`          — selective: inject only the
     ///   listed names. Missing names raise a clear error. Names
     ///   that start with `_` are accepted when listed
@@ -1966,9 +2040,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         let is_plain_glob = items.is_none() && alias.is_none();
         if is_plain_glob
             && self
-                .imported_here
+                .import_scopes
                 .last()
-                .is_some_and(|imports| imports.contains(path))
+                .is_some_and(|imports| imports.paths.contains(path))
         {
             return Ok(());
         }
@@ -2068,7 +2142,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         }
         // Module values and functions live in separate runtime tables, but a
         // single `use` projects one logical namespace. Sort the combined
-        // surface so warning order is deterministic across all engines.
+        // surface so the first reported clash is the same in all engines.
         exports.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         // Selective filter: restrict to the listed names.
@@ -2191,25 +2265,62 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             // bindings explicitly.
             let skip_private = items.is_none() && !bindings.explicit_surface;
             let module_top_scope = self.is_module_top_scope();
+            let incoming_origin = |name: &str| {
+                bindings
+                    .binding_origins
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| (path.to_string(), name.to_string()))
+            };
+            // A flat import binds every selected name or none. A name this
+            // scope already binds to the same declaration (a diamond
+            // re-export, or a selective import followed by a glob) is
+            // already in place; any other existing binding is a clash.
+            let mut already_bound = BTreeSet::new();
+            for (name, _) in &exports {
+                if skip_private && crate::naming::is_private(name) {
+                    continue;
+                }
+                match self.flat_binding_origin(name, module_top_scope) {
+                    None => {}
+                    Some(Some(existing)) if existing == incoming_origin(name) => {
+                        already_bound.insert(name.clone());
+                    }
+                    Some(_) => {
+                        return Err(crate::error_messages::import_clash_error(name, path, line));
+                    }
+                }
+            }
+            for (type_name, origin) in &exposed_types {
+                if let Some(existing) = self
+                    .type_bindings
+                    .last()
+                    .and_then(|scope| scope.get(type_name))
+                    && existing != origin
+                {
+                    return Err(crate::error_messages::import_clash_error(
+                        type_name, path, line,
+                    ));
+                }
+            }
             for (name, mut value) in exports {
                 if skip_private && crate::naming::is_private(&name) {
                     continue;
                 }
-                if self
-                    .scopes
-                    .last()
-                    .map(|s| s.contains_key(&name))
-                    .unwrap_or(false)
-                    || (module_top_scope && self.functions.contains_key(&name))
-                {
-                    if is_plain_glob {
-                        self.runtime_warnings.push(crate::error::NyblWarning::at(
-                            crate::error_messages::glob_shadow_warning(&name, path),
-                            line,
-                        ));
-                    }
+                if already_bound.contains(&name) {
                     continue;
                 }
+                self.import_scopes
+                    .last_mut()
+                    .expect("import scope")
+                    .names
+                    .insert(
+                        name.clone(),
+                        ImportedName {
+                            origin: incoming_origin(&name),
+                            path: path.to_string(),
+                        },
+                    );
                 if let Some(fn_def) = fn_entries.remove(&name) {
                     self.imported_functions
                         .last_mut()
@@ -2260,10 +2371,10 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             // Bind the bare type names in the current scope's
             // type_bindings so subsequent `Color::Red` /
             // `Color { ... }` resolves to the module the name
-            // came from. Shadowing here is silent (same as
-            // values): first definition wins. Types without an
-            // explicit bare binding remain reachable through
-            // the alias form only.
+            // came from. Clashing names were rejected above, so a
+            // bound name here already has this origin. Types without
+            // an explicit bare binding remain reachable through the
+            // alias form only.
             for (type_name, origin) in &exposed_types {
                 let already_bound = self
                     .type_bindings
@@ -2286,9 +2397,10 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         }
 
         if is_plain_glob {
-            self.imported_here
+            self.import_scopes
                 .last_mut()
                 .expect("import scope")
+                .paths
                 .insert(path.to_string());
         }
         Ok(())
@@ -2311,6 +2423,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             }
         }
 
+        // A load runs the module's top level as one more active frame.
+        if self.active_call_depth() >= MAX_CALL_DEPTH {
+            return Err(crate::error_messages::call_depth_error(line));
+        }
+
         // Ask the host for source.
         let resolved = self.host.resolve_module(path);
         let source = match resolved {
@@ -2321,6 +2438,24 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             }
         };
 
+        // Loading costs one step per token, charged to the importer before
+        // the module is parsed; a failed load is not refunded.
+        let tokens = crate::lexer::lex(&source)
+            .map_err(|error| error.with_module_source(path, source.as_str()))?;
+        self.charge_steps(crate::lexer::module_load_steps(&tokens), line)?;
+        let stmts = crate::parser::parse(tokens)
+            .and_then(|stmts| {
+                // Modules load lazily at their `use` site, so this is the
+                // earliest point their source is visible — apply the same
+                // disabled-builtin gate the root program got, before any of
+                // the module's statements run.
+                crate::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
+                Ok(stmts)
+            })
+            .map_err(|error| error.with_module_source(path, source.as_str()))?;
+        let nesting = crate::ast_depth::body_depth(&stmts);
+        self.enter_nesting(nesting, line)?;
+
         // Mark in-progress before we start evaluating so a
         // circular import surfaces as a clean error.
         self.imports
@@ -2328,8 +2463,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             .insert(path.to_string(), ImportSlot::Loading);
 
         let result = self
-            .evaluate_module(path, &source, line)
+            .evaluate_module(path, &stmts)
             .map_err(|error| error.with_module_source(path, source.as_str()));
+        self.leave_nesting(nesting);
 
         match result {
             Ok(bindings) => {
@@ -2348,9 +2484,10 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         }
     }
 
-    /// Parse and walk a module source in a fresh scope, returning
-    /// its top-level bindings as a `ModuleBindings`. Reuses the
-    /// parent evaluator's host, limits, and import cache.
+    /// Walk a parsed module in a fresh scope, returning its top-level
+    /// bindings as a `ModuleBindings`. Reuses the parent evaluator's host,
+    /// limits, and import cache, and shares its step budget, call depth
+    /// (the load itself is one frame), and nesting budget.
     /// `module_path` is the dot-joined name the importer used —
     /// the sub-evaluator tags its own declared types with this
     /// path so runtime values keep a stable identity across the
@@ -2358,20 +2495,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     fn evaluate_module(
         &mut self,
         module_path: &str,
-        source: &str,
-        line: u32,
+        stmts: &[Stmt],
     ) -> Result<ModuleBindings, NyblError> {
-        let _ = line;
-        let stmts = crate::parse(source)?;
-        // Modules load lazily at their `use` site, so this is the
-        // earliest point their source is visible — apply the same
-        // disabled-builtin gate the root program got, before any of
-        // the module's statements run.
-        crate::check::enforce_disabled_builtins(&stmts, &self.limits.disabled_builtins)?;
         let public_surface: Option<BTreeSet<String>> = {
             let mut names = BTreeSet::new();
             let mut explicit = false;
-            for stmt in &stmts {
+            for stmt in stmts {
                 if let StmtKind::PublicSurface { names: listed } = &stmt.kind {
                     explicit = true;
                     names.extend(listed.iter().cloned());
@@ -2395,14 +2524,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         );
         sub.steps = self.steps;
         sub.rand_state = self.rand_state;
+        sub.call_depth_base = self.call_depth_base + self.call_depth + 1;
+        sub.nesting_used = self.nesting_used;
         // Run the module body to top — errors propagate as-is.
-        let module_result = sub.exec_block(&stmts);
+        let module_result = sub.exec_block(stmts);
         self.steps = sub.steps;
         self.rand_state = sub.rand_state;
-        // A module evaluator is an implementation detail of this root run.
-        // Preserve its warnings (including transitive-module warnings) and
-        // let only the root boundary write them to stderr.
-        self.runtime_warnings.append(&mut sub.runtime_warnings);
         let module_signal = match module_result {
             Ok(signal) => signal,
             Err(module_error) => {
@@ -3970,13 +4097,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             args.push(Value::__try_new_array_in(extras, line, &self.memory)?);
         }
 
-        if self.call_depth >= MAX_CALL_DEPTH {
-            return Err(error_with_hint(
-                line,
-                "Too many nested function calls (possible infinite recursion)",
-                "Check that your recursive function has a base case that stops calling itself.",
-            ));
+        if self.active_call_depth() >= MAX_CALL_DEPTH {
+            return Err(crate::error_messages::call_depth_error(line));
         }
+        let nesting = func.body_depth();
+        self.enter_nesting(nesting, line)?;
 
         // A function call gets a fresh scope stack: no outer
         // locals leak in. Captures and parameters seed the new
@@ -4040,8 +4165,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         self.module_aliases.push(BTreeMap::new());
         self.imported_functions.push(BTreeMap::new());
         self.alias_scope_floors.push(alias_scope_floor);
-        self.imported_here
-            .push(alloc_import::collections::BTreeSet::new());
+        self.import_scopes.push(ImportScope::default());
 
         // Captures go in first so parameters shadow them on
         // collision (matches the lexical snapshot semantics).
@@ -4056,6 +4180,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             // own body so `fn fib(n) { return fib(n-1) ... }`
             // works without a special "named fn" path.
             self.define(self_name.clone(), Value::Fn(Rc::clone(func)));
+            if !func.params.contains(self_name)
+                && let Some(imports) = self.import_scopes.last_mut()
+            {
+                imports.self_binding = Some((function_module.clone(), self_name.clone()));
+            }
         }
         for (index, (param, arg)) in func.params.iter().zip(args).enumerate() {
             self.define(param.clone(), arg);
@@ -4148,10 +4277,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         self.module_aliases.truncate(alias_scope_floor);
         self.imported_functions.truncate(alias_scope_floor);
         self.alias_scope_floors.pop();
-        self.imported_here.truncate(alias_scope_floor);
+        self.import_scopes.truncate(alias_scope_floor);
         self.active_lexical_contexts.pop();
         self.function_modules.pop();
         self.call_depth -= 1;
+        self.leave_nesting(nesting);
         self.active_ref_bindings = saved_ref_bindings;
         self.active_capture_bindings = saved_capture_bindings;
 
@@ -4997,7 +5127,7 @@ pub struct ReplSession {
     imported_functions: Vec<BTreeMap<String, FunctionDefinition>>,
     root_lexical_context: Rc<ModuleLexicalContext>,
     imports: ImportCache,
-    imported_here: Vec<alloc_import::collections::BTreeSet<String>>,
+    import_scopes: Vec<ImportScope>,
     rand_state: u64,
 }
 
@@ -5075,7 +5205,7 @@ impl ReplSession {
             imported_functions: vec![BTreeMap::new()],
             root_lexical_context,
             imports: Rc::new(RefCell::new(alloc_import::collections::BTreeMap::new())),
-            imported_here: vec![alloc_import::collections::BTreeSet::new()],
+            import_scopes: vec![ImportScope::default()],
             rand_state: 0,
         }
     }
@@ -5181,6 +5311,9 @@ impl ReplSession {
         // error.
         let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
         let mut result: Result<Option<Value>, NyblError> = (|| {
+            // The evaluated top level (including a tail expression) is the
+            // first active frame of this operation.
+            eval.enter_nesting(crate::ast_depth::body_depth(stmts), 0)?;
             let sig = eval.exec_block(body)?;
             match sig {
                 Signal::Break => Err(error(0, "break used outside of a loop")),
@@ -5199,12 +5332,6 @@ impl ReplSession {
                 "Your code is using too much memory. Check for large strings or arrays growing in loops.",
             ));
         }
-        // Surface any warnings accumulated on this run
-        // (currently: glob-import shadowing). Stderr delivery
-        // matches `Evaluator::run`; embedders that want
-        // structured access can call `eval` via a custom host
-        // and take warnings out through that path.
-        write_runtime_warnings(&mut eval.runtime_warnings);
         self.put_evaluator(eval);
         result
     }
@@ -5245,7 +5372,6 @@ impl ReplSession {
 
         let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
         let result = eval.call_nybl_fn(&func, args, 0);
-        write_runtime_warnings(&mut eval.runtime_warnings);
         self.put_evaluator(eval);
         result
     }
@@ -5286,7 +5412,6 @@ impl ReplSession {
         let result = eval
             .call_nybl_fn_with_refs(target, args.to_vec(), &[], 0)
             .map(|(value, _)| value);
-        write_runtime_warnings(&mut eval.runtime_warnings);
         self.put_evaluator(eval);
         result
     }
@@ -5336,15 +5461,14 @@ impl ReplSession {
                 }
                 eval.steps = 0;
                 debug_assert_eq!(eval.call_depth, 0);
+                debug_assert_eq!(eval.nesting_used, 0);
                 let value = eval
                     .call_nybl_fn_with_refs(target, args.to_vec(), &[], 0)
                     .map(|(value, _)| value);
-                write_runtime_warnings(&mut eval.runtime_warnings);
                 values.push(value?);
             }
             Ok(values)
         })();
-        write_runtime_warnings(&mut eval.runtime_warnings);
         self.put_evaluator(eval);
         result
     }
@@ -5386,7 +5510,6 @@ impl ReplSession {
         }
         let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
         let result = eval.call_nybl_fn(&target, args.to_vec(), 0);
-        write_runtime_warnings(&mut eval.runtime_warnings);
         self.put_evaluator(eval);
         result
     }
@@ -5424,12 +5547,14 @@ impl ReplSession {
             root_lexical_context,
             active_lexical_contexts: Vec::new(),
             imports: Rc::clone(&self.imports),
-            imported_here: core::mem::take(&mut self.imported_here),
+            import_scopes: core::mem::take(&mut self.import_scopes),
             rand_state: self.rand_state,
             host,
             steps: 0,
             loop_lines: Vec::new(),
             call_depth: 0,
+            call_depth_base: 0,
+            nesting_used: 0,
             function_modules: Vec::new(),
             alias_scope_floors: Vec::new(),
             limits,
@@ -5437,7 +5562,6 @@ impl ReplSession {
             pending_try_return: None,
             active_ref_bindings: alloc_import::collections::BTreeSet::new(),
             active_capture_bindings: alloc_import::collections::BTreeSet::new(),
-            runtime_warnings: Vec::new(),
         }
     }
 
@@ -5490,14 +5614,14 @@ impl ReplSession {
             imported_functions.push(BTreeMap::new());
         }
         self.imported_functions = imported_functions;
-        let mut imported_here = eval.imported_here;
-        if imported_here.len() > 1 {
-            imported_here.truncate(1);
+        let mut import_scopes = eval.import_scopes;
+        if import_scopes.len() > 1 {
+            import_scopes.truncate(1);
         }
-        if imported_here.is_empty() {
-            imported_here.push(alloc_import::collections::BTreeSet::new());
+        if import_scopes.is_empty() {
+            import_scopes.push(ImportScope::default());
         }
-        self.imported_here = imported_here;
+        self.import_scopes = import_scopes;
         self.rand_state = eval.rand_state;
         // `imports` is shared via `Rc` — nothing to do; the
         // cache the Evaluator wrote into is the same one the

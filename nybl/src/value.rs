@@ -618,6 +618,10 @@ pub struct NyblFn {
     /// Maximum recursive ownership depth, including captures and any
     /// engine-owned values hidden inside an opaque compiled body.
     depth: u16,
+    /// Static nesting depth of an AST body (see [`crate::ast_depth`]),
+    /// charged against `NyblLimits::max_nesting` while a call is active.
+    /// Compiled bodies carry their depth in engine-owned metadata.
+    body_depth: u32,
 }
 
 /// Engine-specific representation of a function body.
@@ -663,6 +667,12 @@ impl NyblFn {
     #[doc(hidden)]
     pub fn __is_allowed_by(&self, instance: &NyblFnOrigin, engine: &'static str) -> bool {
         instance.allows(&self.origin, engine)
+    }
+
+    /// Static nesting depth of an AST body; `0` for engine-compiled bodies,
+    /// whose engine stores the depth with its compiled code.
+    pub fn body_depth(&self) -> u32 {
+        self.body_depth
     }
 
     /// Build an AST-backed function object for engine-internal dispatch paths
@@ -760,6 +770,7 @@ impl NyblFn {
         }
         crate::ref_params::validate_parameter_modes(&param_modes, line)?;
         let depth = checked_owner_depth(captures.iter().map(|(_, value)| value), 1, line)?;
+        let body_depth = crate::ast_depth::body_depth(&body);
         let body = FnBody::Ast(body);
         Ok(Rc::new(Self {
             params,
@@ -770,6 +781,7 @@ impl NyblFn {
             module_path,
             origin,
             depth,
+            body_depth,
         }))
     }
 
@@ -902,6 +914,7 @@ impl NyblFn {
             module_path,
             origin,
             depth,
+            body_depth: 0,
         }))
     }
 }
@@ -2075,6 +2088,7 @@ impl Value {
                     module_path: value.module_path.clone(),
                     origin: value.origin.clone(),
                     depth: value.depth,
+                    body_depth: value.body_depth,
                 }))
             }
             Value::Module(value) => {

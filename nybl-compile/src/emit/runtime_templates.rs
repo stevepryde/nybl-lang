@@ -63,6 +63,8 @@ pub(super) const CTX_BASE: &str = r#"pub struct Ctx<'h> {
         ::std::string::String,
         ::std::collections::HashSet<::std::string::String>,
     >,
+    pub export_origins: __NyblExportOrigins,
+    pub top_import_records: __NyblTopImportRecords,
     pub active_function_sites: ::std::collections::HashMap<
         (::std::string::String, ::std::string::String),
         usize,
@@ -150,6 +152,8 @@ struct __NyblState {
         ::std::string::String,
         ::std::collections::HashSet<::std::string::String>,
     >,
+    export_origins: __NyblExportOrigins,
+    top_import_records: __NyblTopImportRecords,
     abi_declarations: ::std::vec::Vec<usize>,
 /*__NYBL_METHOD_SLOTS__*/
 }
@@ -164,11 +168,17 @@ struct Ctx<'h> {
     /// backedge and fn entry so runaway programs hit the step
     /// budget before they exhaust the host.
     steps: u64,
-    /// User-call depth is reset for every public operation.
+    /// User-call depth is reset for every public operation. Module loads
+    /// count as one frame each.
     call_depth: usize,
     /// Upper bound on `steps`, populated from
     /// `NyblLimits::max_steps` at operation entry.
     max_steps: u64,
+    /// Static nesting depth charged by active frames (see
+    /// `nybl::ast_depth`), reset for every public operation.
+    nesting_used: u32,
+    /// Upper bound on `nesting_used`, from `NyblLimits::max_nesting`.
+    max_nesting: u32,
 }
 
 impl<'h> ::core::ops::Deref for Ctx<'h> {
@@ -226,28 +236,71 @@ fn __nybl_validate_aot_function(
     }
 }
 
+/// Enter one frame (a call or a module load) whose code nests `nesting`
+/// levels deep. Mirrors the walker: call depth first, then the nesting
+/// budget. Every successful enter is paired with `__nybl_leave_aot_call`.
 fn __nybl_enter_aot_call(
     ctx: &mut Ctx<'_>,
     line: u32,
+    nesting: u32,
 ) -> Result<(), ::nybl::error::NyblError> {
     const MAX_CALL_DEPTH: usize = 64;
     if ctx.call_depth >= MAX_CALL_DEPTH {
-        let mut error = ::nybl::error::NyblError::runtime(
-            "Too many nested function calls (possible infinite recursion)",
-            line,
-        );
-        error.friendly_hint = ::std::option::Option::Some(
-            "Check that your recursive function has a base case that stops calling itself."
-                .to_string(),
-        );
-        return Err(error);
+        return Err(::nybl::error_messages::call_depth_error(line));
     }
+    __nybl_enter_nesting(ctx, line, nesting)?;
     ctx.call_depth += 1;
     Ok(())
 }
 
-fn __nybl_leave_aot_call(ctx: &mut Ctx<'_>) {
+fn __nybl_leave_aot_call(ctx: &mut Ctx<'_>, nesting: u32) {
     ctx.call_depth = ctx.call_depth.saturating_sub(1);
+    ctx.nesting_used = ctx.nesting_used.saturating_sub(nesting);
+}
+
+fn __nybl_enter_nesting(
+    ctx: &mut Ctx<'_>,
+    line: u32,
+    nesting: u32,
+) -> Result<(), ::nybl::error::NyblError> {
+    let used = ctx.nesting_used.saturating_add(nesting);
+    if used > ctx.max_nesting {
+        return Err(::nybl::error_messages::nesting_error(line));
+    }
+    ctx.nesting_used = used;
+    Ok(())
+}
+
+/// Enter a module load on a cache miss: one more frame (call depth), its
+/// token cost charged to the importer, then the module top level's nesting.
+/// Paired with `__nybl_leave_aot_call(ctx, nesting)` on every exit.
+fn __nybl_enter_module_load(
+    ctx: &mut Ctx<'_>,
+    line: u32,
+    steps: u64,
+    nesting: u32,
+) -> Result<(), ::nybl::error::NyblError> {
+    const MAX_CALL_DEPTH: usize = 64;
+    if ctx.call_depth >= MAX_CALL_DEPTH {
+        return Err(::nybl::error_messages::call_depth_error(line));
+    }
+    __nybl_charge_steps(ctx, steps, line)?;
+    __nybl_enter_nesting(ctx, line, nesting)?;
+    ctx.call_depth += 1;
+    Ok(())
+}
+
+/// Charge a module load's source-level step cost to the importer.
+fn __nybl_charge_steps(
+    ctx: &mut Ctx<'_>,
+    steps: u64,
+    line: u32,
+) -> Result<(), ::nybl::error::NyblError> {
+    ctx.steps = ctx.steps.saturating_add(steps);
+    if ctx.steps > ctx.max_steps {
+        return Err(::nybl::error_messages::step_limit_error(line));
+    }
+    Ok(())
 }
 
 fn __nybl_host_call(
@@ -287,6 +340,8 @@ struct __NyblFunctionSite {
     is_public: bool,
     abi_eligible: bool,
     line: u32,
+    /// Static nesting depth of the function body.
+    nesting: u32,
 }
 
 #[derive(Clone)]
@@ -393,11 +448,160 @@ fn __nybl_has_binding(ctx: &Ctx<'_>, module_path: &str, name: &str) -> bool {
             .is_some_and(|claims| claims.contains(name))
 }
 
-fn __nybl_warn_glob_shadow(name: &str, path: &str) {
-    ::std::eprintln!(
-        "warning: {}",
-        ::nybl::error_messages::glob_shadow_warning(name, path),
-    );
+/// Declaration each module top-level binding made by a flat `use`
+/// resolves to, keyed by `(module, name)`. A local redefinition removes it.
+type __NyblExportOrigins = ::std::collections::HashMap<
+    (::std::string::String, ::std::string::String),
+    (::std::string::String, ::std::string::String),
+>;
+
+/// Names a flat `use` bound at a module's top level while it loads:
+/// module -> name -> (origin, use path). Mirrors the walker's per-scope
+/// import records.
+type __NyblTopImportRecords = ::std::collections::HashMap<
+    ::std::string::String,
+    ::std::collections::HashMap<
+        ::std::string::String,
+        ((::std::string::String, ::std::string::String), ::std::string::String),
+    >,
+>;
+
+/// The declaration a flat import of `path.name` binds.
+fn __nybl_flat_import_origin(
+    ctx: &Ctx<'_>,
+    path: &str,
+    name: &str,
+) -> (::std::string::String, ::std::string::String) {
+    ctx.export_origins
+        .get(&(path.to_string(), name.to_string()))
+        .cloned()
+        .unwrap_or_else(|| (path.to_string(), name.to_string()))
+}
+
+/// Check a flat import into a module top level. `Ok(true)` means bind it,
+/// `Ok(false)` means the name already binds this declaration.
+fn __nybl_check_top_import(
+    ctx: &Ctx<'_>,
+    module_path: &str,
+    name: &str,
+    path: &str,
+    line: u32,
+) -> Result<bool, ::nybl::error::NyblError> {
+    let incoming = __nybl_flat_import_origin(ctx, path, name);
+    if let ::std::option::Option::Some((origin, _)) = ctx
+        .top_import_records
+        .get(module_path)
+        .and_then(|records| records.get(name))
+    {
+        return if *origin == incoming {
+            Ok(false)
+        } else {
+            Err(::nybl::error_messages::import_clash_error(name, path, line))
+        };
+    }
+    let key = (module_path.to_string(), name.to_string());
+    if __nybl_has_binding(ctx, module_path, name)
+        || ctx.active_function_sites.contains_key(&key)
+        || ctx.module_imported_function_sites.contains_key(&key)
+    {
+        return Err(::nybl::error_messages::import_clash_error(name, path, line));
+    }
+    Ok(true)
+}
+
+fn __nybl_record_top_import(ctx: &mut Ctx<'_>, module_path: &str, name: &str, path: &str) {
+    let incoming = __nybl_flat_import_origin(ctx, path, name);
+    ctx.export_origins
+        .insert((module_path.to_string(), name.to_string()), incoming.clone());
+    ctx.top_import_records
+        .entry(module_path.to_string())
+        .or_default()
+        .insert(name.to_string(), (incoming, path.to_string()));
+}
+
+/// Check a flat import into a nested (function or block) scope from the
+/// statically known state of that scope: the origin a flat `use` already
+/// bound there (`recorded`, absent if that export was missing), whether a
+/// local declaration owns the name, and a function body's own name.
+fn __nybl_check_scoped_import(
+    ctx: &Ctx<'_>,
+    recorded: ::std::option::Option<&(::std::string::String, ::std::string::String)>,
+    local: bool,
+    self_origin: ::std::option::Option<(&str, &str)>,
+    name: &str,
+    path: &str,
+    line: u32,
+) -> Result<bool, ::nybl::error::NyblError> {
+    let incoming = __nybl_flat_import_origin(ctx, path, name);
+    let existing = match (recorded, self_origin) {
+        (::std::option::Option::Some(origin), _) => {
+            ::std::option::Option::Some(origin.0 == incoming.0 && origin.1 == incoming.1)
+        }
+        (::std::option::Option::None, _) if local => ::std::option::Option::Some(false),
+        (::std::option::Option::None, ::std::option::Option::Some((module, own))) => {
+            ::std::option::Option::Some(module == incoming.0 && own == incoming.1)
+        }
+        (::std::option::Option::None, ::std::option::Option::None) => ::std::option::Option::None,
+    };
+    match existing {
+        ::std::option::Option::None => Ok(true),
+        ::std::option::Option::Some(true) => Ok(false),
+        ::std::option::Option::Some(false) => {
+            Err(::nybl::error_messages::import_clash_error(name, path, line))
+        }
+    }
+}
+
+/// Flat-import a live value binding into a module top level.
+fn __nybl_import_flat_alias(
+    ctx: &mut Ctx<'_>,
+    module_path: &str,
+    name: &str,
+    path: &str,
+    line: u32,
+) -> Result<(), ::nybl::error::NyblError> {
+    if __nybl_check_top_import(ctx, module_path, name, path, line)? {
+        __nybl_import_binding_alias(ctx, module_path, name, path, name);
+        __nybl_record_top_import(ctx, module_path, name, path);
+    }
+    Ok(())
+}
+
+/// Flat-import a snapshot value (a function export) into a module top level.
+fn __nybl_import_flat_value(
+    ctx: &mut Ctx<'_>,
+    module_path: &str,
+    name: &str,
+    path: &str,
+    value: ::nybl::value::Value,
+    line: u32,
+) -> Result<(), ::nybl::error::NyblError> {
+    if __nybl_check_top_import(ctx, module_path, name, path, line)? {
+        __nybl_import_binding_value(ctx, module_path, name, value);
+        __nybl_record_top_import(ctx, module_path, name, path);
+    }
+    Ok(())
+}
+
+/// Activate a module top-level `fn` declaration, rejecting one whose name a
+/// flat `use` already bound in that scope.
+fn __nybl_activate_top_function(
+    ctx: &mut Ctx<'_>,
+    site_id: usize,
+    line: u32,
+) -> Result<(), ::nybl::error::NyblError> {
+    let site = &__NYBL_FUNCTION_SITES[site_id];
+    if let ::std::option::Option::Some((_, path)) = ctx
+        .top_import_records
+        .get(site.module_path)
+        .and_then(|records| records.get(site.name))
+    {
+        return Err(::nybl::error_messages::function_replaces_import_error(
+            site.name, path, line,
+        ));
+    }
+    __nybl_activate_function(ctx, site_id);
+    Ok(())
 }
 
 fn __nybl_define_binding(
@@ -408,6 +612,12 @@ fn __nybl_define_binding(
 ) {
     if let ::std::option::Option::Some(origins) = ctx.binding_origins.get_mut(module_path) {
         origins.remove(name);
+    }
+    // A local definition now owns the name.
+    ctx.export_origins
+        .remove(&(module_path.to_string(), name.to_string()));
+    if let ::std::option::Option::Some(records) = ctx.top_import_records.get_mut(module_path) {
+        records.remove(name);
     }
     ctx.binding_claims
         .entry(module_path.to_string())
@@ -631,17 +841,28 @@ fn __nybl_bind_type(bindings: &mut __NyblTypeBindings, name: &str, origin: &str)
         .insert(name.to_string(), origin.to_string());
 }
 
+/// Bind a flat-imported type name in the current type scope, rejecting a
+/// name that scope already binds to a different type.
 fn __nybl_bind_imported_type(
     bindings: &mut __NyblTypeBindings,
     name: &str,
     origin: &str,
-) {
+    path: &str,
+    line: u32,
+) -> Result<(), ::nybl::error::NyblError> {
     let frame = bindings
         .last_mut()
         .expect("type bindings always have a frame");
-    ::std::rc::Rc::make_mut(frame)
-        .entry(name.to_string())
-        .or_insert_with(|| origin.to_string());
+    match frame.get(name) {
+        ::std::option::Option::Some(existing) if existing != origin => {
+            Err(::nybl::error_messages::import_clash_error(name, path, line))
+        }
+        ::std::option::Option::Some(_) => Ok(()),
+        ::std::option::Option::None => {
+            ::std::rc::Rc::make_mut(frame).insert(name.to_string(), origin.to_string());
+            Ok(())
+        }
+    }
 }
 
 fn __nybl_resolve_bare_type(
@@ -1027,6 +1248,8 @@ fn __nybl_pack_rest_args(
             ::std::vec::Vec<::nybl::value::Value>,
         ) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>,
     >,
+    /// Static nesting depth of the body, charged while a call is active.
+    /*__NYBL_RUNTIME_VIS__*/nesting: u32,
 }
 
 /*__NYBL_INVOKE_HELPER__*/
@@ -1099,6 +1322,7 @@ fn __nybl_wrap_callable(
     captures: ::std::vec::Vec<(String, ::nybl::value::Value)>,
     self_name: ::std::option::Option<String>,
     opaque_body_depth: u16,
+    nesting: u32,
     line: u32,
     callable: ::std::rc::Rc<
         dyn for<'__a> Fn(
@@ -1107,7 +1331,7 @@ fn __nybl_wrap_callable(
         ) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>,
     >,
 ) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {
-    let closure = ::std::rc::Rc::new(AotClosure { callable });
+    let closure = ::std::rc::Rc::new(AotClosure { callable, nesting });
     let body: ::std::rc::Rc<dyn ::core::any::Any + 'static> = closure;
     /*__NYBL_WRAP_CONSTRUCTOR__*/
 }
@@ -1130,6 +1354,7 @@ fn __nybl_call_value(
                 ::nybl::value::FnBody::Compiled(body) => {
                     if let Some(aot) = body.downcast_ref::<AotClosure>() {
                         let callable = ::std::rc::Rc::clone(&aot.callable);
+                        let nesting = aot.nesting;
                         drop(callee);
                         /*__NYBL_CALL_VALUE_INVOKE__*/
                     } else {
@@ -1196,9 +1421,9 @@ fn __nybl_try_call(
     drop(callable);
 /*__NYBL_TRY_ATTEMPT_START__*/
 /*__NYBL_VALIDATE_AOT_FUNC_ORIGIN__*/
-        let callable_fn = match &func.body {
+        let (callable_fn, nesting) = match &func.body {
             ::nybl::value::FnBody::Compiled(body) => match body.downcast_ref::<AotClosure>() {
-                Some(aot) => ::std::rc::Rc::clone(&aot.callable),
+                Some(aot) => (::std::rc::Rc::clone(&aot.callable), aot.nesting),
                 None => {
                     return Err(::nybl::error::NyblError::runtime(
                         "try_call: callee wasn't compiled by the AOT transpiler",
@@ -1309,9 +1534,9 @@ fn __nybl_result_callable_method(
     };
     drop(callable);
 /*__NYBL_VALIDATE_AOT_FUNC_ORIGIN__*/
-    let callable_fn = match &func.body {
+    let (callable_fn, nesting) = match &func.body {
         ::nybl::value::FnBody::Compiled(body) => match body.downcast_ref::<AotClosure>() {
-            Some(aot) => ::std::rc::Rc::clone(&aot.callable),
+            Some(aot) => (::std::rc::Rc::clone(&aot.callable), aot.nesting),
             None => {
                 return Err(::nybl::error::NyblError::runtime(
                     format!("{}: callee wasn't compiled by the AOT transpiler", method),
@@ -1863,6 +2088,8 @@ pub fn run<H: ::nybl::NyblHost>(host: &mut H) -> Result<(), ::nybl::error::NyblE
         bindings: ::std::collections::HashMap::new(),
         binding_origins: ::std::collections::HashMap::new(),
         binding_claims: ::std::collections::HashMap::new(),
+        export_origins: ::std::collections::HashMap::new(),
+        top_import_records: ::std::collections::HashMap::new(),
         active_function_sites: ::std::collections::HashMap::new(),
         reached_function_sites: ::std::vec![false; __NYBL_FUNCTION_SITES.len()],
         module_imported_function_sites: ::std::collections::HashMap::new(),
@@ -1923,6 +2150,8 @@ fn __nybl_load_state(
         bindings: ::std::collections::HashMap::new(),
         binding_origins: ::std::collections::HashMap::new(),
         binding_claims: ::std::collections::HashMap::new(),
+        export_origins: ::std::collections::HashMap::new(),
+        top_import_records: ::std::collections::HashMap::new(),
         abi_declarations: ::std::vec::Vec::new(),
 /*__NYBL_METHOD_SLOTS_INIT__*/
     };
@@ -1934,8 +2163,12 @@ fn __nybl_load_state(
             steps: 0,
             call_depth: 0,
             max_steps: limits.max_steps,
+            nesting_used: 0,
+            max_nesting: limits.max_nesting,
         };
         __nybl_seed_builtin_type_defs(&mut ctx)?;
+        // The root top level is the first active frame.
+        __nybl_enter_nesting(&mut ctx, 0, __NYBL_ROOT_NESTING)?;
         run_program(&mut ctx)?;
     }
     Ok(state)
@@ -2021,6 +2254,8 @@ impl NyblInstance {
                 steps: 0,
                 call_depth: 0,
                 max_steps: self.limits.max_steps,
+                nesting_used: 0,
+                max_nesting: self.limits.max_nesting,
             };
             __nybl_call_function_site(&mut ctx, site_id, args.to_vec(), 0)
         };
@@ -2079,6 +2314,8 @@ impl NyblInstance {
                 steps: 0,
                 call_depth: 0,
                 max_steps: self.limits.max_steps,
+                nesting_used: 0,
+                max_nesting: self.limits.max_nesting,
             };
             __nybl_call_value(&mut ctx, callable.clone(), args.to_vec(), 0)
                 .map(|outcome| outcome.value)

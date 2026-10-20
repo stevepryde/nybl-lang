@@ -5,6 +5,83 @@ publishable workspace crates unless a section says otherwise.
 
 ## Unreleased
 
+## 0.5.0
+
+`0.5.0` bounds the native stack an execution can use, so a host can size its
+threads from Nybl's limits, shares resource accounting across module loads,
+and makes flat-import name clashes errors. It is a breaking release.
+
+### Language
+
+- A flat `use` (glob or selective) that would bind a name the current scope
+  already binds to a different declaration — a `let`, parameter, module
+  alias, `fn` declaration, type, built-in type, or another import — is now an ordinary
+  runtime error instead of a first-definition-wins stderr warning:
+  `` `helper` is already defined — `use money` would import a different `helper` ``.
+  The same applies in reverse: a `fn` declared in a scope where a flat `use`
+  already bound its name fails with
+  `` `helper` is already imported from `money` — `fn helper` would replace it ``,
+  in either source order. Importing the same declaration twice (a diamond
+  re-export, or a selective import followed by a glob) binds it once, a later
+  `let` still shadows an import, aliased imports and private names are
+  unaffected, and re-importing a path stays a no-op. The runtime warning
+  machinery is removed; static-check warnings are unchanged.
+- Operator and postfix chains (`a + b + ...`, `x[0][0]...`, `.m().m()...`,
+  `f(1)(2)...`) count each link toward the 128-level parse-depth cap, so code
+  nested past the cap is rejected with `Code is nested too deeply` instead of
+  parsing into an AST that overflows later passes. Programs right at the old
+  limit with long chains may now need splitting.
+
+### Embedding
+
+- Add `NyblLimits::max_nesting` (default `DEFAULT_MAX_NESTING`, 2048, in both
+  presets; `with_max_nesting` builder). Every active function, lambda, or
+  method body, loading module top level, and the root program charge their
+  static nesting depth (`nybl::ast_depth`); exceeding the budget is an
+  ordinary, `try_call`-catchable `Too much nested code across active function
+  calls` error, identical in the walker, VM, and sandboxed AOT. Combined with
+  the call-depth and parse-depth caps, a 10 MiB thread (release) or 128 MiB
+  (debug) suffices for any program under default limits. `NyblLimits` struct
+  literals must add the field (or use `..NyblLimits::standard()`).
+- A module load is one call frame: call depth, the nesting budget, and the
+  step budget are shared between an importer and the modules it loads, in
+  every engine (the VM previously restarted its step counter in each module).
+- Loading a module costs one step per lexer token, charged to the importer
+  at the `use` line on each load (cache hits are free, failed loads are not
+  refunded, root source is not charged). `CompiledScript::compile_with_modules`
+  stores the cost so precompiled and lazily loaded modules charge the same.
+- `nybl_vm::Chunk` gains `nesting_depth` and `FnDef` gains
+  `checks_import_clash`; hand-built bytecode must set them.
+- `nybl run` and the REPL execute scripts on a thread of the documented
+  stack size instead of the platform-sized main thread (1 MiB on Windows).
+
+### Specs
+
+- RUN-002 states the per-profile native stack bound; RUN-003 adds the nesting
+  budget and module load cost; ARCH-004 and ARCH-005 describe shared
+  accounting across modules and the chain-inclusive parse cap; AC-RUN-015 is
+  the flat-import clash contract; AC-RUN-020 and AC-RUN-021 cover the stack
+  corpus and module accounting parity.
+
+### Release checks
+
+CI's test jobs build the debug profile and skip `#[ignore]`d suites. Before
+publishing, also run the release-profile stack bound and the AOT suites:
+
+```sh
+cargo test --release -p nybl-vm --test stack_bound --test module_accounting
+cargo test -p nybl-compile --test e2e -- --ignored
+cargo test -p nybl-compile --test three_way -- --ignored --test-threads=1
+```
+
+### Migration from 0.4
+
+- Change dependency requirements from `"0.4"` to `"0.5"`.
+- Resolve name clashes the new errors report: import only the names you need
+  (`use money.{total}`), namespace the module (`use money as m`), or rename
+  the local declaration.
+- Add `max_nesting` to any `NyblLimits { .. }` literal that lists every field.
+
 ## 0.4.3
 
 `0.4.3` improves persistent embedding, cross-engine consistency, shared VM
