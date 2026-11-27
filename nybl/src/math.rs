@@ -73,6 +73,71 @@ pub fn tan(x: f64) -> f64 {
     }
 }
 
+/// `asin(x)` (radians, in `[-π/2, π/2]`, `NaN` for `|x| > 1`).
+#[inline]
+pub fn asin(x: f64) -> f64 {
+    #[cfg(any(feature = "std", not(feature = "no_std")))]
+    {
+        x.asin()
+    }
+    #[cfg(all(feature = "no_std", not(feature = "std")))]
+    {
+        libm::asin(x)
+    }
+}
+
+/// `acos(x)` (radians, in `[0, π]`, `NaN` for `|x| > 1`).
+#[inline]
+pub fn acos(x: f64) -> f64 {
+    #[cfg(any(feature = "std", not(feature = "no_std")))]
+    {
+        x.acos()
+    }
+    #[cfg(all(feature = "no_std", not(feature = "std")))]
+    {
+        libm::acos(x)
+    }
+}
+
+/// `atan(x)` (radians, in `[-π/2, π/2]`).
+#[inline]
+pub fn atan(x: f64) -> f64 {
+    #[cfg(any(feature = "std", not(feature = "no_std")))]
+    {
+        x.atan()
+    }
+    #[cfg(all(feature = "no_std", not(feature = "std")))]
+    {
+        libm::atan(x)
+    }
+}
+
+/// Four-quadrant arctangent `atan2(y, x)` (radians, in `[-π, π]`).
+#[inline]
+pub fn atan2(y: f64, x: f64) -> f64 {
+    #[cfg(any(feature = "std", not(feature = "no_std")))]
+    {
+        y.atan2(x)
+    }
+    #[cfg(all(feature = "no_std", not(feature = "std")))]
+    {
+        libm::atan2(y, x)
+    }
+}
+
+/// Euclidean hypotenuse `√(x² + y²)` without undue overflow or underflow.
+#[inline]
+pub fn hypot(x: f64, y: f64) -> f64 {
+    #[cfg(any(feature = "std", not(feature = "no_std")))]
+    {
+        x.hypot(y)
+    }
+    #[cfg(all(feature = "no_std", not(feature = "std")))]
+    {
+        libm::hypot(x, y)
+    }
+}
+
 /// `⌊x⌋` — largest integer ≤ x, as a float.
 #[inline]
 pub fn floor(x: f64) -> f64 {

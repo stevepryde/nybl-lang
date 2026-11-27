@@ -549,6 +549,117 @@ print(mean([10, 20, 30, 40, 50]))"#);
     assert_eq!(host.prints.borrow().clone(), vec!["4", "30"]);
 }
 
+#[test]
+fn math_inverse_trig_hypot_trunc_lerp_smoothstep() {
+    let host = run(r#"use std.math
+use std.test
+let eps = 0.000000000001
+assert_near(atan2(1, 1), PI / 4, eps)
+assert_near(atan2(1, -1), 3 * PI / 4, eps)
+assert_near(atan2(-1, -1), -3 * PI / 4, eps)
+assert_near(atan2(-1, 1), -PI / 4, eps)
+assert_near(asin(1), PI / 2, eps)
+assert_near(acos(-1), PI, eps)
+assert_near(atan(1), PI / 4, eps)
+assert_near(hypot(3, 4), 5, eps)
+assert_eq(3.9.trunc(), 3)
+assert_eq((-3.9).trunc(), -3)
+assert_eq(3.9.trunc().type(), "int")
+assert_near(lerp(10, 20, 0.25), 12.5, eps)
+assert_near(smoothstep(0, 1, -0.5), 0.0, eps)
+assert_near(smoothstep(0, 1, 0.5), 0.5, eps)
+assert_near(smoothstep(0, 1, 1.5), 1.0, eps)
+assert_near(smoothstep(2, 2, 1), 0.0, eps)
+assert_near(smoothstep(2, 2, 2), 1.0, eps)
+let nan = 2.0.asin()
+assert(nan != nan, "out-of-domain asin should be NaN")
+print("ok")"#);
+    assert_eq!(host.last(), "ok");
+}
+
+#[test]
+fn math_vec2_and_vec3_methods_and_duck_typed_helpers() {
+    let host = run(r#"use std.math
+use std.test
+let eps = 0.000000000001
+
+let a2 = vec2(3, 4)
+let b2 = Vec2 { x: 1, y: 2 }
+assert_eq(a2.dot(b2), 11)
+assert_eq(a2.length_sq(), 25)
+assert_near(a2.length(), 5.0, eps)
+let n2 = a2.normalize()
+assert_near(n2.x, 0.6, eps)
+assert_near(n2.y, 0.8, eps)
+let z2 = vec2(0, 0).normalize()
+assert_eq(z2.x, 0.0)
+assert_eq(z2.y, 0.0)
+assert(z2.x == z2.x && z2.y == z2.y, "zero vec2 normalize must not produce NaN")
+assert_near(a2.distance(vec2(0, 0)), 5.0, eps)
+let l2 = vec2(0, 10).lerp(vec2(10, 0), 0.25)
+assert_near(l2.x, 2.5, eps)
+assert_near(l2.y, 7.5, eps)
+
+let a3 = vec3(1, 0, 0)
+let b3 = Vec3 { x: 0, y: 1, z: 0 }
+let c3 = a3.cross(b3)
+assert_eq(c3.x, 0)
+assert_eq(c3.y, 0)
+assert_eq(c3.z, 1)
+assert_eq(vec3(1, 2, 2).dot(vec3(2, 3, 4)), 16)
+assert_eq(vec3(1, 2, 2).length_sq(), 9)
+assert_near(vec3(1, 2, 2).length(), 3.0, eps)
+let n3 = vec3(0, 3, 4).normalize()
+assert_near(n3.x, 0.0, eps)
+assert_near(n3.y, 0.6, eps)
+assert_near(n3.z, 0.8, eps)
+let z3 = vec3(0, 0, 0).normalize()
+assert_eq(z3.x, 0.0)
+assert_eq(z3.y, 0.0)
+assert_eq(z3.z, 0.0)
+assert(z3.x == z3.x && z3.y == z3.y && z3.z == z3.z, "zero vec3 normalize must not produce NaN")
+assert_near(vec3(1, 2, 3).distance(vec3(2, 4, 5)), 3.0, eps)
+let l3 = vec3(0, 0, 0).lerp(vec3(4, 8, 12), 0.5)
+assert_near(l3.x, 2.0, eps)
+assert_near(l3.y, 4.0, eps)
+assert_near(l3.z, 6.0, eps)
+
+// Polymorphic standalone helpers
+assert_eq(dot(a2, b2), 11)
+assert_eq(cross(a3, b3).z, 1)
+assert_near(length(a2), 5.0, eps)
+assert_eq(length_sq(vec3(1, 2, 2)), 9)
+assert_near(normalize(vec2(3, 4)).x, 0.6, eps)
+assert_near(distance(vec3(1, 2, 3), vec3(2, 4, 5)), 3.0, eps)
+
+// Duck-typed helpers on user-defined structs
+struct Pt2 { x, y }
+struct Pt3 { x, y, z }
+let p2a = Pt2 { x: 3, y: 4 }
+let p2b = Pt2 { x: 6, y: 8 }
+assert_eq(dot2(p2a, p2b), 50)
+assert_eq(length_sq2(p2a), 25)
+assert_near(length2(p2a), 5.0, eps)
+assert_near(normalize2(p2a).y, 0.8, eps)
+assert_eq(normalize2(Pt2 { x: 0, y: 0 }).x, 0.0)
+assert_near(distance2(p2a, p2b), 5.0, eps)
+assert_near(lerp2(p2a, p2b, 0.5).x, 4.5, eps)
+
+let p3a = Pt3 { x: 1, y: 0, z: 0 }
+let p3b = Pt3 { x: 0, y: 1, z: 0 }
+assert_eq(dot3(p3a, p3b), 0)
+assert_eq(cross3(p3a, p3b).z, 1)
+assert_eq(length_sq3(Pt3 { x: 1, y: 2, z: 2 }), 9)
+assert_near(length3(Pt3 { x: 1, y: 2, z: 2 }), 3.0, eps)
+assert_near(normalize3(Pt3 { x: 0, y: 3, z: 4 }).z, 0.8, eps)
+assert_eq(normalize3(Pt3 { x: 0, y: 0, z: 0 }).z, 0.0)
+assert_near(distance3(Pt3 { x: 1, y: 2, z: 3 }, Pt3 { x: 2, y: 4, z: 5 }), 3.0, eps)
+assert_near(lerp3(Pt3 { x: 0, y: 0, z: 0 }, Pt3 { x: 2, y: 4, z: 6 }, 0.5).z, 3.0, eps)
+
+print("all_vec_ok")"#);
+    assert_eq!(host.last(), "all_vec_ok");
+}
+
 // ─── std.iter ──────────────────────────────────────────────────
 
 #[test]

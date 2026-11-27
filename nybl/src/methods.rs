@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn rounding_methods_preserve_values_at_i64_boundaries() {
-        for method in ["floor", "ceil", "round"] {
+        for method in ["floor", "ceil", "round", "trunc"] {
             let (above, update) =
                 numeric_method(&Value::Number(TWO_TO_63), method, &[], 9).unwrap();
             assert!(update.is_none());
@@ -661,6 +661,123 @@ mod tests {
                 ".{method}() did not convert the largest in-range f64"
             );
         }
+    }
+
+    #[test]
+    fn trunc_truncates_toward_zero_and_preserves_nan() {
+        let (pos, _) = numeric_method(&Value::Number(3.9), "trunc", &[], 1).unwrap();
+        assert!(matches!(pos, Value::Int(3)));
+
+        let (neg, _) = numeric_method(&Value::Number(-3.9), "trunc", &[], 1).unwrap();
+        assert!(matches!(neg, Value::Int(-3)));
+
+        let (int_val, _) = numeric_method(&Value::Int(-7), "trunc", &[], 1).unwrap();
+        assert!(matches!(int_val, Value::Int(-7)));
+
+        let (nan_val, _) = numeric_method(&Value::Number(f64::NAN), "trunc", &[], 1).unwrap();
+        assert!(matches!(nan_val, Value::Number(v) if v.is_nan()));
+    }
+
+    #[test]
+    fn inverse_trig_and_hypot_methods_cover_quadrants_and_domain() {
+        let eps = 1e-12;
+        let expect_num = |res: Result<(Value, Option<Value>), NyblError>| -> f64 {
+            let (val, update) = res.expect("numeric method should succeed");
+            assert!(update.is_none());
+            match val {
+                Value::Number(n) => n,
+                other => panic!("expected Number, got {other:?}"),
+            }
+        };
+
+        // asin / acos / atan
+        assert!((expect_num(numeric_method(&Value::Int(0), "asin", &[], 1)) - 0.0).abs() < eps);
+        assert!(
+            (expect_num(numeric_method(&Value::Int(1), "asin", &[], 1))
+                - core::f64::consts::FRAC_PI_2)
+                .abs()
+                < eps
+        );
+        assert!(
+            (expect_num(numeric_method(&Value::Int(-1), "asin", &[], 1))
+                + core::f64::consts::FRAC_PI_2)
+                .abs()
+                < eps
+        );
+        assert!(expect_num(numeric_method(&Value::Number(1.5), "asin", &[], 1)).is_nan());
+
+        assert!((expect_num(numeric_method(&Value::Int(1), "acos", &[], 1)) - 0.0).abs() < eps);
+        assert!(
+            (expect_num(numeric_method(&Value::Int(0), "acos", &[], 1))
+                - core::f64::consts::FRAC_PI_2)
+                .abs()
+                < eps
+        );
+        assert!(
+            (expect_num(numeric_method(&Value::Int(-1), "acos", &[], 1)) - core::f64::consts::PI)
+                .abs()
+                < eps
+        );
+        assert!(expect_num(numeric_method(&Value::Number(-1.5), "acos", &[], 1)).is_nan());
+
+        assert!((expect_num(numeric_method(&Value::Int(0), "atan", &[], 1)) - 0.0).abs() < eps);
+        assert!(
+            (expect_num(numeric_method(&Value::Int(1), "atan", &[], 1))
+                - core::f64::consts::FRAC_PI_4)
+                .abs()
+                < eps
+        );
+        assert!(
+            (expect_num(numeric_method(&Value::Int(-1), "atan", &[], 1))
+                + core::f64::consts::FRAC_PI_4)
+                .abs()
+                < eps
+        );
+
+        // atan2 across all four quadrants + axes: receiver is y, arg is x
+        let q1 = expect_num(numeric_method(&Value::Int(1), "atan2", &[Value::Int(1)], 1));
+        let q2 = expect_num(numeric_method(&Value::Int(1), "atan2", &[Value::Int(-1)], 1));
+        let q3 = expect_num(numeric_method(&Value::Int(-1), "atan2", &[Value::Int(-1)], 1));
+        let q4 = expect_num(numeric_method(&Value::Int(-1), "atan2", &[Value::Int(1)], 1));
+        assert!((q1 - core::f64::consts::FRAC_PI_4).abs() < eps);
+        assert!((q2 - 3.0 * core::f64::consts::FRAC_PI_4).abs() < eps);
+        assert!((q3 + 3.0 * core::f64::consts::FRAC_PI_4).abs() < eps);
+        assert!((q4 + core::f64::consts::FRAC_PI_4).abs() < eps);
+
+        // hypot
+        assert!((expect_num(numeric_method(&Value::Int(3), "hypot", &[Value::Int(4)], 1)) - 5.0).abs() < eps);
+        assert!((expect_num(numeric_method(&Value::Number(-3.0), "hypot", &[Value::Number(-4.0)], 1)) - 5.0).abs() < eps);
+        let large = expect_num(numeric_method(
+            &Value::Number(1e200),
+            "hypot",
+            &[Value::Number(1e200)],
+            1,
+        ));
+        assert!(large.is_finite());
+
+        // Arity & type validation
+        assert!(numeric_method(&Value::Int(1), "atan2", &[], 1).is_err());
+        assert!(numeric_method(&Value::Int(1), "hypot", &[], 1).is_err());
+        assert!(numeric_method(&Value::Int(1), "asin", &[Value::Int(1)], 1).is_err());
+        assert!(numeric_method(&Value::Int(1), "trunc", &[Value::Int(1)], 1).is_err());
+        assert!(
+            numeric_method(
+                &Value::Int(1),
+                "atan2",
+                &[Value::new_str("nope".to_string())],
+                1
+            )
+            .is_err()
+        );
+        assert!(
+            numeric_method(
+                &Value::Int(1),
+                "hypot",
+                &[Value::new_str("nope".to_string())],
+                1
+            )
+            .is_err()
+        );
     }
 }
 
@@ -991,6 +1108,9 @@ pub fn numeric_method(
         "sin" => unary_number(receiver, args, line, "sin", crate::math::sin),
         "cos" => unary_number(receiver, args, line, "cos", crate::math::cos),
         "tan" => unary_number(receiver, args, line, "tan", crate::math::tan),
+        "asin" => unary_number(receiver, args, line, "asin", crate::math::asin),
+        "acos" => unary_number(receiver, args, line, "acos", crate::math::acos),
+        "atan" => unary_number(receiver, args, line, "atan", crate::math::atan),
         "exp" => unary_number(receiver, args, line, "exp", crate::math::exp),
         "log" => unary_number(receiver, args, line, "log", crate::math::ln),
         // Round-to-integer: return Int when the result fits i64,
@@ -998,11 +1118,24 @@ pub fn numeric_method(
         "floor" => unary_round(receiver, args, line, "floor", crate::math::floor),
         "ceil" => unary_round(receiver, args, line, "ceil", crate::math::ceil),
         "round" => unary_round(receiver, args, line, "round", crate::math::round),
+        "trunc" => unary_round(receiver, args, line, "trunc", crate::math::trunc),
         "pow" => {
             expect_args("pow", args, 1, line)?;
             let base = to_f64_or_error(receiver, "pow", line)?;
             let exp = to_f64_or_error(&args[0], "pow", line)?;
             Ok((Value::Number(crate::math::powf(base, exp)), None))
+        }
+        "atan2" => {
+            expect_args("atan2", args, 1, line)?;
+            let y = to_f64_or_error(receiver, "atan2", line)?;
+            let x = to_f64_or_error(&args[0], "atan2", line)?;
+            Ok((Value::Number(crate::math::atan2(y, x)), None))
+        }
+        "hypot" => {
+            expect_args("hypot", args, 1, line)?;
+            let x = to_f64_or_error(receiver, "hypot", line)?;
+            let y = to_f64_or_error(&args[0], "hypot", line)?;
+            Ok((Value::Number(crate::math::hypot(x, y)), None))
         }
         // Binary pick-min / pick-max. Preserves type when both
         // sides match; widens to Number on mixed operands —
@@ -1197,11 +1330,13 @@ pub fn builtin_method_arity(method: &str) -> Option<usize> {
     match method {
         "len" | "pop" | "reverse" | "sort" | "clear" | "iter" | "keys" | "values" | "upper"
         | "lower" | "trim" | "to_int" | "to_float" | "type" | "to_str" | "inspect" | "is_none"
-        | "is_some" | "abs" | "sqrt" | "sin" | "cos" | "tan" | "exp" | "log" | "floor" | "ceil"
-        | "round" | "is_ok" | "is_err" | "unwrap" | "next" => Some(0),
+        | "is_some" | "abs" | "sqrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "exp"
+        | "log" | "floor" | "ceil" | "round" | "trunc" | "is_ok" | "is_err" | "unwrap" | "next" => {
+            Some(0)
+        }
         "push" | "has" | "index_of" | "remove" | "truncate" | "join" | "contains"
-        | "starts_with" | "ends_with" | "split" | "pow" | "min" | "max" | "expect"
-        | "unwrap_or" | "map" | "map_err" | "and_then" => Some(1),
+        | "starts_with" | "ends_with" | "split" | "pow" | "atan2" | "hypot" | "min" | "max"
+        | "expect" | "unwrap_or" | "map" | "map_err" | "and_then" => Some(1),
         "insert" | "slice" | "replace" => Some(2),
         _ => None,
     }

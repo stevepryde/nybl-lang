@@ -3718,6 +3718,28 @@ print(clamp(99, 0, 10))"#,
         &[],
     ),
     (
+        "std_math_3d_vectors_and_trig",
+        r#"use std.math
+print((3).hypot(4))
+print(3.9.trunc(), (-3.9).trunc())
+print(atan2(1, 1) > 0, atan2(-1, -1) < 0)
+print(asin(0), acos(1), atan(0))
+print(lerp(10, 20, 0.5), smoothstep(0, 1, 0.5))
+let v2 = vec2(3, 4)
+print(v2.dot(vec2(1, 2)), v2.length(), v2.length_sq(), v2.normalize().x)
+let z2 = vec2(0, 0).normalize()
+print(z2.x, z2.y)
+let v3 = vec3(1, 0, 0).cross(vec3(0, 1, 0))
+print(v3.x, v3.y, v3.z)
+let z3 = vec3(0, 0, 0).normalize()
+print(z3.x, z3.y, z3.z)
+struct Pt3 { x, y, z }
+print(dot3(Pt3 { x: 1, y: 2, z: 3 }, Pt3 { x: 4, y: 5, z: 6 }))
+print(length3(Pt3 { x: 1, y: 2, z: 2 }))
+print(normalize3(Pt3 { x: 0, y: 0, z: 0 }).z)"#,
+        &[],
+    ),
+    (
         "std_iter_functional_helpers",
         r#"use std.iter
 let nums = [1, 2, 3, 4, 5]
@@ -4184,5 +4206,21 @@ fn three_way_nested_named_function_values() {
             }),
     );
     assert_eq!(entries.len(), NAMES.len());
+    assert_three_way(&entries);
+}
+
+#[test]
+#[ignore]
+fn three_way_std_math_3d_vectors_and_trig() {
+    let entries = IMPORTS_CORPUS
+        .iter()
+        .filter(|(name, _, _)| *name == "std_math_3d_vectors_and_trig")
+        .map(|(name, source, modules)| CorpusEntry {
+            name,
+            source,
+            modules,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(entries.len(), 1);
     assert_three_way(&entries);
 }

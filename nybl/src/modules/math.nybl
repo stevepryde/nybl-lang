@@ -78,3 +78,245 @@ fn mean(arr) {
     for x in arr { total = total + x }
     return total / n
 }
+
+// ─── Inverse trig, hypotenuse, and interpolation ──────────────
+
+fn atan2(y, x) {
+    return y.atan2(x)
+}
+
+fn asin(x) {
+    return x.asin()
+}
+
+fn acos(x) {
+    return x.acos()
+}
+
+fn atan(x) {
+    return x.atan()
+}
+
+fn hypot(x, y) {
+    return x.hypot(y)
+}
+
+// Linear interpolation between `a` and `b` at parameter `t`.
+fn lerp(a, b, t) {
+    return a + (b - a) * t
+}
+
+// Hermite smoothstep interpolation between `edge0` and `edge1`.
+fn smoothstep(edge0, edge1, x) {
+    if edge0 == edge1 {
+        if x < edge0 { return 0.0 }
+        return 1.0
+    }
+    let t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+}
+
+// ─── 2D / 3D vectors ──────────────────────────────────────────
+
+struct Vec2 {
+    x,
+    y,
+}
+
+fn vec2(x, y) {
+    return Vec2 { x: x, y: y }
+}
+
+fn Vec2.dot(self, other) {
+    return self.x * other.x + self.y * other.y
+}
+
+fn Vec2.length_sq(self) {
+    return self.x * self.x + self.y * self.y
+}
+
+fn Vec2.length(self) {
+    return self.x.hypot(self.y)
+}
+
+fn Vec2.normalize(self) {
+    let len = self.length()
+    if len == 0 {
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+    return Vec2 { x: self.x / len, y: self.y / len }
+}
+
+fn Vec2.distance(self, other) {
+    return (self.x - other.x).hypot(self.y - other.y)
+}
+
+fn Vec2.lerp(self, other, t) {
+    return Vec2 {
+        x: self.x + (other.x - self.x) * t,
+        y: self.y + (other.y - self.y) * t,
+    }
+}
+
+struct Vec3 {
+    x,
+    y,
+    z,
+}
+
+fn vec3(x, y, z) {
+    return Vec3 { x: x, y: y, z: z }
+}
+
+fn Vec3.dot(self, other) {
+    return self.x * other.x + self.y * other.y + self.z * other.z
+}
+
+fn Vec3.cross(self, other) {
+    return Vec3 {
+        x: self.y * other.z - self.z * other.y,
+        y: self.z * other.x - self.x * other.z,
+        z: self.x * other.y - self.y * other.x,
+    }
+}
+
+fn Vec3.length_sq(self) {
+    return self.x * self.x + self.y * self.y + self.z * self.z
+}
+
+fn Vec3.length(self) {
+    return (self.x * self.x + self.y * self.y + self.z * self.z).sqrt()
+}
+
+fn Vec3.normalize(self) {
+    let len = self.length()
+    if len == 0 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+    return Vec3 {
+        x: self.x / len,
+        y: self.y / len,
+        z: self.z / len,
+    }
+}
+
+fn Vec3.distance(self, other) {
+    let dx = self.x - other.x
+    let dy = self.y - other.y
+    let dz = self.z - other.z
+    return (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn Vec3.lerp(self, other, t) {
+    return Vec3 {
+        x: self.x + (other.x - self.x) * t,
+        y: self.y + (other.y - self.y) * t,
+        z: self.z + (other.z - self.z) * t,
+    }
+}
+
+// Polymorphic standalone helpers for Vec2, Vec3, and any struct
+// implementing the matching vector method.
+fn dot(a, b) {
+    return a.dot(b)
+}
+
+fn cross(a, b) {
+    return a.cross(b)
+}
+
+fn length(v) {
+    return v.length()
+}
+
+fn length_sq(v) {
+    return v.length_sq()
+}
+
+fn normalize(v) {
+    return v.normalize()
+}
+
+fn distance(a, b) {
+    return a.distance(b)
+}
+
+// Duck-typed 2D / 3D helpers that work on any struct with
+// `.x, .y` or `.x, .y, .z` fields.
+fn dot2(a, b) {
+    return a.x * b.x + a.y * b.y
+}
+
+fn dot3(a, b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z
+}
+
+fn cross3(a, b) {
+    return Vec3 {
+        x: a.y * b.z - a.z * b.y,
+        y: a.z * b.x - a.x * b.z,
+        z: a.x * b.y - a.y * b.x,
+    }
+}
+
+fn length_sq2(v) {
+    return v.x * v.x + v.y * v.y
+}
+
+fn length_sq3(v) {
+    return v.x * v.x + v.y * v.y + v.z * v.z
+}
+
+fn length2(v) {
+    return v.x.hypot(v.y)
+}
+
+fn length3(v) {
+    return (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
+}
+
+fn normalize2(v) {
+    let len = length2(v)
+    if len == 0 {
+        return Vec2 { x: 0.0, y: 0.0 }
+    }
+    return Vec2 { x: v.x / len, y: v.y / len }
+}
+
+fn normalize3(v) {
+    let len = length3(v)
+    if len == 0 {
+        return Vec3 { x: 0.0, y: 0.0, z: 0.0 }
+    }
+    return Vec3 {
+        x: v.x / len,
+        y: v.y / len,
+        z: v.z / len,
+    }
+}
+
+fn distance2(a, b) {
+    return (a.x - b.x).hypot(a.y - b.y)
+}
+
+fn distance3(a, b) {
+    let dx = a.x - b.x
+    let dy = a.y - b.y
+    let dz = a.z - b.z
+    return (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn lerp2(a, b, t) {
+    return Vec2 {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+    }
+}
+
+fn lerp3(a, b, t) {
+    return Vec3 {
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+        z: a.z + (b.z - a.z) * t,
+    }
+}

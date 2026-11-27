@@ -2541,6 +2541,97 @@ print(lcm(4, 6))"#),
 }
 
 #[test]
+fn numeric_3d_math_methods_diff() {
+    set_modules(&[]);
+    assert_eq!(
+        say(r#"print((1).atan2(1).round())
+print((1).atan2(-1) > 2)
+print((-1).atan2(-1) < -2)
+print((-1).atan2(1) < 0)
+print((0).asin())
+print((1).acos())
+print((0).atan())
+print((3).hypot(4))
+print(3.9.trunc())
+print((-3.9).trunc())
+print((-3.9).trunc().type())
+let bad_asin = 2.0.asin()
+let bad_acos = (-2.0).acos()
+print(bad_asin != bad_asin)
+print(bad_acos != bad_acos)
+print(bad_asin.trunc().type())"#),
+        "number"
+    );
+}
+
+#[test]
+fn numeric_3d_math_method_errors_diff() {
+    set_modules(&[]);
+    assert!(run_err("let x = (1).atan2()").contains("needs 1 argument"));
+    assert!(run_err("let x = (1).hypot()").contains("needs 1 argument"));
+    assert!(run_err("let x = (1).asin(1)").contains("needs 0 arguments"));
+    assert!(run_err("let x = (1).trunc(1)").contains("needs 0 arguments"));
+    assert!(run_err("let x = (1).atan2(\"a\")").contains("expects a number"));
+    assert!(run_err("let x = (1).hypot(\"a\")").contains("expects a number"));
+}
+
+#[test]
+fn std_math_3d_helpers_and_vectors_diff() {
+    set_modules(&[]);
+    assert_eq!(
+        say(r#"use std.math
+print(atan2(1, 1) > 0)
+print(asin(0))
+print(acos(1))
+print(atan(0))
+print(hypot(3, 4))
+print(lerp(0, 10, 0.25))
+print(smoothstep(0, 1, 0.5))
+print(smoothstep(2, 2, 1))
+print(smoothstep(2, 2, 2))
+
+let v2 = vec2(3, 4)
+print(v2.dot(vec2(1, 2)))
+print(v2.length_sq())
+print(v2.length())
+print(v2.normalize().x)
+let z2 = vec2(0, 0).normalize()
+print(z2.x == 0 && z2.y == 0)
+print(v2.distance(vec2(0, 0)))
+print(v2.lerp(vec2(7, 8), 0.5).x)
+
+let v3 = vec3(1, 0, 0)
+let c = v3.cross(vec3(0, 1, 0))
+print(c.x, c.y, c.z)
+print(vec3(1, 2, 2).length())
+print(vec3(1, 2, 2).length_sq())
+let z3 = vec3(0, 0, 0).normalize()
+print(z3.x == 0 && z3.y == 0 && z3.z == 0)
+print(vec3(1, 2, 3).distance(vec3(2, 4, 5)))
+print(vec3(0, 0, 0).lerp(vec3(2, 4, 6), 0.5).z)
+
+struct P2 { x, y }
+struct P3 { x, y, z }
+print(dot2(P2 { x: 3, y: 4 }, P2 { x: 1, y: 2 }))
+print(length2(P2 { x: 3, y: 4 }))
+print(length_sq2(P2 { x: 3, y: 4 }))
+print(normalize2(P2 { x: 0, y: 0 }).x)
+print(distance2(P2 { x: 0, y: 0 }, P2 { x: 3, y: 4 }))
+print(lerp2(P2 { x: 0, y: 0 }, P2 { x: 4, y: 6 }, 0.5).y)
+
+print(dot3(P3 { x: 1, y: 2, z: 3 }, P3 { x: 4, y: 5, z: 6 }))
+print(cross3(P3 { x: 1, y: 0, z: 0 }, P3 { x: 0, y: 1, z: 0 }).z)
+print(length3(P3 { x: 1, y: 2, z: 2 }))
+print(length_sq3(P3 { x: 1, y: 2, z: 2 }))
+print(normalize3(P3 { x: 0, y: 0, z: 0 }).z)
+print(distance3(P3 { x: 1, y: 2, z: 3 }, P3 { x: 2, y: 4, z: 5 }))
+print(lerp3(P3 { x: 0, y: 0, z: 0 }, P3 { x: 2, y: 4, z: 6 }, 0.5).z)
+print(dot(v2, vec2(1, 2)), cross(v3, vec3(0, 1, 0)).z, length(v2), length_sq(v2), normalize(vec2(3, 4)).x, distance(v2, vec2(0, 0)))"#),
+        "11 1 5 25 0.6 5"
+    );
+}
+
+#[test]
 fn std_iter_map_filter_reduce_diff() {
     set_modules(&[]);
     assert_eq!(

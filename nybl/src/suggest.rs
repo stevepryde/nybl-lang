@@ -31,8 +31,9 @@ pub const CORE_CALLABLE_BUILTINS: &[&str] = &["range", "rand", "print", "try_cal
 /// name doesn't match — the "did you mean?" hint surfaces the
 /// whole numeric surface in one shot.
 pub const NUMERIC_METHODS: &[&str] = &[
-    "abs", "sqrt", "sin", "cos", "tan", "floor", "ceil", "round", "exp", "log", "pow", "min",
-    "max", "to_int", "to_float", // Shared methods every value supports:
+    "abs", "sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "hypot", "floor", "ceil",
+    "round", "trunc", "exp", "log", "pow", "min", "max", "to_int", "to_float",
+    // Shared methods every value supports:
     "type", "to_str", "inspect",
 ];
 
@@ -215,5 +216,33 @@ mod tests {
             Some("Did you mean `length`?".to_string())
         );
         assert_eq!(did_you_mean("xyz", cands), None);
+    }
+
+    #[test]
+    fn numeric_methods_include_3d_math_suggestions() {
+        assert_eq!(
+            closest_match("atan2x", NUMERIC_METHODS),
+            Some("atan2".to_string())
+        );
+        assert_eq!(
+            closest_match("hypt", NUMERIC_METHODS),
+            Some("hypot".to_string())
+        );
+        assert_eq!(
+            closest_match("trun", NUMERIC_METHODS),
+            Some("trunc".to_string())
+        );
+        assert_eq!(
+            closest_match("asinx", NUMERIC_METHODS),
+            Some("asin".to_string())
+        );
+        assert_eq!(
+            closest_match("acosx", NUMERIC_METHODS),
+            Some("acos".to_string())
+        );
+        assert_eq!(
+            closest_match("atam", NUMERIC_METHODS),
+            Some("atan".to_string())
+        );
     }
 }
