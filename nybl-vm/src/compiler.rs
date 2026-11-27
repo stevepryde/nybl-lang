@@ -1238,12 +1238,16 @@ impl Compiler {
                         line,
                     );
                 } else {
+                    let nested_place = matches!(
+                        &object.kind,
+                        ExprKind::Index { .. } | ExprKind::FieldAccess { .. }
+                    );
                     self.compile_expr(object)?;
                     self.emit(
                         Instr::PrepareMethodValue {
                             method: method_idx,
                             site,
-                            nested_place: false,
+                            nested_place,
                         },
                         line,
                     );

@@ -19,6 +19,20 @@ publishable workspace crates unless a section says otherwise.
 - An error returned from `NyblHost::on_tick` with no line (or line 0) is now
   reported at the line a step-limit error would use at that tick, with the
   same module ownership, in the walker, VM, and sandboxed AOT.
+- Runtime, step-limit, and `on_tick` errors raised inside AOT-compiled module
+  functions, methods, lambdas, and module top levels now attach their owning
+  module in `NyblError::source_context` (in both native and sandboxed AOT),
+  matching the walker and VM (`RUN-007`).
+- Align walker, VM, and AOT engine parity on method/module call and place
+  diagnostics: VM now rejects built-in mutation through non-binding
+  index/field receivers (`RUN-010`/`RUN-021`); walker and VM accept read-only
+  method calls through module-alias and enum-variant field chains while
+  rejecting unwritable places before evaluating arguments or entering callees;
+  AOT enforces selective/explicit module export surfaces during live member
+  reads, uses canonical index/field/type-as-value diagnostics, and matches
+  walker/VM on `ref self` receiver check order, `Type.method` argument-mode
+  labels, singular `"at least 1 argument"` rest-parameter arity wording, and
+  non-function module export call errors.
 - Add `nybl::StructShape`, the shared identity and field names of a struct
   type. Build it once and construct values with
   `Value::try_new_struct_from_shape(&shape, values, line)`, which takes field

@@ -3958,7 +3958,10 @@ impl Emitter {
         self.line("}");
         self.indent -= 1;
         self.line("}");
-        self.line("__load_result");
+        self.line(&format!(
+            "__load_result.map_err(|__nybl_error| __nybl_error.with_module({}))",
+            rust_string_literal(name),
+        ));
         self.indent = 0;
         self.out.push_str("}\n\n");
         Ok(())
@@ -4460,7 +4463,7 @@ impl Emitter {
         } else if site.params[0].mode == ParamMode::Ref {
             writeln!(
                 self.out,
-                "    let _ = (ctx, obj, args); let mut error = ::nybl::error::NyblError::runtime(\"a `ref` method receiver must be a variable\", line); error.friendly_hint = Some(\"Store the value in a `let` binding before calling this method.\".to_string()); Err(error)"
+                "    let _ = (ctx, obj, args); let mut error = ::nybl::error::NyblError::runtime(\"a `ref` method receiver must be a mutable place\", line); error.friendly_hint = Some(\"Store the value in a `let` binding, or call through one of its fields or indexes.\".to_string()); Err(error)"
             )
             .unwrap();
         } else {
@@ -4602,7 +4605,7 @@ impl Emitter {
             "fn __nybl_user_method_type_key(obj: &::nybl::value::Value) -> ::std::option::Option<(&str, &str)> {\n    match obj {\n        ::nybl::value::Value::Struct(value) => Some((value.module_path(), value.type_name())),\n        ::nybl::value::Value::EnumVariant(value) => Some((value.module_path(), value.type_name())),\n        _ => None,\n    }\n}\n\n",
         );
         self.out.push_str(
-            "fn __nybl_preflight_user_method(\n    ctx: &Ctx<'_>,\n    obj: &::nybl::value::Value,\n    method: &str,\n    actual_modes: &[::nybl::parser::ParamMode],\n    receiver_is_place: bool,\n    line: u32,\n) -> Result<::std::option::Option<__NyblMethodFn>, ::nybl::error::NyblError> {\n    let Some((module_path, type_name)) = __nybl_user_method_type_key(obj) else { return Ok(None); };\n    match (module_path, type_name, method) {\n",
+            "fn __nybl_preflight_user_method(\n    ctx: &Ctx<'_>,\n    obj: &::nybl::value::Value,\n    method: &str,\n    actual_modes: &[::nybl::parser::ParamMode],\n    receiver_is_place: bool,\n    receiver_const: ::std::option::Option<&str>,\n    receiver_captured: bool,\n    receiver_place: ::std::option::Option<(&::nybl::value::Value, &[__NyblPlaceStep])>,\n    line: u32,\n) -> Result<::std::option::Option<__NyblMethodFn>, ::nybl::error::NyblError> {\n    let _ = (receiver_is_place, receiver_const, receiver_captured, receiver_place);\n    let Some((module_path, type_name)) = __nybl_user_method_type_key(obj) else { return Ok(None); };\n    match (module_path, type_name, method) {\n",
         );
         for (slot, (module_path, type_name, method_name)) in
             self.types.method_slots.iter().enumerate()
@@ -4642,7 +4645,7 @@ impl Emitter {
                     .first()
                     .is_some_and(|param| param.mode == ParamMode::Ref)
                 {
-                    "if !receiver_is_place { let mut error = ::nybl::error::NyblError::runtime(\"a `ref` method receiver must be a variable\", line); error.friendly_hint = Some(\"Store the value in a `let` binding before calling this method.\".to_string()); return Err(error); } "
+                    "if !receiver_is_place { let mut error = ::nybl::error::NyblError::runtime(\"a `ref` method receiver must be a mutable place\", line); error.friendly_hint = Some(\"Store the value in a `let` binding, or call through one of its fields or indexes.\".to_string()); return Err(error); } if let ::std::option::Option::Some(const_name) = receiver_const { return Err(::nybl::error_messages::constant_mutation_error(const_name, line)); } if receiver_captured { return Err(::nybl::ref_params::captured_ref_target(1, line)); } if let ::std::option::Option::Some((root, steps)) = receiver_place { let _ = __nybl_place_get_mutable(root, steps, line, &ctx.memory)?; } "
                 } else {
                     ""
                 };
@@ -4658,7 +4661,7 @@ impl Emitter {
                     .join(", ");
                 writeln!(
                     self.out,
-                    "            Some(adapter) if adapter as usize == {adapter} as *const () as usize => {{ {receiver_check}let __full_modes = &[{full_modes}]; if !::nybl::ref_params::accepts_arity(__full_modes, actual_modes.len() + 1) {{ let required = ::nybl::ref_params::required_arity(__full_modes); let message = if matches!(__full_modes.last(), Some(::nybl::parser::ParamMode::Rest)) {{ format!(\"`{{}}.{{}}` expects at least {{}} arguments (including `self`), but got {{}}\", {type_name}, {method_name}, required, actual_modes.len() + 1) }} else {{ format!(\"`{{}}.{{}}` expects {{}} argument{{}} (including `self`), but got {{}}\", {type_name}, {method_name}, required, if required == 1 {{ \"\" }} else {{ \"s\" }}, actual_modes.len() + 1) }}; return Err(::nybl::error::NyblError::runtime(message, line)); }} ::nybl::validate_call_modes({label}, &[{modes}], actual_modes, line)?; Ok(Some(adapter)) }},",
+                    "            Some(adapter) if adapter as usize == {adapter} as *const () as usize => {{ {receiver_check}let __full_modes = &[{full_modes}]; if !::nybl::ref_params::accepts_arity(__full_modes, actual_modes.len() + 1) {{ let required = ::nybl::ref_params::required_arity(__full_modes); let message = if matches!(__full_modes.last(), Some(::nybl::parser::ParamMode::Rest)) {{ format!(\"`{{}}.{{}}` expects at least {{}} argument{{}} (including `self`), but got {{}}\", {type_name}, {method_name}, required, if required == 1 {{ \"\" }} else {{ \"s\" }}, actual_modes.len() + 1) }} else {{ format!(\"`{{}}.{{}}` expects {{}} argument{{}} (including `self`), but got {{}}\", {type_name}, {method_name}, required, if required == 1 {{ \"\" }} else {{ \"s\" }}, actual_modes.len() + 1) }}; return Err(::nybl::error::NyblError::runtime(message, line)); }} ::nybl::validate_call_modes({label}, &[{modes}], actual_modes, line)?; Ok(Some(adapter)) }},",
                     adapter = method_site_adapter_name(site.id),
                     label = rust_string_literal(&format!("{type_name}.{method_name}")),
                     type_name = rust_string_literal(type_name),
@@ -6017,7 +6020,7 @@ fn __nybl_function_site_value(
                 let current = self.fresh_tmp();
                 let replacement = self.fresh_tmp();
                 self.line(&format!(
-                    "let {current} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?;"
+                    "let {current} = __nybl_place_get_mutable(&{root}, &{path}, {line}, &ctx.memory)?;"
                 ));
                 self.line(&format!(
                     "let {replacement} = {}(&{current}, &{rhs_tmp}, {line}, &ctx.memory)?;",
@@ -6096,10 +6099,15 @@ fn __nybl_function_site_value(
         self.in_top_level = false;
         let saved_callable_body = self.in_callable_body;
         self.in_callable_body = true;
+        let module_lit = rust_string_literal(&self.current_module);
         // Function-entry checkpoint — matches the plan's "step-count
         // checks at loop backedges / function entry". No-op outside
         // sandbox mode.
-        self.emit_tick(line);
+        if self.opts.sandbox {
+            self.line(&format!(
+                "__nybl_tick(ctx, {line}).map_err(|__nybl_error| __nybl_error.with_module({module_lit}))?;"
+            ));
+        }
         if uses_runtime_type_bindings {
             self.line(&format!(
                 "let mut __nybl_type_bindings = __nybl_callable_type_bindings(ctx, {});",
@@ -6162,22 +6170,26 @@ fn __nybl_function_site_value(
             ));
         }
         let has_refs = params.iter().any(|param| param.mode == ParamMode::Ref);
-        if has_refs {
-            self.line("let __nybl_call_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {");
-            self.indent += 1;
-        }
+        self.line(
+            "let __nybl_call_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {",
+        );
+        self.indent += 1;
         for s in body {
             self.emit_stmt(s)?;
         }
+        self.line("#[allow(unreachable_code)] Ok(::nybl::value::Value::None)");
+        self.indent -= 1;
+        self.line("})();");
+        self.line("match __nybl_call_result {");
+        self.indent += 1;
         if has_refs {
-            self.line("#[allow(unreachable_code)] Ok(::nybl::value::Value::None)");
-            self.indent -= 1;
-            self.line("})();");
-            self.line("match __nybl_call_result {");
-            self.indent += 1;
             self.line("Ok(__nybl_return_value) => {");
             self.indent += 1;
-            self.emit_tick(line);
+            if self.opts.sandbox {
+                self.line(&format!(
+                    "__nybl_tick(ctx, {line}).map_err(|__nybl_error| __nybl_error.with_module({module_lit}))?;"
+                ));
+            }
             for (index, param) in params.iter().enumerate() {
                 if param.mode == ParamMode::Ref {
                     self.line(&format!(
@@ -6189,22 +6201,20 @@ fn __nybl_function_site_value(
             self.line("Ok(__nybl_return_value)");
             self.indent -= 1;
             self.line("}");
-            self.line("Err(__nybl_error) => Err(__nybl_error),");
-            self.indent -= 1;
-            self.line("}");
+        } else {
+            self.line("Ok(__nybl_return_value) => Ok(__nybl_return_value),");
         }
+        self.line(&format!(
+            "Err(__nybl_error) => Err(__nybl_error.with_module({module_lit})),"
+        ));
+        self.indent -= 1;
+        self.line("}");
         self.pop_scope();
         self.pop_scope();
         self.callable_mutations.pop();
         self.declaration_alias_write_through.pop();
         self.declaration_alias_overlays.pop();
         self.scope_stack = saved_scope_stack;
-        // Implicit `return none` if control falls off the end. The
-        // `allow(unreachable_code)` at the top of the file silences
-        // the warning for bodies that always return explicitly.
-        if !has_refs {
-            self.line("Ok(::nybl::value::Value::None)");
-        }
         self.tmp_counter = saved_tmp;
         self.in_top_level = saved_top_level;
         self.in_callable_body = saved_callable_body;
@@ -6644,7 +6654,7 @@ fn __nybl_function_site_value(
             let leaf = self.fresh_tmp();
             write!(
                 snapshot_lets,
-                "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?; ",
+                "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get_mutable(&{root}, &{path}, {line}, &ctx.memory)?; ",
                 read = target.root_read,
             )
             .unwrap();
@@ -7545,7 +7555,7 @@ fn __nybl_function_site_value(
         let receiver_root = self.fresh_tmp();
         let receiver_value = self.fresh_tmp();
         let receiver_snapshot = format!(
-            "let {receiver_root} = if {receiver_mutates} {{ {read} }} else {{ {receiver_pre_root}.clone() }}; let {receiver_value} = if {receiver_mutates} {{ __nybl_place_get(&{receiver_root}, &{receiver_path}, {line}, &ctx.memory)? }} else {{ {receiver_pre_value}.clone() }}; ",
+            "let {receiver_root} = if {receiver_mutates} {{ {read} }} else {{ {receiver_pre_root}.clone() }}; let {receiver_value} = if {receiver_mutates} {{ __nybl_place_get_mutable(&{receiver_root}, &{receiver_path}, {line}, &ctx.memory)? }} else {{ {receiver_pre_value}.clone() }}; ",
             read = receiver_target.root_read,
         );
 
@@ -7558,7 +7568,7 @@ fn __nybl_function_site_value(
             let leaf = self.fresh_tmp();
             write!(
                 snapshots,
-                "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?; ",
+                "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get_mutable(&{root}, &{path}, {line}, &ctx.memory)?; ",
                 read = target.root_read,
             )
             .unwrap();
@@ -7600,7 +7610,15 @@ fn __nybl_function_site_value(
         } else {
             String::new()
         };
-        let builtin_mutates = methods::is_mutating_method(method);
+        let receiver_const_arg = if self.is_constant_binding(&receiver_place.root) {
+            format!(
+                "::std::option::Option::Some({})",
+                rust_string_literal(&receiver_place.root)
+            )
+        } else {
+            "::std::option::Option::None".to_string()
+        };
+        let receiver_captured_arg = self.is_captured_binding(&receiver_place.root);
         let builtin_arity = methods::builtin_method_arity(method).map_or(String::new(), |expected| {
             format!(
                 "if {user_method}.is_none() && {module_callable}.is_none() && {}usize != {expected}usize {{ return Err(::nybl::error::NyblError::runtime({}, {line})); }} ",
@@ -7615,12 +7633,12 @@ fn __nybl_function_site_value(
         });
 
         Ok(format!(
-            "{{ {receiver_fence}{receiver_projection_lets}let {receiver_pre_root} = {receiver_read}; let {receiver_pre_value} = __nybl_place_get(&{receiver_pre_root}, &{receiver_path}, {line}, &ctx.memory)?; \
-             let {user_method} = __nybl_preflight_user_method(ctx, &{receiver_pre_value}, {method_lit}, &[{modes}], true, {line})?; \
+            "{{ {receiver_fence}{receiver_projection_lets}let {receiver_pre_root} = {receiver_read}; let {receiver_pre_value} = __nybl_place_get(ctx, &{receiver_pre_root}, &{receiver_path}, {line})?; \
+             let {user_method} = __nybl_preflight_user_method(ctx, &{receiver_pre_value}, {method_lit}, &[{modes}], true, {receiver_const_arg}, {receiver_captured_arg}, ::std::option::Option::Some((&{receiver_pre_root}, &{receiver_path})), {line})?; \
              let {module_callable} = if {user_method}.is_some() {{ ::std::option::Option::None }} else {{ __nybl_preflight_module_call(ctx, &{receiver_pre_value}, {method_lit}, &[{modes}], {line})? }}; \
              if {user_method}.is_none() && {module_callable}.is_none() {{ ::nybl::validate_value_only_call_modes({method_lit}, &[{modes}], {line})?; }} \
-             {builtin_arity}let {receiver_mutates} = {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) || ({user_method}.is_none() && {module_callable}.is_none() && {builtin_mutates}); \
-             {receiver_guard}{duplicate_receiver_guard}{fences}{ordinary}{receiver_snapshot}{snapshots}\
+             {builtin_arity}let {receiver_mutates} = {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) || ({user_method}.is_none() && {module_callable}.is_none() && ::nybl::methods::is_mutating_collection_receiver(&{receiver_pre_value}, {method_lit})); \
+             {receiver_guard}if {user_method}.is_none() && {module_callable}.is_none() && {receiver_mutates} {{ let _ = __nybl_place_get_mutable(&{receiver_pre_root}, &{receiver_path}, {line}, &ctx.memory)?; }} {duplicate_receiver_guard}{fences}{ordinary}{receiver_snapshot}{snapshots}\
              let ({result}, __nybl_staged_args, __nybl_staged_receiver) = if let ::std::option::Option::Some(__nybl_method_adapter) = {user_method} {{ \
                  let {outcome} = __nybl_call_preflighted_user_method_outcome(ctx, __nybl_method_adapter, {receiver_value}.clone(), {args_vec}, {line})?; \
                  let __receiver = if __nybl_user_method_receiver_is_ref(__nybl_method_adapter) {{ ::std::option::Option::Some({outcome}.receiver) }} else {{ ::std::option::Option::None }}; \
@@ -7728,7 +7746,7 @@ fn __nybl_function_site_value(
                 let leaf = self.fresh_tmp();
                 write!(
                     snapshots,
-                    "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get(&{root}, &{path}, {line}, &ctx.memory)?; ",
+                    "{projection_lets}let {root} = {read}; let {leaf} = __nybl_place_get_mutable(&{root}, &{path}, {line}, &ctx.memory)?; ",
                     read = target.root_read,
                 )
                 .unwrap();
@@ -7778,7 +7796,7 @@ fn __nybl_function_site_value(
                 let Some(storage) = storage else {
                     return Ok(format!(
                         "{{ let {object_tmp} = {object_src}; \
-                             let {user_method} = __nybl_preflight_user_method(ctx, &{object_tmp}, {method}, &[{modes}], true, {line})?; \
+                             let {user_method} = __nybl_preflight_user_method(ctx, &{object_tmp}, {method}, &[{modes}], false, ::std::option::Option::None, false, ::std::option::Option::None, {line})?; \
                              let {module_callable} = if {user_method}.is_some() {{ ::std::option::Option::None }} else {{ __nybl_preflight_module_call(ctx, &{object_tmp}, {method}, &[{modes}], {line})? }}; \
                              if {user_method}.is_none() && {module_callable}.is_none() {{ ::nybl::validate_value_only_call_modes({method}, &[{modes}], {line})?; unreachable!(); }} \
                              {fences}{ordinary}{snapshots}\
@@ -7792,27 +7810,12 @@ fn __nybl_function_site_value(
                 let (target_preflight, target_read, target_write) =
                     self.ref_target_sources(&storage, name, line);
                 let mut receiver_fence = target_preflight;
-                if self.is_constant_binding(name) {
-                    write!(
-                            receiver_fence,
-                            "if {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::error_messages::constant_mutation_error({}, {line})); }} ",
-                            rust_string_literal(name),
-                        )
-                        .unwrap();
-                }
-                if self.is_captured_binding(name) {
-                    write!(
-                            receiver_fence,
-                            "if {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::ref_params::captured_ref_target(1, {line})); }} "
-                        )
-                        .unwrap();
-                }
                 if seen.contains(name) {
                     write!(
-                            receiver_fence,
-                            "if {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::ref_params::duplicate_ref_target({line})); }} "
-                        )
-                        .unwrap();
+                        receiver_fence,
+                        "if {user_method}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::ref_params::duplicate_ref_target({line})); }} "
+                    )
+                    .unwrap();
                 }
                 (
                     receiver_fence,
@@ -7826,6 +7829,17 @@ fn __nybl_function_site_value(
             } else {
                 (String::new(), String::new(), String::new())
             };
+            let (receiver_const_arg, receiver_captured_arg) = match &object.kind {
+                ExprKind::Ident(name) => (
+                    if self.is_constant_binding(name) {
+                        format!("::std::option::Option::Some({})", rust_string_literal(name))
+                    } else {
+                        "::std::option::Option::None".to_string()
+                    },
+                    self.is_captured_binding(name),
+                ),
+                _ => ("::std::option::Option::None".to_string(), false),
+            };
             let user_receiver = if matches!(&object.kind, ExprKind::Ident(_)) {
                 format!("__nybl_receiver_snapshot.unwrap_or_else(|| {object_tmp}.clone())")
             } else {
@@ -7833,7 +7847,7 @@ fn __nybl_function_site_value(
             };
             return Ok(format!(
                 "{{ let {object_tmp} = {object_src}; \
-                 let {user_method} = __nybl_preflight_user_method(ctx, &{object_tmp}, {method}, &[{modes}], {receiver_is_place}, {line})?; \
+                 let {user_method} = __nybl_preflight_user_method(ctx, &{object_tmp}, {method}, &[{modes}], {receiver_is_place}, {receiver_const_arg}, {receiver_captured_arg}, ::std::option::Option::None, {line})?; \
                  let {module_callable} = if {user_method}.is_some() {{ ::std::option::Option::None }} else {{ __nybl_preflight_module_call(ctx, &{object_tmp}, {method}, &[{modes}], {line})? }}; \
                  if {user_method}.is_none() && {module_callable}.is_none() {{ \
                      ::nybl::validate_value_only_call_modes({method}, &[{modes}], {line})?; \
@@ -7872,9 +7886,20 @@ fn __nybl_function_site_value(
                 .map(|_| "::nybl::parser::ParamMode::Value")
                 .collect::<Vec<_>>()
                 .join(", ");
+            let (receiver_const_arg, receiver_captured_arg) = match &object.kind {
+                ExprKind::Ident(name) => (
+                    if self.is_constant_binding(name) {
+                        format!("::std::option::Option::Some({})", rust_string_literal(name))
+                    } else {
+                        "::std::option::Option::None".to_string()
+                    },
+                    self.is_captured_binding(name),
+                ),
+                _ => ("::std::option::Option::None".to_string(), false),
+            };
             write!(
                 object_preflight,
-                "let {tmp} = {src}; let {user_tmp} = __nybl_preflight_user_method(ctx, &{tmp}, {method}, &[{value_modes}], {receiver_is_place}, {line})?; let {module_tmp} = if {user_tmp}.is_some() {{ ::std::option::Option::None }} else {{ __nybl_preflight_module_call(ctx, &{tmp}, {method}, &[{value_modes}], {line})? }}; ",
+                "let {tmp} = {src}; let {user_tmp} = __nybl_preflight_user_method(ctx, &{tmp}, {method}, &[{value_modes}], {receiver_is_place}, {receiver_const_arg}, {receiver_captured_arg}, ::std::option::Option::None, {line})?; let {module_tmp} = if {user_tmp}.is_some() {{ ::std::option::Option::None }} else {{ __nybl_preflight_module_call(ctx, &{tmp}, {method}, &[{value_modes}], {line})? }}; ",
                 method = rust_string_literal(method),
                 receiver_is_place = matches!(&object.kind, ExprKind::Ident(_)),
             )
@@ -7890,21 +7915,6 @@ fn __nybl_function_site_value(
                     let (target_preflight, target_read, target_write) =
                         self.ref_target_sources(&storage, name, line);
                     object_preflight.push_str(&target_preflight);
-                    if self.is_constant_binding(name) {
-                        write!(
-                            object_preflight,
-                            "if {user_tmp}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::error_messages::constant_mutation_error({}, {line})); }} ",
-                            rust_string_literal(name),
-                        )
-                        .unwrap();
-                    }
-                    if self.is_captured_binding(name) {
-                        write!(
-                            object_preflight,
-                            "if {user_tmp}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::ref_params::captured_ref_target(1, {line})); }} "
-                        )
-                        .unwrap();
-                    }
                     named_user_ref_target = Some((target_read, target_write));
                 }
             }
@@ -7985,27 +7995,36 @@ fn __nybl_function_site_value(
             let receiver_is_array_tmp = self.fresh_tmp();
             let expected = methods::builtin_method_arity(method)
                 .expect("known mutating built-in has declared arity");
-            let captured_guard = if self.is_captured_binding(target_name) {
+            let receiver_const_arg = if self.is_constant_binding(target_name) {
+                format!(
+                    "::std::option::Option::Some({})",
+                    rust_string_literal(target_name)
+                )
+            } else {
+                "::std::option::Option::None".to_string()
+            };
+            let receiver_captured_arg = self.is_captured_binding(target_name);
+            let captured_guard = if receiver_captured_arg {
                 format!("return Err(::nybl::ref_params::captured_ref_target(1, {line})); ")
             } else {
                 String::new()
             };
             write!(
                 arg_lets,
-                "let ({user_tmp}, {receiver_tmp}, {receiver_is_array_tmp}) = {{ let __nybl_preflight_receiver: &::nybl::value::Value = {receiver}; let __nybl_method_adapter = __nybl_preflight_user_method(ctx, __nybl_preflight_receiver, {}, &[{}], true, {line})?; let __nybl_saved_receiver = if __nybl_method_adapter.is_some() {{ ::std::option::Option::Some(__nybl_preflight_receiver.clone()) }} else {{ ::std::option::Option::None }}; let __nybl_receiver_in_place = ::nybl::methods::is_mutating_collection_receiver(__nybl_preflight_receiver, {method_literal}); (__nybl_method_adapter, __nybl_saved_receiver, __nybl_receiver_in_place) }}; if {user_tmp}.is_none() && {receiver_is_array_tmp} {{ {captured_guard}::nybl::methods::reject_constant_array_mutation({}, {}, {line})?; if {actual}usize != {expected}usize {{ return Err(::nybl::error::NyblError::runtime({}, {line})); }} }} ",
+                "let ({user_tmp}, {receiver_tmp}, {receiver_is_array_tmp}) = {{ let __nybl_preflight_receiver: &::nybl::value::Value = {receiver}; let __nybl_method_adapter = __nybl_preflight_user_method(ctx, __nybl_preflight_receiver, {}, &[{}], true, {receiver_const_arg}, {receiver_captured_arg}, ::std::option::Option::None, {line})?; let __nybl_saved_receiver = if __nybl_method_adapter.is_some() {{ ::std::option::Option::Some(__nybl_preflight_receiver.clone()) }} else {{ ::std::option::Option::None }}; let __nybl_receiver_in_place = ::nybl::methods::is_mutating_collection_receiver(__nybl_preflight_receiver, {method_literal}); (__nybl_method_adapter, __nybl_saved_receiver, __nybl_receiver_in_place) }}; if {user_tmp}.is_none() && {receiver_is_array_tmp} {{ if {actual}usize != {expected}usize {{ return Err(::nybl::error::NyblError::runtime({}, {line})); }} ::nybl::methods::reject_constant_array_mutation({}, {}, {line})?; {captured_guard}}} ",
                 rust_string_literal(method),
                 args.iter()
                     .map(|_| "::nybl::parser::ParamMode::Value")
                     .collect::<Vec<_>>()
                     .join(", "),
-                rust_string_literal(target_name),
-                rust_string_literal(method),
                 rust_string_literal(&format!(
                     "`.{}()` needs {} argument{}",
                     method,
                     expected,
                     if expected == 1 { "" } else { "s" }
                 )),
+                rust_string_literal(target_name),
+                rust_string_literal(method),
                 actual = args.len(),
                 method_literal = rust_string_literal(method),
             )
@@ -8019,21 +8038,6 @@ fn __nybl_function_site_value(
             let (target_preflight, target_read, target_write) =
                 self.ref_target_sources(&storage, target_name, line);
             arg_lets.push_str(&target_preflight);
-            if self.is_constant_binding(target_name) {
-                write!(
-                    arg_lets,
-                    "if {user_tmp}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::error_messages::constant_mutation_error({}, {line})); }} ",
-                    rust_string_literal(target_name),
-                )
-                .unwrap();
-            }
-            if self.is_captured_binding(target_name) {
-                write!(
-                    arg_lets,
-                    "if {user_tmp}.is_some_and(__nybl_user_method_receiver_is_ref) {{ return Err(::nybl::ref_params::captured_ref_target(1, {line})); }} "
-                )
-                .unwrap();
-            }
             named_user_method = Some(user_tmp);
             named_user_receiver = Some(receiver_tmp);
             named_user_ref_target = Some((target_read, target_write));
@@ -8331,9 +8335,15 @@ fn __nybl_function_site_value(
                     },
                 );
                 self.mark_captured_local(cap);
+                if nybl::naming::is_constant_name(cap) {
+                    self.mark_constant(cap);
+                }
             } else {
                 self.bind_local(cap);
                 self.mark_captured_local(cap);
+                if nybl::naming::is_constant_name(cap) {
+                    self.mark_constant(cap);
+                }
             }
         }
         let declaration_aliases = self.declaration_aliases_for_callable(params, body);
@@ -8535,16 +8545,19 @@ fn __nybl_function_site_value(
         } else {
             String::new()
         };
+        let module_lit = rust_string_literal(&self.current_module);
         let wrap_ctx = if self.opts.sandbox { "ctx, " } else { "" };
         let memory_check = if self.opts.sandbox {
-            format!("__nybl_check_memory(ctx, {line})?; ")
+            format!(
+                "__nybl_check_memory(ctx, {line}).map_err(|__nybl_error| __nybl_error.with_module({module_lit}))?; "
+            )
         } else {
             String::new()
         };
         let nesting = nybl::ast_depth::body_depth(body);
 
         Ok(format!(
-            "{{ {capture_prelude}let __opaque_body_depth = {opaque_body_depth}; let __callable: ::std::rc::Rc<dyn for<'__a> Fn(&mut Ctx<'__a>, ::std::vec::Vec<::nybl::value::Value>) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>> = ::std::rc::Rc::new(move |ctx, mut args| {{ let __modes = &[{modes_slice}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error(\"lambda\", __modes, args.len(), {line})); }} args = __nybl_pack_rest_args(args, __modes, {line}, &ctx.memory)?; let _ = &args; {type_bindings_init}{capture_moves}{param_binds}let __nybl_value_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{ {body_src} #[allow(unreachable_code)] Ok(::nybl::value::Value::None) }})(); let value = __nybl_value_result?; {memory_check}{param_sync}Ok(__NyblCallOutcome {{ value, args: {final_args} }}) }}); __nybl_wrap_callable({wrap_ctx}{params_array}, {modes_array}, ::std::vec::Vec::new(), None, __opaque_body_depth, {nesting}, {line}, __callable)? }}",
+            "{{ {capture_prelude}let __opaque_body_depth = {opaque_body_depth}; let __callable: ::std::rc::Rc<dyn for<'__a> Fn(&mut Ctx<'__a>, ::std::vec::Vec<::nybl::value::Value>) -> Result<__NyblCallOutcome, ::nybl::error::NyblError>> = ::std::rc::Rc::new(move |ctx, mut args| {{ let __modes = &[{modes_slice}]; if !::nybl::ref_params::accepts_arity(__modes, args.len()) {{ return Err(__nybl_arity_error(\"lambda\", __modes, args.len(), {line}).with_module({module_lit})); }} args = __nybl_pack_rest_args(args, __modes, {line}, &ctx.memory).map_err(|__nybl_error| __nybl_error.with_module({module_lit}))?; let _ = &args; {type_bindings_init}{capture_moves}{param_binds}let __nybl_value_result = (|| -> Result<::nybl::value::Value, ::nybl::error::NyblError> {{ {body_src} #[allow(unreachable_code)] Ok(::nybl::value::Value::None) }})(); let value = __nybl_value_result.map_err(|__nybl_error| __nybl_error.with_module({module_lit}))?; {memory_check}{param_sync}Ok(__NyblCallOutcome {{ value, args: {final_args} }}) }}); __nybl_wrap_callable({wrap_ctx}{params_array}, {modes_array}, ::std::vec::Vec::new(), None, __opaque_body_depth, {nesting}, {line}, __callable)? }}",
         ))
     }
 }

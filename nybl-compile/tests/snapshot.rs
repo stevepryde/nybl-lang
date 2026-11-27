@@ -903,7 +903,9 @@ fn lambda_final_memory_checks_are_sandbox_only() {
 
     let sandbox = compile_sandbox(source);
     assert!(
-        sandbox.contains("let value = __nybl_value_result?; __nybl_check_memory(ctx, 1)?;"),
+        sandbox.contains(
+            "let value = __nybl_value_result.map_err(|__nybl_error| __nybl_error.with_module(\"<root>\"))?; __nybl_check_memory(ctx, 1).map_err(|__nybl_error| __nybl_error.with_module(\"<root>\"))?;"
+        ),
         "sandbox lambda must check memory before exposing its outcome:\n{sandbox}"
     );
 }

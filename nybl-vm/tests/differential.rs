@@ -7188,3 +7188,73 @@ fn flat_import_clash_rules_diff() {
         assert_eq!(say(source), expected, "{source}");
     }
 }
+
+#[test]
+fn issue_203_parity_regressions_diff() {
+    // 1. Nested non-binding index receiver must reject built-in mutation before
+    //    evaluating arguments (RUN-010 / RUN-021 / AC-RUN-017).
+    assert_eq!(
+        say(r#"let values = [1]
+fn side() { print("arg"); return 2 }
+fn nested_place() { [values][0].push(side()) }
+print(try_call(nested_place))"#),
+        "Result::Err(RuntimeError { message: \"can't mutate through an index or field receiver yet\", line: 3 })"
+    );
+
+    // 2. Method argument-mode error names `C.var`, rest-parameter arity uses
+    //    singular `at least 1 argument`, and `ref self` temporary receiver
+    //    checks run before arity.
+    assert_eq!(
+        say(r#"struct C { value }
+fn C.var(self, x) { return self.value + x }
+let c = C { value: 1 }
+let n = 2
+fn bad_mode() { return c.var(ref n) }
+print(try_call(bad_mode))"#),
+        "Result::Err(RuntimeError { message: \"argument 1 to `C.var` is a value parameter and can't use `ref`\", line: 5 })"
+    );
+    assert_eq!(
+        say(r#"fn one_or_more(first, ..rest) { return first }
+fn bad_rest() { return one_or_more() }
+print(try_call(bad_rest))"#),
+        "Result::Err(RuntimeError { message: \"`one_or_more` expects at least 1 argument, but got 0\", line: 2 })"
+    );
+    assert_eq!(
+        say(r#"struct C { value }
+fn C.bump(ref self, delta) { self.value += delta }
+fn bad_ref_temp_and_arity() { return C { value: 1 }.bump() }
+print(try_call(bad_ref_temp_and_arity))"#),
+        "Result::Err(RuntimeError { message: \"a `ref` method receiver must be a mutable place\", line: 3 })"
+    );
+
+    // 3. Read-only method calls on captured struct fields and enum struct
+    //    variant fields succeed instead of failing as non-mutable places.
+    assert_eq!(
+        say(r#"struct Box { items }
+enum Holder { Full { items } }
+let b = Box { items: [1, 2, 3] }
+let f = fn() { return b.items.len() }
+let h = Holder::Full { items: [4, 5] }
+print(f(), h.items.len())"#),
+        "3 2"
+    );
+
+    // 4. Nested module aliases (at top level and inside functions) resolve
+    //    field chains cleanly, and calling a non-function module export uses
+    //    the same message in every engine.
+    set_modules(&[
+        ("shared", "let answer = 42\nfn helper(n) { return n + 1 }"),
+        ("layer", "use shared as ctx"),
+        ("facade", "use layer as layer"),
+    ]);
+    assert_eq!(
+        say(r#"use facade as outer
+fn call_nested() { return outer.layer.ctx.helper(4) }
+print(outer.layer.ctx.helper(4), call_nested())"#),
+        "5 5"
+    );
+    assert_eq!(
+        run_err("use facade as outer\nouter.layer.ctx.answer()"),
+        "`answer` is a int, not a function"
+    );
+}

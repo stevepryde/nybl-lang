@@ -492,9 +492,10 @@ impl NyblInstance {
                 0,
                 if entry.variadic {
                     format!(
-                        "`{}` expects at least {} arguments, but got {}",
+                        "`{}` expects at least {} argument{}, but got {}",
                         name,
                         entry.arity,
+                        if entry.arity == 1 { "" } else { "s" },
                         args.len(),
                     )
                 } else {
@@ -559,8 +560,10 @@ fn validate_prepared_arity(entry: &PreparedEntry, actual: usize) -> Result<(), N
         0,
         if entry.variadic {
             format!(
-                "`{}` expects at least {} arguments, but got {actual}",
-                entry.name, entry.arity
+                "`{}` expects at least {} argument{}, but got {actual}",
+                entry.name,
+                entry.arity,
+                if entry.arity == 1 { "" } else { "s" }
             )
         } else {
             format!(

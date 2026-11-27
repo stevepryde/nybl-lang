@@ -570,6 +570,39 @@ print(try_call(nested_place))
 print([10].push(side()))"#,
     ),
     (
+        "user_method_call_error_parity",
+        r#"struct C { value }
+fn C.var(self, x) { return self.value + x }
+fn C.bump(ref self, delta) { print("body"); self.value += delta }
+fn one_or_more(first, ..rest) { return first }
+let c = C { value: 1 }
+const K = C { value: 1 }
+let n = 2
+fn bad_mode() { return c.var(ref n) }
+fn bad_rest() { return one_or_more() }
+fn bad_ref_temp_and_arity() { return C { value: 1 }.bump() }
+fn bad_const_and_arity() { return K.bump() }
+fn bad_const_and_mode() { return K.bump(ref n) }
+let bad_captured_and_arity = fn() { return c.bump() }
+let bad_const_in_lambda = fn() { return K.bump(1) }
+print(try_call(bad_mode))
+print(try_call(bad_rest))
+print(try_call(bad_ref_temp_and_arity))
+print(try_call(bad_const_and_arity))
+print(try_call(bad_const_and_mode))
+print(try_call(bad_captured_and_arity))
+print(try_call(bad_const_in_lambda))
+struct Box { items }
+enum Holder { Full { items } }
+let b = Box { items: [1, 2, 3] }
+let read_captured = fn() { return b.items.len() }
+let h = Holder::Full { items: [4, 5] }
+fn side() { print("arg"); return 9 }
+fn bad_enum_push() { h.items.push(side()) }
+print(read_captured(), h.items.len())
+print(try_call(bad_enum_push))"#,
+    ),
+    (
         "method_preflight_retains_exact_adapter_across_argument_redeclaration",
         r#"struct Box { value }
 fn Box.apply(self, ref output, trigger) { output = self.value }
@@ -3978,6 +4011,52 @@ print(try_call(retained))"#,
                 "use stash.{save}\nfn helper() { return 7 }\nfn expose() { return helper() }\nsave(expose)\nmissing()",
             ),
         ],
+    ),
+    (
+        "aliased_selective_included_member_reads_resolve_live_bindings",
+        r#"use counter.{value, next} as c
+print(c.value)
+c.next()
+print(c.value)"#,
+        &[(
+            "counter",
+            "let value = 1\nfn next() {\n    value += 1\n    return value\n}",
+        )],
+    ),
+    (
+        "import_alias_of_alias_inside_fn_and_non_function_export_call",
+        r#"use facade as outer
+fn call_nested() { return outer.layer.ctx.helper(4) }
+print(call_nested())
+fn call_value() { return outer.layer.ctx.answer() }
+print(try_call(call_value))"#,
+        &[
+            ("shared", "let answer = 42\nfn helper(n) { return n + 1 }"),
+            ("layer", "use shared as ctx"),
+            ("facade", "use layer as layer"),
+        ],
+    ),
+    (
+        "unwritable_module_place_and_type_value_parity",
+        r#"use store as m
+fn side() { print("arg"); return 1 }
+fn inc(ref x) { print("body"); x += 1 }
+fn bad_ref_method() { m.counter.bump(side()) }
+fn bad_ref_arg() { inc(ref m.value) }
+fn bad_push() { m.items.push(side()) }
+fn bad_remove() { m.table.remove(9) }
+fn bad_compound() { m.missing += 1 }
+fn bad_type_val() { m.Counter.peek() }
+print(try_call(bad_ref_method))
+print(try_call(bad_ref_arg))
+print(try_call(bad_push))
+print(try_call(bad_remove))
+print(try_call(bad_compound))
+print(try_call(bad_type_val))"#,
+        &[(
+            "store",
+            "struct Counter { n }\nfn Counter.bump(ref self, d) { print(\"method\"); self.n += d }\nlet counter = Counter { n: 1 }\nlet value = 1\nlet items = [1]\nlet table = { \"a\": 1 }",
+        )],
     ),
 ];
 

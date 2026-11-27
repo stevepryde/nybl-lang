@@ -4565,6 +4565,7 @@ fn sandbox_stack_corpus() {
 #[ignore]
 fn e2e_sandbox_line_less_tick_hook_error_reports_the_step_limit_line_and_owner() {
     let root = "use lib
+use spinmod as m
 fn inner(n) {
   let total = 0
   repeat n {
@@ -4578,11 +4579,47 @@ pub fn run() {
     count += inner(5)
   }
 }
-pub fn run_module() { return spin() }";
-    let modules = [(
-        "lib",
-        "let ready = true\nfn spin() {\n  let n = 0\n  while ready {\n    n += 1\n  }\n}",
-    )];
+pub fn run_module() { return spin() }
+pub fn run_aliased_module() { return m.spin() }
+pub fn run_module_lambda() {
+  let f = m.make_spinner()
+  return f()
+}
+pub fn run_module_method() {
+  let box = m.make_box()
+  return box.spin()
+}
+pub fn run_module_ref_commit() {
+  let x = 0
+  return m.bump_ref(ref x)
+}
+pub fn run_module_lambda_mem() {
+  let f = m.make_grower()
+  return f()
+}
+pub fn run_root_callback_in_module() {
+  return m.invoke(fn() {
+    let count = 0
+    while true {
+      count += 1
+    }
+  })
+}
+pub fn load_spinning_module() {
+  use badload
+  return 0
+}";
+    let modules = [
+        (
+            "lib",
+            "let ready = true\nfn spin() {\n  let n = 0\n  while ready {\n    n += 1\n  }\n}",
+        ),
+        (
+            "spinmod",
+            "struct Box { id }\nfn Box.spin(self) {\n  while true {}\n}\nfn make_box() { return Box { id: 1 } }\nfn spin() {\n  while true {}\n}\nfn make_spinner() {\n  return fn() {\n    while true {}\n  }\n}\nfn make_grower() {\n  return fn() {\n    let s = \"abcdefgh\"\n    repeat 20 { s = s + s }\n    return s\n  }\n}\nfn bump_ref(ref x) {\n  x += 1\n  return x\n}\nfn invoke(cb) {\n  return cb()\n}",
+        ),
+        ("badload", "let n = 0\nwhile true {\n  n += 1\n}"),
+    ];
     let mut rust_src = transpile(
         root,
         &Options {
@@ -4621,20 +4658,44 @@ fn error_owner(error: &::nybl::error::NyblError) -> Option<String> {
     error.source_context.as_ref().map(|context| context.module_path.clone())
 }
 fn main() {
-    for entry in ["run", "run_module"] {
+    let cases = [
+        ("run", Some(::nybl::value::ROOT_MODULE_PATH)),
+        ("run_module", Some("lib")),
+        ("run_aliased_module", Some("spinmod")),
+        ("run_module_lambda", Some("spinmod")),
+        ("run_module_method", Some("spinmod")),
+        ("run_root_callback_in_module", Some(::nybl::value::ROOT_MODULE_PATH)),
+        ("load_spinning_module", Some("badload")),
+    ];
+    for (entry, expected_owner) in cases {
         // The built-in step error trips on tick 201; the hook fails on the
         // same tick.
         let builtin = hooked_call(entry, 200, u64::MAX, 0);
         assert!(builtin.message.contains("too many steps"), "{entry}: {builtin:?}");
+        assert_eq!(error_owner(&builtin).as_deref(), expected_owner, "{entry}: {builtin:?}");
         let hooked = hooked_call(entry, 1_000_000, 201, 0);
         assert_eq!(hooked.message, "host stop");
         assert!(matches!(hooked.line, Some(line) if line > 0), "{entry}: {hooked:?}");
         assert_eq!(hooked.line, builtin.line, "{entry}");
         assert_eq!(hooked.column, None);
-        assert_eq!(error_owner(&hooked), error_owner(&builtin), "{entry}");
+        assert_eq!(error_owner(&hooked).as_deref(), expected_owner, "{entry}: {hooked:?}");
         let explicit = hooked_call(entry, 1_000_000, 201, 77);
         assert_eq!(explicit.line, Some(77), "{entry}");
+        assert_eq!(error_owner(&explicit).as_deref(), expected_owner, "{entry}: {explicit:?}");
     }
+    // Ref-commit tick inside `spinmod::bump_ref`: tick 1 is `run_module_ref_commit`
+    // entry, tick 2 is `bump_ref` entry, tick 3 is `bump_ref`'s post-body ref-commit tick.
+    let ref_commit_err = hooked_call("run_module_ref_commit", 1_000_000, 3, 0);
+    assert_eq!(ref_commit_err.message, "host stop", "{ref_commit_err:?}");
+    assert_eq!(ref_commit_err.line, Some(21), "{ref_commit_err:?}");
+    assert_eq!(error_owner(&ref_commit_err).as_deref(), Some("spinmod"), "{ref_commit_err:?}");
+    // Memory limit error inside a module lambda carries that module as owner.
+    let mem_limits = ::nybl::NyblLimits { max_memory: 16 * 1024, ..::nybl::NyblLimits::standard() };
+    let mut mem_host = HookTickHost { ticks: 0, fail_on: u64::MAX, line: 0 };
+    let mut mem_instance = NyblInstance::load(&mut mem_host, &mem_limits).unwrap();
+    let mem_err = mem_instance.call("run_module_lambda_mem", &[], &mut mem_host).unwrap_err();
+    assert!(mem_err.message.contains("Memory limit exceeded"), "{mem_err:?}");
+    assert_eq!(error_owner(&mem_err).as_deref(), Some("spinmod"), "{mem_err:?}");
     println!("ok");
 }
 "#,

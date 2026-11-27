@@ -1352,6 +1352,25 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         })
     }
 
+    fn read_place_value_from(
+        &self,
+        root: &Value,
+        projections: &[PlaceProjection],
+        line: u32,
+        column: Option<core::num::NonZeroU32>,
+    ) -> Result<Value, NyblError> {
+        let mut value = root.clone();
+        for projection in projections {
+            value = match projection {
+                PlaceProjection::Index(index) => {
+                    ops::index_get_in(&value, index, line, &self.memory)?
+                }
+                PlaceProjection::Field(field) => self.field_get(&value, field, line, column)?,
+            };
+        }
+        Ok(value)
+    }
+
     fn place_value_from(
         &self,
         root: &Value,
@@ -3725,7 +3744,8 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         method: &str,
         args: &[CallArg],
     ) -> Result<MethodCallSite, NyblError> {
-        let value = self.place_value_from(&place.root, &place.projections, expr.line)?;
+        let value =
+            self.read_place_value_from(&place.root, &place.projections, expr.line, expr.column)?;
         self.method_site(expr, object, Some(place), value, method, args)
     }
 
@@ -3941,7 +3961,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
         crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
         check_mutating_method_arity(method, args.len(), expr.line)?;
-        self.validate_mutable_place(place, 1, expr.line)
+        self.validate_mutable_place(place, 1, expr.line)?;
+        self.place_value_from(&place.root, &place.projections, expr.line)?;
+        Ok(())
     }
 
     /// Mutating built-in method on an index or field place, committed back
@@ -4004,6 +4026,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 return Err(error);
             };
             self.validate_mutable_place(place, 1, expr.line)?;
+            self.place_value_from(&place.root, &place.projections, expr.line)?;
             Ok(true)
         } else {
             Ok(false)
@@ -4107,20 +4130,30 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         field: &str,
     ) -> Result<Value, NyblError> {
         let obj = self.eval_expr(object)?;
-        match &obj {
+        self.field_get(&obj, field, expr.line, expr.column)
+    }
+
+    fn field_get(
+        &self,
+        obj: &Value,
+        field: &str,
+        line: u32,
+        column: Option<core::num::NonZeroU32>,
+    ) -> Result<Value, NyblError> {
+        match obj {
             Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
                 let msg = crate::error_messages::struct_has_no_field(s.type_name(), field);
                 // Suggest from the struct's own declared
                 // field list — `p.z` when `Point` has `x`
                 // and `y` should point to `x`/`y`.
                 match crate::suggest::did_you_mean(field, s.shape().field_names()) {
-                    Some(hint) => error_with_hint_at(expr.line, expr.column, msg, hint),
-                    None => error_at(expr.line, expr.column, msg),
+                    Some(hint) => error_with_hint_at(line, column, msg, hint),
+                    None => error_at(line, column, msg),
                 }
             }),
             Value::EnumVariant(e) => e.field(field).cloned().ok_or_else(|| {
                 error(
-                    expr.line,
+                    line,
                     crate::error_messages::variant_has_no_field(e.type_name(), e.variant(), field),
                 )
             }),
@@ -4139,7 +4172,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                     // value-returning position.
                     let alias = m.path.rsplit('.').next().unwrap_or(&m.path);
                     return Err(error_with_hint(
-                        expr.line,
+                        line,
                         format!("`{}` in `{}` is a type, not a value", field, m.path),
                         format!(
                             "construct through the alias: `{alias}.{field} {{ ... }}` or `{alias}.{field}::Variant(...)`",
@@ -4147,12 +4180,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                     ));
                 }
                 Err(error(
-                    expr.line,
+                    line,
                     format!("`{}` isn't exported from `{}`", field, m.path),
                 ))
             }
             other => Err(error(
-                expr.line,
+                line,
                 crate::error_messages::cant_read_field(field, other.type_name()),
             )),
         }
@@ -4472,7 +4505,8 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 line,
                 if variadic {
                     format!(
-                        "`{callable}` expects at least {required} arguments, but got {}",
+                        "`{callable}` expects at least {required} argument{}, but got {}",
+                        if required == 1 { "" } else { "s" },
                         arg_count
                     )
                 } else {
@@ -4529,6 +4563,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         line: u32,
     ) -> Result<Vec<PlacePlan>, NyblError> {
         let actual_arity = args.len() + 1;
+        let method_label = format!("{receiver_type}.{method}");
         if !crate::ref_params::accepts_arity(&definition.param_modes, actual_arity) {
             let required = crate::ref_params::required_arity(&definition.param_modes);
             let variadic = matches!(definition.param_modes.last(), Some(ParamMode::Rest));
@@ -4536,11 +4571,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 line,
                 if variadic {
                     format!(
-                        "`{receiver_type}.{method}` expects at least {required} arguments (including `self`), but got {actual_arity}"
+                        "`{method_label}` expects at least {required} argument{} (including `self`), but got {actual_arity}",
+                        if required == 1 { "" } else { "s" }
                     )
                 } else {
                     format!(
-                        "`{receiver_type}.{method}` expects {required} argument{} (including `self`), but got {actual_arity}",
+                        "`{method_label}` expects {required} argument{} (including `self`), but got {actual_arity}",
                         if required == 1 { "" } else { "s" }
                     )
                 },
@@ -4551,7 +4587,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         // argument modes or evaluate any ordinary argument expressions.
         let expected_modes = &definition.param_modes[1..];
         let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
-        crate::validate_call_modes(method, expected_modes, &actual_modes, line)?;
+        crate::validate_call_modes(&method_label, expected_modes, &actual_modes, line)?;
         let explicit_plans = self.preflight_ref_places(args, line)?;
         if let Some(receiver_place) = receiver_place
             && explicit_plans
@@ -4738,7 +4774,8 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 line,
                 if variadic {
                     format!(
-                        "`{name}` expects at least {required} arguments, but got {}",
+                        "`{name}` expects at least {required} argument{}, but got {}",
+                        if required == 1 { "" } else { "s" },
                         args.len()
                     )
                 } else {
@@ -5212,8 +5249,9 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                         line,
                         if variadic {
                             format!(
-                                "`{}.{method}` expects at least {required} arguments (including `self`), but got {}",
+                                "`{}.{method}` expects at least {required} argument{} (including `self`), but got {}",
                                 key.1,
+                                if required == 1 { "" } else { "s" },
                                 args.len() + 1
                             )
                         } else {
@@ -5996,7 +6034,10 @@ impl ReplSession {
             return Err(error(
                 0,
                 if variadic {
-                    format!("Function expects at least {required} arguments, but got {arg_count}")
+                    format!(
+                        "Function expects at least {required} argument{}, but got {arg_count}",
+                        if required == 1 { "" } else { "s" }
+                    )
                 } else {
                     format!(
                         "Function expects {required} argument{}, but got {arg_count}",
@@ -6307,7 +6348,8 @@ impl ReplSession {
                         0,
                         if variadic {
                             format!(
-                                "`{name}` expects at least {arity} arguments, but got {}",
+                                "`{name}` expects at least {arity} argument{}, but got {}",
+                                if arity == 1 { "" } else { "s" },
                                 args.len()
                             )
                         } else {
@@ -6359,7 +6401,8 @@ impl ReplSession {
                 0,
                 if variadic {
                     format!(
-                        "`{name}` expects at least {required} arguments, but got {}",
+                        "`{name}` expects at least {required} argument{}, but got {}",
+                        if required == 1 { "" } else { "s" },
                         args.len()
                     )
                 } else {

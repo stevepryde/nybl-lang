@@ -697,7 +697,11 @@ fn __nybl_module_member(
     module: &::nybl::value::NyblModule,
     name: &str,
 ) -> ::std::option::Option<::nybl::value::Value> {
-    __nybl_binding_value(ctx, &module.path, name).or_else(|| module.__binding(name))
+    // Establish export membership from the module object's import-time
+    // surface before reading the defining module's live environment, which
+    // also holds private or unselected bindings.
+    let snapshot = module.__binding(name)?;
+    __nybl_binding_value(ctx, &module.path, name).or(::std::option::Option::Some(snapshot))
 }
 
 fn __nybl_read_binding(
@@ -1323,6 +1327,12 @@ fn __nybl_preflight_module_call(
             line,
         )
     })?;
+    if !matches!(&callable, ::nybl::value::Value::Fn(_)) {
+        return Err(::nybl::error::NyblError::runtime(
+            format!("`{}` is a {}, not a function", method, callable.type_name()),
+            line,
+        ));
+    }
     __nybl_preflight_value_call(ctx, &callable, actual_modes, line)?;
     Ok(Some(callable))
 }
@@ -1624,13 +1634,15 @@ fn __nybl_field_get(
                 return Ok(v);
             }
             if m.has_type(field) {
-                return Err(::nybl::error::NyblError::runtime(
-                    format!(
-                        "`{}.{}` is a type, not a value — construct it with `{{ ... }}` or `::Variant(...)`",
-                        m.path, field
-                    ),
+                let alias = m.path.rsplit('.').next().unwrap_or(&m.path);
+                let mut err = ::nybl::error::NyblError::runtime(
+                    format!("`{}` in `{}` is a type, not a value", field, m.path),
                     line,
+                );
+                err.friendly_hint = ::std::option::Option::Some(format!(
+                    "construct through the alias: `{alias}.{field} {{ ... }}` or `{alias}.{field}::Variant(...)`",
                 ));
+                return Err(err);
             }
             Err(::nybl::error::NyblError::runtime(
                 format!("`{}` isn't exported from `{}`", field, m.path),
@@ -1837,6 +1849,27 @@ enum __NyblPlaceStep {
 /// expressions have already been evaluated by generated code, so this helper
 /// is deliberately side-effect free.
 fn __nybl_place_get(
+    ctx: &Ctx<'_>,
+    root: &::nybl::value::Value,
+    steps: &[__NyblPlaceStep],
+    line: u32,
+) -> Result<::nybl::value::Value, ::nybl::error::NyblError> {
+    let mut value = root.clone();
+    for step in steps {
+        value = match step {
+            __NyblPlaceStep::Field(field) => __nybl_field_get_live(ctx, &value, field, line)?,
+            __NyblPlaceStep::Index(index) =>
+                ::nybl::ops::index_get_in(&value, index, line, &ctx.memory)?,
+        };
+    }
+    Ok(value)
+}
+
+/// Strict place read for mutable paths (compound assignment, `ref` arguments,
+/// `ref self` receivers, and mutating collection receivers). Only struct
+/// fields are writable, so a field step on a module, enum variant, or other
+/// value fails immediately with the canonical field-assignment diagnostic.
+fn __nybl_place_get_mutable(
     root: &::nybl::value::Value,
     steps: &[__NyblPlaceStep],
     line: u32,
@@ -1845,9 +1878,23 @@ fn __nybl_place_get(
     let mut value = root.clone();
     for step in steps {
         value = match step {
-            __NyblPlaceStep::Field(field) => __nybl_field_get(&value, field, line)?,
-            __NyblPlaceStep::Index(index) =>
-                ::nybl::ops::index_get_in(&value, index, line, memory)?,
+            __NyblPlaceStep::Field(field) => match &value {
+                ::nybl::value::Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
+                    ::nybl::error::NyblError::runtime(
+                        ::nybl::error_messages::struct_has_no_field(s.type_name(), field),
+                        line,
+                    )
+                })?,
+                other => {
+                    return Err(::nybl::error::NyblError::runtime(
+                        ::nybl::error_messages::cant_assign_field(field, other.type_name()),
+                        line,
+                    ));
+                }
+            },
+            __NyblPlaceStep::Index(index) => {
+                ::nybl::ops::index_get_in(&value, index, line, memory)?
+            }
         };
     }
     Ok(value)
@@ -1873,9 +1920,33 @@ fn __nybl_place_set(
         let Some((head, tail)) = steps.split_first() else {
             return Ok(value);
         };
+        if tail.is_empty() {
+            return match head {
+                __NyblPlaceStep::Field(field) => {
+                    __nybl_field_set(memory, owner, field, value, line)
+                }
+                __NyblPlaceStep::Index(index) => {
+                    ::nybl::ops::index_set_in(&mut owner, index, value, line, memory)?;
+                    Ok(owner)
+                }
+            };
+        }
         match head {
             __NyblPlaceStep::Field(field) => {
-                let child = __nybl_field_get(&owner, field, line)?;
+                let child = match &owner {
+                    ::nybl::value::Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
+                        ::nybl::error::NyblError::runtime(
+                            ::nybl::error_messages::struct_has_no_field(s.type_name(), field),
+                            line,
+                        )
+                    })?,
+                    other => {
+                        return Err(::nybl::error::NyblError::runtime(
+                            ::nybl::error_messages::cant_assign_field(field, other.type_name()),
+                            line,
+                        ));
+                    }
+                };
                 let child = replace(memory, child, tail, value, line)?;
                 __nybl_field_set(memory, owner, field, child, line)
             }
@@ -1952,6 +2023,12 @@ fn __nybl_call_method(
                     line,
                 )
             })?;
+            if !matches!(&binding, ::nybl::value::Value::Fn(_)) {
+                return Err(::nybl::error::NyblError::runtime(
+                    format!("`{}` is a {}, not a function", method, binding.type_name()),
+                    line,
+                ));
+            }
             let result = __nybl_call_value(ctx, binding, args.to_vec(), line)?;
             Ok((result.value, None))
         }

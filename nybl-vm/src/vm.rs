@@ -2509,10 +2509,8 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     .filter(|projection| matches!(projection, PlaceProjectionRecipe::Index))
                     .count();
                 let indices = self.pop_n_values(index_count, line)?;
-                let resolved = self.resolve_place(place, indices, 0, line)?;
-                let receiver =
-                    self.place_value_from(&resolved.root, &resolved.projections, line)?;
-                self.prepare_method_call(receiver, None, Some(resolved), method, site, true, line)?;
+                let (receiver, resolved_place) = self.resolve_method_place(place, indices, line)?;
+                self.prepare_method_call(receiver, None, resolved_place, method, site, true, line)?;
             }
             Instr::CallPrepared { site } => {
                 return self.call_prepared(site, line);
@@ -3097,6 +3095,12 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     format!("`{method}` isn't exported from `{}`", module.path),
                 )
             })?;
+            if !matches!(&callee, Value::Fn(_)) {
+                return Err(error(
+                    line,
+                    format!("`{method}` is a {}, not a function", callee.type_name()),
+                ));
+            }
             return self.prepare_value_call(callee, site, line);
         }
 
@@ -3271,6 +3275,40 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 receiver_place,
                 ..
             } => {
+                if entry.param_modes.first() == Some(&ParamMode::Ref) {
+                    if let Some(place) = receiver_place {
+                        self.validate_mutable_resolved_target(
+                            &place.target,
+                            &place.root_name,
+                            0,
+                            line,
+                        )?;
+                        self.place_value_from(&place.root, &place.projections, line)?;
+                    } else if let Some(recipe) = receiver_target {
+                        let name = self.current_chunk().name(recipe.name_idx());
+                        if nybl::naming::is_constant_name(name) {
+                            return Err(nybl::error_messages::constant_mutation_error(name, line));
+                        }
+                        if recipe.slot_idx().is_none()
+                            && self
+                                .frames
+                                .last()
+                                .is_some_and(|frame| frame.captured_names.contains(name))
+                        {
+                            return Err(nybl::ref_params::captured_ref_target(1, line));
+                        }
+                    } else {
+                        let mut error = NyblError::runtime(
+                            "a `ref` method receiver must be a mutable place",
+                            line,
+                        );
+                        error.friendly_hint = Some(
+                            "Store the value in a `let` binding, or call through one of its fields or indexes."
+                                .to_string(),
+                        );
+                        return Err(error);
+                    }
+                }
                 validate_user_arity(
                     &display_name,
                     &entry.param_modes,
@@ -3278,18 +3316,6 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     true,
                     line,
                 )?;
-                if entry.param_modes.first() == Some(&ParamMode::Ref)
-                    && receiver_target.is_none()
-                    && receiver_place.is_none()
-                {
-                    let mut error =
-                        NyblError::runtime("a `ref` method receiver must be a mutable place", line);
-                    error.friendly_hint = Some(
-                        "Store the value in a `let` binding, or call through one of its fields or indexes."
-                            .to_string(),
-                    );
-                    return Err(error);
-                }
                 Some(&entry.param_modes[1..])
             }
             PreparedCallable::NamedFallback(_)
@@ -3339,6 +3365,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         if let PreparedCallable::PlaceMethodInPlace { place, method } = &callable {
             methods::reject_constant_array_mutation(&place.root_name, method, line)?;
             self.validate_mutable_resolved_target(&place.target, &place.root_name, 0, line)?;
+            self.place_value_from(&place.root, &place.projections, line)?;
         }
 
         let receiver_ref = match &callable {
@@ -3349,27 +3376,9 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 ..
             } if entry.param_modes.first() == Some(&ParamMode::Ref) => {
                 if let Some(place) = receiver_place {
-                    self.validate_mutable_resolved_target(
-                        &place.target,
-                        &place.root_name,
-                        0,
-                        line,
-                    )?;
                     Some(PreparedReceiverRef::Place(place.clone()))
                 } else {
                     let recipe = receiver_target.expect("mutable receiver target was preflighted");
-                    let name = self.current_chunk().name(recipe.name_idx());
-                    if nybl::naming::is_constant_name(name) {
-                        return Err(nybl::error_messages::constant_mutation_error(name, line));
-                    }
-                    if recipe.slot_idx().is_none()
-                        && self
-                            .frames
-                            .last()
-                            .is_some_and(|frame| frame.captured_names.contains(name))
-                    {
-                        return Err(nybl::ref_params::captured_ref_target(1, line));
-                    }
                     Some(PreparedReceiverRef::Binding(recipe))
                 }
             }
@@ -3831,6 +3840,100 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         place.root = self.resolved_target_value(&place.target, line)?;
         let _ = self.place_value_from(&place.root, &place.projections, line)?;
         Ok(place)
+    }
+
+    fn resolve_method_place(
+        &self,
+        place: PlaceIdx,
+        indices: Vec<Value>,
+        line: u32,
+    ) -> Result<(Value, Option<ResolvedPlace>), NyblError> {
+        let recipe = self.current_chunk().place(place);
+        let root_recipe = recipe.root;
+        let root_name = self
+            .current_chunk()
+            .name(root_recipe.name_idx())
+            .to_string();
+        let mut indices = indices.into_iter();
+        let mut projections = Vec::with_capacity(recipe.projections.len());
+        for projection in &recipe.projections {
+            projections.push(match projection {
+                PlaceProjectionRecipe::Index => ResolvedPlaceProjection::Index(
+                    indices
+                        .next()
+                        .ok_or_else(|| error(line, "VM: missing mutable-place index"))?,
+                ),
+                PlaceProjectionRecipe::Field(field) => {
+                    ResolvedPlaceProjection::Field(self.current_chunk().name(*field).to_string())
+                }
+            });
+        }
+        if indices.next().is_some() {
+            return Err(error(line, "VM: too many mutable-place indices"));
+        }
+        match self.resolve_target(root_recipe, 0, line, false) {
+            Ok((target, root)) => {
+                let receiver = self.read_place_value_from(&root, &projections, line)?;
+                Ok((
+                    receiver,
+                    Some(ResolvedPlace {
+                        target,
+                        root_recipe,
+                        root_name,
+                        root,
+                        projections,
+                    }),
+                ))
+            }
+            Err(_) if root_recipe.slot_idx().is_none() => {
+                let root = if let Some(entry) = self.lookup_function_entry(&root_name) {
+                    let body: Rc<dyn core::any::Any + 'static> = Rc::new(entry.chunk.clone());
+                    Value::Fn(NyblFn::try_new_compiled_in_module_with_origin_and_modes(
+                        entry.params.clone(),
+                        entry.param_modes.clone(),
+                        Vec::new(),
+                        body,
+                        Some(root_name.clone()),
+                        Some(entry.module_path.clone()),
+                        self.function_origin.clone(),
+                        0,
+                        line,
+                    )?)
+                } else if let Some(module) = self.module_alias(&root_name).cloned() {
+                    Value::Module(module)
+                } else {
+                    let hint = self
+                        .value_candidates_hint(&root_name)
+                        .unwrap_or_else(|| "Did you forget to create it with `let`?".to_string());
+                    return Err(error_with_hint(
+                        line,
+                        nybl::error_messages::variable_not_found(&root_name),
+                        hint,
+                    ));
+                };
+                let receiver = self.read_place_value_from(&root, &projections, line)?;
+                Ok((receiver, None))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn read_place_value_from(
+        &self,
+        root: &Value,
+        projections: &[ResolvedPlaceProjection],
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        let mut value = root.clone();
+        for projection in projections {
+            value = match projection {
+                ResolvedPlaceProjection::Index(index) => {
+                    ops::index_get_in(&value, index, line, &self.memory)?
+                }
+                ResolvedPlaceProjection::Field(field) => self.field_get(&value, field, line)?,
+            };
+        }
+        Ok(value)
     }
 
     fn place_value_from(
@@ -4539,6 +4642,12 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 return Ok(Next::Continue);
             }
             if let Some(callee) = self.module_binding(m, method) {
+                if !matches!(&callee, Value::Fn(_)) {
+                    return Err(error(
+                        line,
+                        format!("`{method}` is a {}, not a function", callee.type_name()),
+                    ));
+                }
                 drop(obj);
                 return self.invoke_value(callee, args, line);
             }
@@ -7581,8 +7690,10 @@ fn validate_prepared_arity(entry: &PreparedEntry, actual: usize) -> Result<(), N
         0,
         if entry.variadic {
             format!(
-                "`{}` expects at least {} arguments, but got {actual}",
-                entry.name, entry.arity
+                "`{}` expects at least {} argument{}, but got {actual}",
+                entry.name,
+                entry.arity,
+                if entry.arity == 1 { "" } else { "s" }
             )
         } else {
             format!(
