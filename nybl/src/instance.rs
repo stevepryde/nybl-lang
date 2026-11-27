@@ -16,6 +16,158 @@ use crate::memory::MemoryContext;
 use crate::{NyblError, NyblHost, NyblLimits, ReplSession, Value};
 use core::cell::Cell;
 
+/// A set of instances that share one set of limits.
+///
+/// Instances loaded into a group (walker or VM) charge one memory account,
+/// so `max_memory` bounds the group's total tracked memory. An operation the
+/// host starts on a grouped instance while another operation of the same
+/// group is running (from inside a host hook) continues that operation's
+/// step count, call depth, and nesting budget, so `max_steps`, the call-depth
+/// cap, and `max_nesting` bound the whole chain of nested instances. An
+/// operation started when none of the group is running starts from zero.
+#[derive(Clone)]
+pub struct InstanceGroup {
+    state: Rc<GroupState>,
+}
+
+struct GroupState {
+    limits: NyblLimits,
+    memory: MemoryContext,
+    /// Operations of this group currently running.
+    active: Cell<usize>,
+    /// Counts published by the innermost running operation before it calls
+    /// a host hook. Steps are in unscaled `max_steps` units.
+    steps: Cell<u64>,
+    call_depth: Cell<usize>,
+    nesting_used: Cell<u32>,
+}
+
+impl InstanceGroup {
+    /// Create an empty group whose instances all run under `limits`.
+    pub fn new(limits: &NyblLimits) -> Self {
+        Self {
+            state: Rc::new(GroupState {
+                limits: limits.clone(),
+                memory: MemoryContext::__new(limits.max_memory),
+                active: Cell::new(0),
+                steps: Cell::new(0),
+                call_depth: Cell::new(0),
+                nesting_used: Cell::new(0),
+            }),
+        }
+    }
+
+    /// The limits every instance of this group runs under.
+    pub fn limits(&self) -> &NyblLimits {
+        &self.state.limits
+    }
+
+    /// The memory account every instance of this group charges.
+    #[doc(hidden)]
+    pub fn __memory(&self) -> &MemoryContext {
+        &self.state.memory
+    }
+
+    /// Start one operation on a grouped instance. An outermost operation
+    /// starts from zero; a nested one continues the counts last published by
+    /// the running operation.
+    #[doc(hidden)]
+    pub fn __begin(&self) -> GroupOperation {
+        let state = &self.state;
+        let outermost = state.active.get() == 0;
+        if outermost {
+            state.steps.set(0);
+            state.call_depth.set(0);
+            state.nesting_used.set(0);
+        }
+        state.active.set(state.active.get() + 1);
+        GroupOperation {
+            group: self.clone(),
+            start: GroupStart {
+                steps: state.steps.get(),
+                call_depth: state.call_depth.get(),
+                nesting_used: state.nesting_used.get(),
+                outermost,
+            },
+        }
+    }
+
+    /// Publish the running operation's counts before a host hook, so an
+    /// operation the hook starts on this group continues them.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __publish(&self, steps: u64, call_depth: usize, nesting_used: u32) {
+        self.state.steps.set(steps);
+        self.state.call_depth.set(call_depth);
+        self.state.nesting_used.set(nesting_used);
+    }
+
+    /// Published step count, in unscaled `max_steps` units.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __steps(&self) -> u64 {
+        self.state.steps.get()
+    }
+
+    /// Record the steps an operation reached when it ends, so the operation
+    /// it was nested in resumes from them.
+    #[doc(hidden)]
+    #[inline]
+    pub fn __set_steps(&self, steps: u64) {
+        self.state.steps.set(steps);
+    }
+}
+
+impl core::fmt::Debug for InstanceGroup {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InstanceGroup")
+            .field("limits", &self.state.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Counts a grouped operation starts from.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct GroupStart {
+    pub steps: u64,
+    pub call_depth: usize,
+    pub nesting_used: u32,
+    /// No other operation of the group was running when this one began.
+    pub outermost: bool,
+}
+
+/// One running operation of an [`InstanceGroup`]. Dropping it ends the
+/// operation and restores the published call depth and nesting to the
+/// values the enclosing operation published, so a later sibling operation
+/// starts from the enclosing operation's own frames.
+#[doc(hidden)]
+pub struct GroupOperation {
+    group: InstanceGroup,
+    start: GroupStart,
+}
+
+impl GroupOperation {
+    #[doc(hidden)]
+    pub fn __group(&self) -> &InstanceGroup {
+        &self.group
+    }
+
+    #[doc(hidden)]
+    pub fn __start(&self) -> GroupStart {
+        self.start
+    }
+}
+
+impl Drop for GroupOperation {
+    fn drop(&mut self) {
+        let state = &self.group.state;
+        state.call_depth.set(self.start.call_depth);
+        state.nesting_used.set(self.start.nesting_used);
+        state.active.set(state.active.get() - 1);
+    }
+}
+
 /// An opaque, pre-resolved public entry point for repeated host dispatch.
 ///
 /// Prepared entries are bound to the exact [`NyblInstance`] that created
@@ -148,6 +300,7 @@ pub struct NyblInstance {
     in_operation: Cell<bool>,
     memory: MemoryContext,
     identity: Rc<()>,
+    group: Option<InstanceGroup>,
 }
 
 impl NyblInstance {
@@ -158,11 +311,48 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
         limits: &NyblLimits,
     ) -> Result<Self, NyblError> {
+        Self::load_with(
+            source,
+            host,
+            limits,
+            MemoryContext::__new(limits.max_memory),
+            None,
+        )
+    }
+
+    /// Like [`Self::load`], but the instance joins `group`: it runs under
+    /// the group's limits, charges the group's memory account, and shares
+    /// step, call-depth, and nesting accounting with operations of the group
+    /// that are running when this instance is called.
+    pub fn load_in(
+        source: &str,
+        host: &mut dyn NyblHost,
+        group: &InstanceGroup,
+    ) -> Result<Self, NyblError> {
+        Self::load_with(
+            source,
+            host,
+            group.limits(),
+            group.__memory().clone(),
+            Some(group),
+        )
+    }
+
+    fn load_with(
+        source: &str,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+        memory: MemoryContext,
+        group: Option<&InstanceGroup>,
+    ) -> Result<Self, NyblError> {
+        let operation = group.map(InstanceGroup::__begin);
+        if memory.__exceeded() {
+            return Err(memory_limit_error());
+        }
         let stmts = crate::parse(source)?;
         crate::check::enforce_disabled_builtins(&stmts, &limits.disabled_builtins)?;
         let mut session = ReplSession::new();
-        let memory = MemoryContext::__new(limits.max_memory);
-        session.run_stmts_in(&stmts, host, limits, &memory)?;
+        session.run_stmts_in(&stmts, host, limits, &memory, operation.as_ref())?;
         if memory.__exceeded() {
             return Err(memory_limit_error());
         }
@@ -174,6 +364,7 @@ impl NyblInstance {
             in_operation: Cell::new(false),
             memory,
             identity: Rc::new(()),
+            group: group.cloned(),
         })
     }
 
@@ -215,14 +406,20 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         let _operation = OperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(InstanceGroup::__begin);
         self.validate_prepared_entry(entry)?;
         validate_prepared_arity(entry, args.len())?;
         if self.memory.__exceeded() {
             return Err(memory_limit_error());
         }
-        let result =
-            self.session
-                .call_prepared_in(&entry.target, args, host, &self.limits, &self.memory);
+        let result = self.session.call_prepared_in(
+            &entry.target,
+            args,
+            host,
+            &self.limits,
+            &self.memory,
+            group.as_ref(),
+        );
         if self.memory.__exceeded() {
             Err(memory_limit_error())
         } else {
@@ -242,6 +439,7 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Vec<Value>, NyblError> {
         let _operation = OperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(InstanceGroup::__begin);
         self.validate_prepared_entry(entry)?;
         if self.memory.__exceeded() {
             return Err(memory_limit_error());
@@ -255,6 +453,7 @@ impl NyblInstance {
             host,
             &self.limits,
             &self.memory,
+            group.as_ref(),
         );
         if self.memory.__exceeded() {
             Err(memory_limit_error())
@@ -282,6 +481,7 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         let _operation = OperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(InstanceGroup::__begin);
         let entry = self
             .entries
             .iter()
@@ -311,9 +511,9 @@ impl NyblInstance {
         if self.memory.__exceeded() {
             return Err(memory_limit_error());
         }
-        let result = self
-            .session
-            .call_named(name, args, host, &self.limits, &self.memory);
+        let result =
+            self.session
+                .call_named(name, args, host, &self.limits, &self.memory, group.as_ref());
         if self.memory.__exceeded() {
             Err(memory_limit_error())
         } else {
@@ -329,6 +529,7 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         let _operation = OperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(InstanceGroup::__begin);
         self.session
             .validate_instance_callable(callable, args.len())?;
         if self.memory.__exceeded() {
@@ -340,6 +541,7 @@ impl NyblInstance {
             host,
             &self.limits,
             &self.memory,
+            group.as_ref(),
         );
         if self.memory.__exceeded() {
             Err(memory_limit_error())
@@ -1273,6 +1475,96 @@ mod tests {
         );
         assert_eq!(instance.memory.__used(), 0);
         assert!(host.retained.borrow().len() >= 8);
+    }
+
+    /// Host whose `ask()` spends steps in a held instance and records whether
+    /// that nested call succeeded.
+    struct AskHost {
+        other: Option<NyblInstance>,
+        spend: i64,
+        outcomes: Vec<Result<(), NyblError>>,
+    }
+
+    impl NyblHost for AskHost {
+        fn call(
+            &mut self,
+            name: &str,
+            _args: &[Value],
+            _line: u32,
+        ) -> Option<Result<Value, NyblError>> {
+            if name != "ask" {
+                return None;
+            }
+            let mut other = self.other.take().expect("instance is not running");
+            let result = other.call("spend", &[Value::Int(self.spend)], &mut Host);
+            self.other = Some(other);
+            self.outcomes
+                .push(result.as_ref().map(|_| ()).map_err(Clone::clone));
+            Some(result)
+        }
+    }
+
+    #[test]
+    fn eval_in_is_the_outermost_operation_of_its_group() {
+        let limits = NyblLimits {
+            max_steps: 1_000,
+            ..NyblLimits::standard()
+        };
+        let spend = "pub fn spend(n) { repeat n { } return 1 }";
+        // About 600 steps here and 600 in the instance: each fits alone.
+        let snippet = "repeat 600 { }\nask()";
+
+        let group = InstanceGroup::new(&limits);
+        let mut host = AskHost {
+            other: Some(NyblInstance::load_in(spend, &mut Host, &group).unwrap()),
+            spend: 600,
+            outcomes: Vec::new(),
+        };
+        let mut session = ReplSession::new();
+        let error = session.eval_in(snippet, &mut host, &group).unwrap_err();
+        assert!(error.is_fatal);
+        assert_eq!(error.message, crate::error_messages::STEP_LIMIT_MESSAGE);
+        let nested = host.outcomes[0].as_ref().unwrap_err();
+        assert_eq!(nested.message, crate::error_messages::STEP_LIMIT_MESSAGE);
+
+        // The next evaluation starts from zero again.
+        host.spend = 300;
+        assert_eq!(
+            session
+                .eval_in("repeat 600 { }\nask()", &mut host, &group)
+                .unwrap()
+                .map(|value| value.inspect()),
+            Some("1".to_string())
+        );
+
+        // Plain `eval` shares nothing with the grouped instance.
+        host.spend = 600;
+        assert!(session.eval(snippet, &mut host, &limits).is_ok());
+        assert!(host.outcomes.last().unwrap().is_ok());
+    }
+
+    #[test]
+    fn eval_in_runs_against_the_group_memory_account() {
+        let limits = NyblLimits {
+            max_steps: 10_000,
+            max_memory: 64,
+            ..NyblLimits::standard()
+        };
+        let group = InstanceGroup::new(&limits);
+        let mut host = ExternalValueHost {
+            value: Some(Value::new_array((0..256).map(Value::Int).collect())),
+        };
+        let mut instance = NyblInstance::load_in(
+            "let stored = none\npub fn keep() { stored = take_external()\n stored.push(1) }",
+            &mut host,
+            &group,
+        )
+        .unwrap();
+        assert!(instance.call("keep", &[], &mut host).is_err());
+        let mut session = ReplSession::new();
+        let error = session.eval_in("1", &mut Host, &group).unwrap_err();
+        assert!(error.is_fatal);
+        assert!(error.message.contains("Memory limit"));
     }
 
     #[test]

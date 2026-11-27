@@ -93,6 +93,54 @@ fn nest(depth: usize, inner: &str, open: &str, close: &str) -> String {
     format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
 }
 
+/// The most calls of `fn d` in `program` whose frames still fit beside the
+/// root, so a module loaded from the deepest frame is what exceeds the
+/// nesting budget (and the call-depth cap leaves room for the load's own
+/// frame).
+fn calls_filling_budget(program: &str) -> usize {
+    let probe = nybl::parse(program).expect("recursion parses");
+    let root = nybl::ast_depth::body_depth(&probe);
+    let frame = probe
+        .iter()
+        .find_map(|statement| match &statement.kind {
+            nybl::parser::StmtKind::FnDecl { name, body, .. } if name == "d" => {
+                Some(nybl::ast_depth::body_depth(body))
+            }
+            _ => None,
+        })
+        .expect("the program declares `fn d`");
+    ((nybl::DEFAULT_MAX_NESTING - root) / frame).min(63) as usize
+}
+
+/// `prelude`, then a recursive `fn d(k)` that runs `locals` and returns
+/// `d(k - 1)` nested in argument position (`open`/`close` around it) at the
+/// deepest parseable depth. At `k == 0` it loads `module`, if any, from the
+/// deepest frame; otherwise it recurses past the nesting budget.
+fn recursive_argument_nesting(
+    prelude: &str,
+    locals: &str,
+    open: &str,
+    close: &str,
+    module: Option<&str>,
+) -> String {
+    let base = match module {
+        Some(module) => format!("use {module}\n        "),
+        None => String::new(),
+    };
+    let program = |calls: usize| {
+        deepest_parseable(125, |depth| {
+            format!(
+                "{prelude}fn d(k) {{\n    if k == 0 {{\n        {base}return 0\n    }}\n    {locals}return {}\n}}\nd({calls})\n",
+                nest(depth, "d(k - 1)", open, close)
+            )
+        })
+    };
+    match module {
+        Some(_) => program(calls_filling_budget(&program(0)) - 1),
+        None => program(100),
+    }
+}
+
 pub fn corpus() -> Vec<Shape> {
     let mut shapes = Vec::new();
 
@@ -172,23 +220,131 @@ pub fn corpus() -> Vec<Shape> {
                 nest(width, "d(k - 1)", "Ok(", ")")
             )
         };
-        // The most calls whose frames still fit beside the root, so the
-        // module load is what exceeds the budget (and the call-depth cap
-        // leaves room for the load's own frame).
-        let probe = nybl::parse(&recursion(0)).expect("recursion parses");
-        let root = nybl::ast_depth::body_depth(&probe);
-        let frame = match &probe[0].kind {
-            nybl::parser::StmtKind::FnDecl { body, .. } => nybl::ast_depth::body_depth(body),
-            _ => unreachable!("the program starts with `fn d`"),
-        };
-        let frames = ((nybl::DEFAULT_MAX_NESTING - root) / frame).min(63) as usize;
         shapes.push(
             Shape::new(
                 &format!("deep_module_at_full_budget_width_{width}"),
-                recursion(frames - 1),
+                recursion(calls_filling_budget(&recursion(0)) - 1),
                 &[NESTING],
             )
             .with_modules(vec![("deep".to_string(), deep_module.clone())]),
+        );
+    }
+
+    // Calls nested in argument position: while each argument runs, the
+    // enclosing call keeps its callee, receiver, and preflighted places on
+    // the native stack. Before the call paths were split up, a user-method
+    // level cost the debug walker about 8 KiB per nesting unit.
+    let lib = ("lib".to_string(), "fn f(x) { return x }\n".to_string());
+    for (name, prelude, locals, open, close) in [
+        (
+            "nested_user_method_args",
+            "struct T { v }\nfn T.m(self, x) { return x }\n",
+            "let t = T { v: 1 }\n    ",
+            "t.m(",
+            ")",
+        ),
+        (
+            "nested_module_alias_args",
+            "use lib as m\n",
+            "",
+            "m.f(",
+            ")",
+        ),
+        (
+            "nested_ref_arg_calls",
+            "fn g(ref a, x) { return x }\n",
+            "let z = 0\n    ",
+            "g(ref z, ",
+            ")",
+        ),
+        (
+            "nested_immediate_lambdas",
+            "",
+            "",
+            "(fn(x) { return x })(",
+            ")",
+        ),
+        (
+            "nested_place_receiver_pushes",
+            "struct H { xs }\n",
+            "let h = H { xs: [] }\n    ",
+            "h.xs.push(",
+            ")",
+        ),
+    ] {
+        shapes.push(
+            Shape::new(
+                name,
+                recursive_argument_nesting(prelude, locals, open, close, None),
+                &[NESTING],
+            )
+            .with_modules(vec![lib.clone()]),
+        );
+    }
+    // The worst of these before the split, filling the budget and then
+    // loading the parse-cap module from its deepest frame.
+    shapes.push(
+        Shape::new(
+            "deep_module_at_full_budget_under_user_method_args",
+            recursive_argument_nesting(
+                "struct T { v }\nfn T.m(self, x) { return x }\n",
+                "let t = T { v: 1 }\n    ",
+                "t.m(",
+                ")",
+                Some("deep"),
+            ),
+            &[NESTING],
+        )
+        .with_modules(vec![("deep".to_string(), deep_module.clone())]),
+    );
+    // The heaviest shapes found for the debug walker: a call nested in the
+    // index of its own `ref` argument (the enclosing call keeps its setup,
+    // staging, and place resolution live), and struct-variant construction.
+    // Each fills the budget and loads the parse-cap module.
+    let ref_lib = (
+        "lib".to_string(),
+        "fn g(ref a, x) { return 0 }\n".to_string(),
+    );
+    for (name, prelude, locals, open, close) in [
+        (
+            "deep_module_at_full_budget_under_method_ref_index_args",
+            "struct C { n }\nfn C.z(self, ref a) { return 0 }\n",
+            "let c = C { n: 0 }\n    let xs = [0]\n    ",
+            "c.z(ref xs[",
+            "])",
+        ),
+        (
+            "deep_module_at_full_budget_under_module_ref_index_args",
+            "use lib as m\n",
+            "let xs = [0]\n    ",
+            "m.g(ref xs[",
+            "], 0)",
+        ),
+        (
+            "deep_module_at_full_budget_under_ref_index_args",
+            "fn g(ref a, x) { return 0 }\n",
+            "let xs = [0]\n    ",
+            "g(ref xs[",
+            "], 0)",
+        ),
+        (
+            "deep_module_at_full_budget_under_enum_struct_variants",
+            "enum E { V { a } }\n",
+            "",
+            "E::V { a: ",
+            " }",
+        ),
+    ] {
+        shapes.push(
+            Shape::new(
+                name,
+                recursive_argument_nesting(prelude, locals, open, close, Some("deep")),
+                &[NESTING],
+            )
+            .with_modules(vec![
+                ref_lib.clone(),
+                ("deep".to_string(), deep_module.clone()),
+            ]),
         );
     }
 

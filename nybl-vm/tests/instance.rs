@@ -1,5 +1,5 @@
 use nybl::value::NyblFn;
-use nybl::{NyblError, NyblHost, NyblLimits, Value};
+use nybl::{NyblError, NyblHost, NyblLimits, StructShape, Value};
 use nybl_vm::NyblInstance;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -1066,4 +1066,992 @@ fn host_calls_may_nest_a_different_instance_without_crossing_state() {
 
     assert_eq!(outer.call("invoke", &[], &mut host).unwrap().inspect(), "1");
     assert_eq!(outer.call("invoke", &[], &mut host).unwrap().inspect(), "2");
+}
+
+// ─── Instance groups and the tick-hook line ───────────────────────
+
+#[derive(Clone, Copy, Debug)]
+enum Engine {
+    Walker,
+    Vm,
+}
+
+const ENGINE_PAIRS: [(Engine, Engine); 4] = [
+    (Engine::Walker, Engine::Walker),
+    (Engine::Vm, Engine::Vm),
+    (Engine::Walker, Engine::Vm),
+    (Engine::Vm, Engine::Walker),
+];
+
+impl Engine {
+    /// `repeat` iterations that cost about `units` of `max_steps`: one
+    /// walker step per iteration, two VM instructions at `STEP_SCALE` 8.
+    fn iterations(self, units: i64) -> Value {
+        Value::Int(match self {
+            Engine::Walker => units,
+            Engine::Vm => units * 4,
+        })
+    }
+}
+
+/// How the two instances of a scenario are loaded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Grouping {
+    Shared,
+    Separate,
+    Ungrouped,
+}
+
+const GROUPINGS: [Grouping; 3] = [Grouping::Shared, Grouping::Separate, Grouping::Ungrouped];
+
+enum Script {
+    Walker(nybl::NyblInstance),
+    Vm(NyblInstance),
+}
+
+impl Script {
+    fn load(
+        engine: Engine,
+        source: &str,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+        group: Option<&nybl::InstanceGroup>,
+    ) -> Result<Self, NyblError> {
+        Ok(match (engine, group) {
+            (Engine::Walker, Some(group)) => {
+                Script::Walker(nybl::NyblInstance::load_in(source, host, group)?)
+            }
+            (Engine::Walker, None) => {
+                Script::Walker(nybl::NyblInstance::load(source, host, limits)?)
+            }
+            (Engine::Vm, Some(group)) => Script::Vm(NyblInstance::load_in(source, host, group)?),
+            (Engine::Vm, None) => Script::Vm(NyblInstance::load(source, host, limits)?),
+        })
+    }
+
+    fn call(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        host: &mut dyn NyblHost,
+    ) -> Result<Value, NyblError> {
+        match self {
+            Script::Walker(instance) => instance.call(name, args, host),
+            Script::Vm(instance) => instance.call(name, args, host),
+        }
+    }
+
+    fn batch(
+        &mut self,
+        name: &str,
+        calls: &[Vec<Value>],
+        host: &mut dyn NyblHost,
+    ) -> Result<Vec<Value>, NyblError> {
+        match self {
+            Script::Walker(instance) => {
+                let entry = instance.prepare_entry(name)?;
+                instance.call_batch(&entry, calls, host)
+            }
+            Script::Vm(instance) => {
+                let entry = instance.prepare_entry(name)?;
+                instance.call_batch(&entry, calls, host)
+            }
+        }
+    }
+}
+
+/// Load instance A and instance B of one scenario.
+fn load_pair(
+    engines: (Engine, Engine),
+    sources: (&str, &str),
+    limits: &NyblLimits,
+    grouping: Grouping,
+) -> (Script, Script) {
+    let shared = nybl::InstanceGroup::new(limits);
+    let other = nybl::InstanceGroup::new(limits);
+    let (group_a, group_b) = match grouping {
+        Grouping::Shared => (Some(&shared), Some(&shared)),
+        Grouping::Separate => (Some(&shared), Some(&other)),
+        Grouping::Ungrouped => (None, None),
+    };
+    let a = Script::load(engines.0, sources.0, &mut Host, limits, group_a).unwrap();
+    let b = Script::load(engines.1, sources.1, &mut Host, limits, group_b).unwrap();
+    (a, b)
+}
+
+/// Host for instance A whose `ask()` runs `entry` on instance B (or a batch
+/// of it) and records B's result.
+struct AskHost {
+    b: Option<Script>,
+    entry: &'static str,
+    args: Vec<Value>,
+    batch: Option<Vec<Vec<Value>>>,
+    /// Hand A `none` instead of B's error.
+    swallow: bool,
+    /// B's outcomes. Values are not retained, so a value B returns has a
+    /// single owner once A holds it.
+    results: Vec<Result<(), NyblError>>,
+    /// Module sources A's `use` resolves.
+    modules: BTreeMap<String, String>,
+}
+
+impl AskHost {
+    fn new(b: Script, entry: &'static str, args: Vec<Value>) -> Self {
+        Self {
+            b: Some(b),
+            entry,
+            args,
+            batch: None,
+            swallow: false,
+            results: Vec::new(),
+            modules: BTreeMap::new(),
+        }
+    }
+
+    fn b_result(&self) -> &Result<(), NyblError> {
+        self.results.last().expect("A asked B")
+    }
+}
+
+impl NyblHost for AskHost {
+    fn call(
+        &mut self,
+        name: &str,
+        _args: &[Value],
+        _line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        if name != "ask" {
+            return None;
+        }
+        let mut b = self.b.take().expect("B is not already running");
+        let result = match &self.batch {
+            Some(calls) => b.batch(self.entry, calls, &mut Host).map(Value::new_array),
+            None => b.call(self.entry, &self.args, &mut Host),
+        };
+        self.b = Some(b);
+        self.results
+            .push(result.as_ref().map(|_| ()).map_err(Clone::clone));
+        Some(match result {
+            Err(_) if self.swallow => Ok(Value::None),
+            other => other,
+        })
+    }
+
+    fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>> {
+        self.modules.get(name).cloned().map(Ok)
+    }
+}
+
+const RECURSE_THEN_ASK: &str =
+    "fn down(n) { if n > 0 { return down(n - 1) } return ask() }\npub fn run(n) { return down(n) }";
+const RECURSE: &str =
+    "fn down(n) { if n > 0 { return down(n - 1) } return 0 }\npub fn run(n) { return down(n) }";
+
+/// Recursing walker scenarios need more native stack than a debug test
+/// thread's default; RUN-002 sizes debug threads at 24 MiB.
+fn on_large_stack(test: impl FnOnce() + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(24 * 1024 * 1024)
+        .spawn(test)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn grouped_nesting_budget_bounds_the_whole_chain_of_instances() {
+    on_large_stack(grouped_nesting_scenarios);
+}
+
+fn grouped_nesting_scenarios() {
+    // A `down` frame charges about seven units: 15 frames fit a budget of
+    // 200 alone, 30 do not.
+    let limits = NyblLimits::standard().with_max_nesting(200);
+    for engines in ENGINE_PAIRS {
+        for grouping in GROUPINGS {
+            let (mut a, b) = load_pair(engines, (RECURSE_THEN_ASK, RECURSE), &limits, grouping);
+            let mut host = AskHost::new(b, "run", vec![Value::Int(15)]);
+            let result = a.call("run", &[Value::Int(15)], &mut host);
+            let context = format!("{engines:?} {grouping:?}");
+            if grouping == Grouping::Shared {
+                let error = host.b_result().as_ref().expect_err(&context);
+                assert_eq!(
+                    error.message,
+                    nybl::error_messages::NESTING_MESSAGE,
+                    "{context}"
+                );
+                assert!(!error.is_fatal, "{context}: nesting errors are catchable");
+                assert_eq!(result.unwrap_err().message, error.message, "{context}");
+            } else {
+                assert_eq!(result.unwrap().inspect(), "0", "{context}");
+            }
+        }
+    }
+}
+
+#[test]
+fn grouped_call_depth_cap_bounds_the_whole_chain_of_instances() {
+    on_large_stack(grouped_call_depth_scenarios);
+}
+
+fn grouped_call_depth_scenarios() {
+    // 41 frames fit the fixed 64-frame cap alone; 82 do not.
+    let limits = NyblLimits::standard();
+    for engines in ENGINE_PAIRS {
+        for grouping in GROUPINGS {
+            let (mut a, b) = load_pair(engines, (RECURSE_THEN_ASK, RECURSE), &limits, grouping);
+            let mut host = AskHost::new(b, "run", vec![Value::Int(40)]);
+            let result = a.call("run", &[Value::Int(40)], &mut host);
+            let context = format!("{engines:?} {grouping:?}");
+            if grouping == Grouping::Shared {
+                let error = host.b_result().as_ref().expect_err(&context);
+                assert_eq!(
+                    error.message,
+                    nybl::error_messages::CALL_DEPTH_MESSAGE,
+                    "{context}"
+                );
+                assert!(!error.is_fatal, "{context}");
+                assert!(result.is_err(), "{context}");
+            } else {
+                assert_eq!(result.unwrap().inspect(), "0", "{context}");
+            }
+        }
+    }
+}
+
+const SPEND_ASK_SPEND: &str = "pub fn run(before, after) { repeat before { }\n ask()\n repeat after { }\n return 1 }\npub fn spend(n) { repeat n { } return 1 }";
+const SPEND: &str = "pub fn spend(n) { repeat n { } return 1 }";
+
+fn is_step_error(error: &NyblError) -> bool {
+    error.is_fatal && error.message == nybl::error_messages::STEP_LIMIT_MESSAGE
+}
+
+#[test]
+fn grouped_steps_bound_the_whole_call_across_engines() {
+    let limits = NyblLimits {
+        max_steps: 1_000,
+        ..NyblLimits::standard()
+    };
+    for (ea, eb) in ENGINE_PAIRS {
+        for grouping in GROUPINGS {
+            let context = format!("{ea:?}/{eb:?} {grouping:?}");
+            // About 600 + 600 units: each fits alone, the sum does not.
+            let (mut a, b) = load_pair((ea, eb), (SPEND_ASK_SPEND, SPEND), &limits, grouping);
+            let mut host = AskHost::new(b, "spend", vec![eb.iterations(600)]);
+            host.swallow = true;
+            let result = a.call("run", &[ea.iterations(600), ea.iterations(10)], &mut host);
+            if grouping == Grouping::Shared {
+                let b_error = host.b_result().as_ref().expect_err(&context);
+                assert!(is_step_error(b_error), "{context}: {b_error:?}");
+                // The host swallowed B's error; A's next tick still fails.
+                let a_error = result.expect_err(&context);
+                assert!(is_step_error(&a_error), "{context}: {a_error:?}");
+            } else {
+                assert!(host.b_result().is_ok(), "{context}");
+                assert_eq!(result.unwrap().inspect(), "1", "{context}");
+            }
+            // After a failed or finished outermost operation, the next
+            // outermost operation starts from zero.
+            let mut b = host.b.take().unwrap();
+            for _ in 0..2 {
+                assert!(
+                    b.call("spend", &[eb.iterations(900)], &mut Host).is_ok(),
+                    "{context}"
+                );
+                assert!(
+                    a.call("spend", &[ea.iterations(900)], &mut Host).is_ok(),
+                    "{context}"
+                );
+            }
+
+            // About 300 + 300 units fit together, so neither engine charges
+            // the other more than the steps it actually used.
+            let (mut a, b) = load_pair((ea, eb), (SPEND_ASK_SPEND, SPEND), &limits, grouping);
+            let mut host = AskHost::new(b, "spend", vec![eb.iterations(300)]);
+            let result = a.call("run", &[ea.iterations(300), ea.iterations(10)], &mut host);
+            assert!(host.b_result().is_ok(), "{context}: {:?}", host.b_result());
+            assert_eq!(result.unwrap().inspect(), "1", "{context}");
+        }
+    }
+}
+
+#[test]
+fn nested_batch_counts_every_item_toward_the_enclosing_operation() {
+    let limits = NyblLimits {
+        max_steps: 1_000,
+        ..NyblLimits::standard()
+    };
+    for (ea, eb) in ENGINE_PAIRS {
+        for grouping in GROUPINGS {
+            let context = format!("{ea:?}/{eb:?} {grouping:?}");
+            // Four items of about 300 units each: each fits alone, all four
+            // together do not.
+            let items = vec![vec![eb.iterations(300)]; 4];
+            let (mut a, b) = load_pair((ea, eb), (SPEND_ASK_SPEND, SPEND), &limits, grouping);
+            let mut host = AskHost::new(b, "spend", Vec::new());
+            host.batch = Some(items.clone());
+            let result = a.call("run", &[Value::Int(0), Value::Int(0)], &mut host);
+            if grouping == Grouping::Shared {
+                let b_error = host.b_result().as_ref().expect_err(&context);
+                assert!(is_step_error(b_error), "{context}: {b_error:?}");
+                assert!(result.is_err(), "{context}");
+            } else {
+                assert!(host.b_result().is_ok(), "{context}");
+                assert!(result.is_ok(), "{context}");
+            }
+            // The same batch as an outermost operation resets per item.
+            let mut b = host.b.take().unwrap();
+            assert_eq!(
+                b.batch("spend", &items, &mut Host).unwrap().len(),
+                4,
+                "{context}"
+            );
+        }
+    }
+}
+
+const KEEP: &str = "let kept = none\npub fn keep(n) { let items = []\n repeat n { items.push(n) }\n kept = items\n return 1 }\npub fn drop_it() { kept = none }";
+
+#[test]
+fn grouped_memory_bounds_the_total_retained_by_all_instances() {
+    for (ea, eb) in ENGINE_PAIRS {
+        let context = format!("{ea:?}/{eb:?}");
+        // Measure what one retained value costs, then allow one and a half.
+        let probe_limits = NyblLimits {
+            max_steps: 100_000,
+            ..NyblLimits::standard()
+        };
+        let probe = nybl::InstanceGroup::new(&probe_limits);
+        let mut one = Script::load(ea, KEEP, &mut Host, &probe_limits, Some(&probe)).unwrap();
+        one.call("keep", &[Value::Int(1_000)], &mut Host).unwrap();
+        let retained = probe.__memory().__used();
+        assert!(retained > 0, "{context}");
+        let limits = NyblLimits {
+            max_memory: retained + retained / 2,
+            ..probe_limits
+        };
+
+        for grouping in GROUPINGS {
+            let context = format!("{context} {grouping:?}");
+            let (mut a, mut b) = load_pair((ea, eb), (KEEP, KEEP), &limits, grouping);
+            assert!(
+                a.call("keep", &[Value::Int(1_000)], &mut Host).is_ok(),
+                "{context}"
+            );
+            let second = b.call("keep", &[Value::Int(1_000)], &mut Host);
+            if grouping == Grouping::Shared {
+                let error = second.expect_err(&context);
+                assert!(
+                    error.is_fatal && error.message.contains("Memory limit"),
+                    "{context}"
+                );
+                // Releasing A's value brings the group back under budget.
+                a.call("drop_it", &[], &mut Host).unwrap();
+                assert!(
+                    b.call("keep", &[Value::Int(1_000)], &mut Host).is_ok(),
+                    "{context}"
+                );
+            } else {
+                assert!(second.is_ok(), "{context}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_value_handed_between_grouped_instances_is_charged_once_without_a_copy() {
+    // 100 pushes leave a backing with spare capacity; copying it on the
+    // first mutation would allocate an exact-size backing and then grow it.
+    let make = "pub fn make() { let items = []\n repeat 100 { items.push(1) }\n return items }";
+    let take = "let kept = none\npub fn take() { let v = ask()\n v.push(0)\n kept = v\n return 1 }";
+    let alone = "let kept = none\nfn make() { let items = []\n repeat 100 { items.push(1) }\n return items }\npub fn take() { let v = make()\n v.push(0)\n kept = v\n return 1 }";
+    let limits = NyblLimits::standard();
+    for (ea, eb) in ENGINE_PAIRS {
+        let context = format!("{ea:?}/{eb:?}");
+        let oracle_group = nybl::InstanceGroup::new(&limits);
+        let mut oracle = Script::load(ea, alone, &mut Host, &limits, Some(&oracle_group)).unwrap();
+        oracle.call("take", &[], &mut Host).unwrap();
+        let expected = oracle_group.__memory().__used();
+
+        let group = nybl::InstanceGroup::new(&limits);
+        let mut a = Script::load(ea, take, &mut Host, &limits, Some(&group)).unwrap();
+        let b = Script::load(eb, make, &mut Host, &limits, Some(&group)).unwrap();
+        let mut host = AskHost::new(b, "make", Vec::new());
+        a.call("take", &[], &mut host).unwrap();
+        assert_eq!(group.__memory().__used(), expected, "{context}");
+    }
+}
+
+#[test]
+fn grouped_instances_run_under_the_group_disabled_builtins() {
+    let group = nybl::InstanceGroup::new(&NyblLimits::standard().with_disabled_builtins(["rand"]));
+    for engine in [Engine::Walker, Engine::Vm] {
+        let error = Script::load(
+            engine,
+            "pub fn roll() { return rand(6) }",
+            &mut Host,
+            &NyblLimits::standard(),
+            Some(&group),
+        )
+        .err()
+        .expect("the group's deny list applies");
+        assert_eq!(
+            error.message, "builtin `rand` is disabled by the host",
+            "{engine:?}"
+        );
+    }
+    let program = nybl_vm::CompiledScript::compile("pub fn roll() { return rand(6) }").unwrap();
+    assert!(NyblInstance::from_compiled_in(&program, &mut Host, &group).is_err());
+}
+
+/// Host for instance A whose `ask()` runs two operations in a row on B:
+/// `first`, then `run`, both with `n`.
+struct SiblingHost {
+    b: Option<Script>,
+    first: &'static str,
+    n: i64,
+    results: Vec<Result<(), NyblError>>,
+}
+
+impl NyblHost for SiblingHost {
+    fn call(
+        &mut self,
+        name: &str,
+        _args: &[Value],
+        _line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        if name != "ask" {
+            return None;
+        }
+        let mut b = self.b.take().expect("B is not already running");
+        for entry in [self.first, "run"] {
+            let result = b.call(entry, &[Value::Int(self.n)], &mut Host);
+            self.results.push(result.map(|_| ()));
+        }
+        self.b = Some(b);
+        Some(Ok(Value::Int(0)))
+    }
+}
+
+/// `run` and `fail` recurse `n` frames and call a host hook (`print`) from
+/// the deepest one; `fail` then raises a catchable error there. An error
+/// unwinds without running another statement, so after `fail` the deepest
+/// counts are the last ones B published.
+const RECURSE_PRINT: &str = "fn down(n, fail) { if n > 0 { return down(n - 1, fail) }\n print(\"bottom\")\n if fail { panic(\"bottom\") }\n return 0 }\npub fn run(n) { return down(n, false) }\npub fn fail(n) { return down(n, true) }";
+
+#[test]
+fn sibling_nested_operations_from_one_hook_each_start_from_the_hook_caller() {
+    on_large_stack(sibling_nested_scenarios);
+}
+
+fn sibling_nested_scenarios() {
+    // Each B operation alone fits the budget from A's shallow frame; two
+    // stacked would not (see the nesting and call-depth scenarios above).
+    // The nesting budget, then the call-depth cap.
+    let cases = [
+        (NyblLimits::standard().with_max_nesting(200), 15),
+        (NyblLimits::standard(), 40),
+    ];
+    for (limits, n) in &cases {
+        for engines in ENGINE_PAIRS {
+            for first in ["run", "fail"] {
+                let context = format!("{engines:?} n={n} first={first}");
+                let (mut a, b) = load_pair(
+                    engines,
+                    ("pub fn run() { return ask() }", RECURSE_PRINT),
+                    limits,
+                    Grouping::Shared,
+                );
+                let mut host = SiblingHost {
+                    b: Some(b),
+                    first,
+                    n: *n,
+                    results: Vec::new(),
+                };
+                assert_eq!(
+                    a.call("run", &[], &mut host).unwrap().inspect(),
+                    "0",
+                    "{context}"
+                );
+                let [first_result, second] = &host.results[..] else {
+                    panic!("{context}: two nested operations ran")
+                };
+                if first == "run" {
+                    assert!(first_result.is_ok(), "{context}: {first_result:?}");
+                } else {
+                    let error = first_result.as_ref().expect_err(&context);
+                    assert_eq!(error.message, "bottom", "{context}");
+                }
+                assert!(second.is_ok(), "{context}: {second:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_nested_call_from_a_module_top_level_continues_the_group_step_count() {
+    let limits = NyblLimits {
+        max_steps: 1_000,
+        ..NyblLimits::standard()
+    };
+    for (ea, eb) in ENGINE_PAIRS {
+        let context = format!("{ea:?}/{eb:?}");
+        // About 100 units before the import and 300 in the module's top
+        // level leave too few for B's 600.
+        let (mut a, b) = load_pair(
+            (ea, eb),
+            (
+                "pub fn run(before) { repeat before { }\n use m\n return 1 }",
+                SPEND,
+            ),
+            &limits,
+            Grouping::Shared,
+        );
+        let mut host = AskHost::new(b, "spend", vec![eb.iterations(600)]);
+        host.swallow = true;
+        host.modules.insert(
+            "m".to_string(),
+            format!("repeat {} {{ }}\nask()", ea.iterations(300).inspect()),
+        );
+        let result = a.call("run", &[ea.iterations(100)], &mut host);
+        let b_error = host.b_result().as_ref().expect_err(&context);
+        assert!(is_step_error(b_error), "{context}: {b_error:?}");
+        assert!(result.is_err(), "{context}");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Hook {
+    Call,
+    Tick,
+    Print,
+    Method,
+    Resolve,
+}
+
+/// Host for instance A that runs `spend(units)` on B once, from `hook`.
+struct HookHost {
+    b: Option<Script>,
+    hook: Hook,
+    units: Value,
+    /// `arm()` was called; the next tick runs B.
+    armed: bool,
+    results: Vec<Result<(), NyblError>>,
+}
+
+impl HookHost {
+    /// Run B from `hook` when it is this host's hook. B's error is recorded
+    /// and not handed to A.
+    fn nest(&mut self, hook: Hook) {
+        if hook == self.hook {
+            let mut b = self.b.take().expect("B is not already running");
+            let result = b.call("spend", std::slice::from_ref(&self.units), &mut Host);
+            self.b = Some(b);
+            self.results.push(result.map(|_| ()));
+        }
+    }
+}
+
+impl NyblHost for HookHost {
+    fn call(
+        &mut self,
+        name: &str,
+        _args: &[Value],
+        _line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        match name {
+            "ask" => self.nest(Hook::Call),
+            "arm" => self.armed = true,
+            _ => return None,
+        }
+        Some(Ok(Value::None))
+    }
+
+    fn on_tick(&mut self) -> Result<(), NyblError> {
+        if core::mem::take(&mut self.armed) {
+            self.nest(Hook::Tick);
+        }
+        Ok(())
+    }
+
+    fn on_print(&mut self, _message: &str) {
+        self.nest(Hook::Print);
+    }
+
+    fn call_method(
+        &mut self,
+        _receiver: &nybl::HostValue,
+        method: &str,
+        _args: &[Value],
+        _line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        (method == "ask").then(|| {
+            self.nest(Hook::Method);
+            Ok(Value::None)
+        })
+    }
+
+    fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>> {
+        (name == "m").then(|| {
+            self.nest(Hook::Resolve);
+            Ok("let loaded = 1".to_string())
+        })
+    }
+}
+
+#[test]
+fn every_host_hook_continues_the_group_step_count() {
+    let limits = NyblLimits {
+        max_steps: 1_000,
+        ..NyblLimits::standard()
+    };
+    let hooks = [
+        (Hook::Call, "ask()"),
+        (Hook::Tick, "arm()"),
+        (Hook::Print, "print(\"x\")"),
+        (Hook::Method, "h.ask()"),
+        (Hook::Resolve, "use m"),
+    ];
+    for (hook, trigger) in hooks {
+        let source = format!(
+            "pub fn run(h, before, after) {{ repeat before {{ }}\n {trigger}\n repeat after {{ }}\n return 1 }}"
+        );
+        for (ea, eb) in ENGINE_PAIRS {
+            for b_units in [400, 700] {
+                let context = format!("{hook:?} {ea:?}/{eb:?} B {b_units}");
+                let (mut a, b) = load_pair((ea, eb), (&source, SPEND), &limits, Grouping::Shared);
+                let mut host = HookHost {
+                    b: Some(b),
+                    hook,
+                    units: eb.iterations(b_units),
+                    armed: false,
+                    results: Vec::new(),
+                };
+                let args = [
+                    Value::new_host("handle", ()),
+                    ea.iterations(400),
+                    ea.iterations(400),
+                ];
+                let result = a.call("run", &args, &mut host);
+                let [b_result] = &host.results[..] else {
+                    panic!("{context}: B ran once")
+                };
+                if b_units == 400 {
+                    // About 400 + 400 fit; A resumes from B's count, so its
+                    // last 400 do not.
+                    assert!(b_result.is_ok(), "{context}: {b_result:?}");
+                } else {
+                    // About 400 + 700 do not fit.
+                    let error = b_result.as_ref().expect_err(&context);
+                    assert!(is_step_error(error), "{context}: {error:?}");
+                }
+                let a_error = result.expect_err(&context);
+                assert!(is_step_error(&a_error), "{context}: {a_error:?}");
+            }
+        }
+    }
+}
+
+/// Host whose `on_tick` fails on its `fail_on`-th call with `line`.
+struct FailingTickHost {
+    ticks: u64,
+    fail_on: u64,
+    line: u32,
+    modules: BTreeMap<String, String>,
+}
+
+impl FailingTickHost {
+    fn new(fail_on: u64, line: u32) -> Self {
+        Self {
+            ticks: 0,
+            fail_on,
+            line,
+            modules: BTreeMap::new(),
+        }
+    }
+}
+
+impl NyblHost for FailingTickHost {
+    fn call(
+        &mut self,
+        _name: &str,
+        _args: &[Value],
+        _line: u32,
+    ) -> Option<Result<Value, NyblError>> {
+        None
+    }
+
+    fn on_tick(&mut self) -> Result<(), NyblError> {
+        self.ticks += 1;
+        if self.ticks == self.fail_on {
+            Err(NyblError::fatal("host stop", self.line))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn resolve_module(&mut self, name: &str) -> Option<Result<String, NyblError>> {
+        self.modules.get(name).cloned().map(Ok)
+    }
+}
+
+/// Load `source` with an inert tick hook, then call `run` with the hook
+/// armed to fail on its `host.fail_on`-th tick.
+fn run_with_tick_host(
+    engine: Engine,
+    source: &str,
+    host: &mut FailingTickHost,
+    limits: &NyblLimits,
+) -> NyblError {
+    let fail_on = core::mem::replace(&mut host.fail_on, u64::MAX);
+    let mut instance = Script::load(engine, source, host, limits, None).unwrap();
+    host.ticks = 0;
+    host.fail_on = fail_on;
+    instance.call("run", &[], host).unwrap_err()
+}
+
+const NESTED_LOOPS: &str = "fn inner(n) {
+  let total = 0
+  repeat n {
+    total += 1
+  }
+  return total
+}
+pub fn run() {
+  let count = 0
+  while true {
+    count += inner(5)
+  }
+}";
+
+#[test]
+fn line_less_tick_hook_error_reports_the_outermost_active_loop_header() {
+    for engine in [Engine::Walker, Engine::Vm] {
+        for fail_on in [3, 40, 41, 200] {
+            let mut host = FailingTickHost::new(fail_on, 0);
+            let error =
+                run_with_tick_host(engine, NESTED_LOOPS, &mut host, &NyblLimits::standard());
+            assert_eq!(error.message, "host stop");
+            // `while true` is on line 10.
+            assert_eq!(error.line, Some(10), "{engine:?} tick {fail_on}");
+            assert_eq!(error.column, None);
+        }
+    }
+}
+
+#[test]
+fn line_less_tick_hook_error_without_a_loop_reports_the_current_statement() {
+    let source = "pub fn run() {\n  let a = 1\n  let b = a + 1\n  let c = b + 1\n  return c\n}";
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut host = FailingTickHost::new(2, 0);
+        let error = run_with_tick_host(engine, source, &mut host, &NyblLimits::standard());
+        assert_eq!(error.message, "host stop");
+        let line = error.line.expect("a line is reported");
+        assert!((2..=5).contains(&line), "{engine:?}: line {line}");
+    }
+}
+
+#[test]
+fn tick_hook_error_with_an_explicit_line_is_unchanged() {
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut host = FailingTickHost::new(40, 77);
+        let error = run_with_tick_host(engine, NESTED_LOOPS, &mut host, &NyblLimits::standard());
+        assert_eq!(error.line, Some(77), "{engine:?}");
+    }
+}
+
+#[test]
+fn tick_hook_error_in_a_module_loop_has_the_step_limit_error_owner_and_line() {
+    let root = "use lib\npub fn run() {\n  return spin()\n}";
+    let lib = "let ready = true\nfn spin() {\n  let n = 0\n  while ready {\n    n += 1\n  }\n}";
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut builtin_host = FailingTickHost::new(u64::MAX, 0);
+        builtin_host.modules.insert("lib".into(), lib.into());
+        let limits = NyblLimits {
+            max_steps: 500,
+            ..NyblLimits::standard()
+        };
+        let builtin = run_with_tick_host(engine, root, &mut builtin_host, &limits);
+        assert!(is_step_error(&builtin), "{engine:?}: {builtin:?}");
+
+        let mut hook_host = FailingTickHost::new(100, 0);
+        hook_host.modules.insert("lib".into(), lib.into());
+        let hooked = run_with_tick_host(engine, root, &mut hook_host, &NyblLimits::standard());
+        assert_eq!(hooked.message, "host stop");
+        let owner = |error: &NyblError| {
+            error
+                .source_context
+                .as_ref()
+                .map(|context| context.module_path.clone())
+        };
+        assert_eq!(owner(&builtin).as_deref(), Some("lib"), "{engine:?}");
+        assert_eq!(owner(&hooked), owner(&builtin), "{engine:?}");
+        // `while ready` is on line 4 of the module.
+        assert_eq!(builtin.line, Some(4), "{engine:?}");
+        assert_eq!(hooked.line, builtin.line, "{engine:?}");
+    }
+}
+
+// ─── Host-built struct shapes ─────────────────────────────────────
+
+const POINT_SCRIPT: &str = "struct Point { x, y }
+pub fn bump(p) { p.x = p.x + 10\n return p }
+pub fn same(p) { return p == Point { x: 1, y: 2 } }
+pub fn is_point(p) { let r = match p { Point { x, y } => true, _ => false }\n return r }";
+
+fn point(module_path: &str, x: i64, y: i64) -> Value {
+    let shape = StructShape::new(module_path, "Point", ["x", "y"]);
+    Value::try_new_struct_from_shape(&shape, vec![Value::Int(x), Value::Int(y)], 0).unwrap()
+}
+
+#[test]
+fn host_built_struct_values_are_read_written_and_returned_by_scripts() {
+    let original = point(nybl::value::ROOT_MODULE_PATH, 1, 2);
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut script = Script::load(
+            engine,
+            POINT_SCRIPT,
+            &mut Host,
+            &NyblLimits::standard(),
+            None,
+        )
+        .unwrap();
+        let returned = script
+            .call("bump", std::slice::from_ref(&original), &mut Host)
+            .unwrap();
+        let Value::Struct(returned) = returned else {
+            panic!("{engine:?}: expected a struct, got {returned:?}")
+        };
+        assert!(
+            matches!(returned.values(), [Value::Int(11), Value::Int(2)]),
+            "{engine:?}"
+        );
+        assert!(
+            matches!(returned.field("x"), Some(Value::Int(11))),
+            "{engine:?}"
+        );
+        assert!(
+            matches!(returned.field("y"), Some(Value::Int(2))),
+            "{engine:?}"
+        );
+        // The script's write detached its copy; the host's value is untouched.
+        let Value::Struct(original) = &original else {
+            unreachable!()
+        };
+        assert!(
+            matches!(original.values(), [Value::Int(1), Value::Int(2)]),
+            "{engine:?}"
+        );
+    }
+}
+
+#[test]
+fn host_built_struct_identity_is_module_path_and_type_name() {
+    let root = point(nybl::value::ROOT_MODULE_PATH, 1, 2);
+    let elsewhere = point("elsewhere", 1, 2);
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut script = Script::load(
+            engine,
+            POINT_SCRIPT,
+            &mut Host,
+            &NyblLimits::standard(),
+            None,
+        )
+        .unwrap();
+        let mut ask = |entry: &str, value: &Value| {
+            script
+                .call(entry, std::slice::from_ref(value), &mut Host)
+                .unwrap()
+                .inspect()
+        };
+        assert_eq!(ask("same", &root), "true", "{engine:?}");
+        assert_eq!(ask("is_point", &root), "true", "{engine:?}");
+        assert_eq!(ask("same", &elsewhere), "false", "{engine:?}");
+        assert_eq!(ask("is_point", &elsewhere), "false", "{engine:?}");
+    }
+}
+
+#[test]
+fn script_struct_values_charge_for_their_values_not_their_names() {
+    let make = |type_name: &str, first: &str, second: &str| {
+        format!(
+            "struct {type_name} {{ {first}, {second} }}\nlet kept = []\npub fn make(n) {{ repeat n {{ kept.push({type_name} {{ {first}: 1, {second}: 2 }}) }}\n return kept.len() }}"
+        )
+    };
+    let short = make("P", "a", "b");
+    let long = make(
+        "PointWithAVeryLongDescriptiveTypeName",
+        "first_field_with_a_long_descriptive_name",
+        "second_field_with_a_long_descriptive_name",
+    );
+    let limits = NyblLimits::standard();
+    for engine in [Engine::Walker, Engine::Vm] {
+        let retained = |source: &str| {
+            let group = nybl::InstanceGroup::new(&limits);
+            let mut script =
+                Script::load(engine, source, &mut Host, &limits, Some(&group)).unwrap();
+            let before = group.__memory().__used();
+            script.call("make", &[Value::Int(50)], &mut Host).unwrap();
+            group.__memory().__used() - before
+        };
+        let short_bytes = retained(&short);
+        assert!(short_bytes > 0, "{engine:?}");
+        assert_eq!(retained(&long), short_bytes, "{engine:?}");
+    }
+}
+
+const SHAPE_METHODS_SCRIPT: &str = "struct Point { x, y }
+fn Point.sum(self) { return self.x + self.y }
+fn Point.scale(ref self, k) { self.x = self.x * k\n self.y = self.y * k }
+pub fn sum(p) { return p.sum() }
+pub fn scaled(p) { p.scale(3)\n return [p.sum(), p] }";
+
+#[test]
+fn host_built_struct_values_dispatch_script_methods() {
+    let original = point(nybl::value::ROOT_MODULE_PATH, 1, 2);
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut script = Script::load(
+            engine,
+            SHAPE_METHODS_SCRIPT,
+            &mut Host,
+            &NyblLimits::standard(),
+            None,
+        )
+        .unwrap();
+        let mut ask = |entry: &str| {
+            script
+                .call(entry, std::slice::from_ref(&original), &mut Host)
+                .unwrap()
+                .inspect()
+        };
+        assert_eq!(ask("sum"), "3", "{engine:?}");
+        assert_eq!(ask("scaled"), "[9, Point { x: 3, y: 6 }]", "{engine:?}");
+    }
+}
+
+#[test]
+fn caught_runtime_errors_of_one_instance_share_one_shape() {
+    let source = "fn fail() { panic(\"stop\") }
+pub fn caught() { let r = try_call(fail)
+ let e = match r { Result::Err(e) => e, _ => none }
+ return e }";
+    for engine in [Engine::Walker, Engine::Vm] {
+        let mut script =
+            Script::load(engine, source, &mut Host, &NyblLimits::standard(), None).unwrap();
+        let first = script.call("caught", &[], &mut Host).unwrap();
+        let second = script.call("caught", &[], &mut Host).unwrap();
+        let (Value::Struct(first), Value::Struct(second)) = (&first, &second) else {
+            panic!("{engine:?}: expected two RuntimeError structs, got {first:?} and {second:?}")
+        };
+        assert_eq!(first.shape().type_name(), "RuntimeError", "{engine:?}");
+        assert!(
+            matches!(first.field("message"), Some(Value::Str(_))),
+            "{engine:?}"
+        );
+        // One shared shape means one field-name allocation for both values.
+        assert!(
+            std::ptr::eq(first.shape().field_names(), second.shape().field_names()),
+            "{engine:?}"
+        );
+    }
 }

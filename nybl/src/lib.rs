@@ -211,10 +211,12 @@ mod evaluator;
 
 pub use error::NyblError;
 pub use error::NyblWarning;
-pub use instance::{EntryPoint, NyblInstance, PreparedEntry};
+pub use instance::{EntryPoint, InstanceGroup, NyblInstance, PreparedEntry};
+#[doc(hidden)]
+pub use instance::{GroupOperation, GroupStart};
 pub use parser::{ParamMode, Stmt, count_instructions};
 pub use ref_params::{validate_call_modes, validate_value_only_call_modes};
-pub use value::{HostValue, Value};
+pub use value::{HostValue, StructShape, Value};
 pub use value_conversion::{FromValue, IntoValue, ValueConversionError, ValuePathSegment};
 
 /// The core pattern matcher. Re-exported so engines beyond the
@@ -373,6 +375,12 @@ pub trait NyblHost {
     }
 
     /// Called each tick. Return `Err` to halt execution.
+    ///
+    /// An error whose `line` is `None` or `Some(0)` is reported at the line
+    /// the engine would use for its own step-limit error at that tick (the
+    /// outermost active source loop's header, else the current statement in
+    /// the walker and VM; the checkpoint's line in AOT output), and takes the
+    /// same module ownership. A non-zero line is kept. `column` is not set.
     fn on_tick(&mut self) -> Result<(), NyblError> {
         Ok(())
     }

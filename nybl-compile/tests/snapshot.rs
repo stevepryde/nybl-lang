@@ -505,7 +505,7 @@ let r = Shape::Rect { w: [3] }"#,
     contains_all(
         &out,
         &[
-            "Value::__try_new_struct_in(",
+            "Value::__try_new_struct_from_shape_in(",
             "], 3, &ctx.memory)?",
             "Value::__try_new_enum_tuple_in(",
             "], 4, &ctx.memory)?",
@@ -1558,7 +1558,7 @@ fn nested_type_sites_emit_static_descriptors_and_o1_runtime_lookup() {
             "__nybl_register_struct(ctx, \"<root>\", \"Point\", __NYBL_STRUCT_SITE_0",
             "__nybl_register_enum(ctx, \"<root>\", \"Signal\", __NYBL_ENUM_SITE_1",
             ".get(module)\n        .and_then(|defs| defs.get(type_name))",
-            "__nybl_struct_fields(ctx, &__module_path, \"Point\"",
+            "__nybl_struct_def(ctx, &__module_path, \"Point\"",
             "__nybl_enum_variant_shape(ctx, &__module_path, \"Signal\", \"Pair\"",
         ],
     );
@@ -1728,9 +1728,9 @@ if true {
 
     assert!(out.contains("__nybl_validate_namespace_type(&__nybl_user_value_7479706573"));
     assert!(out.contains("\"types\", \"Point\", 8)?; \"second\".to_string()"));
-    assert!(out.contains(
-        "let __declared_fields = __nybl_struct_fields(ctx, &__module_path, \"Point\", 8)?;"
-    ));
+    assert!(
+        out.contains("let __struct_def = __nybl_struct_def(ctx, &__module_path, \"Point\", 8)?;")
+    );
 }
 
 #[test]

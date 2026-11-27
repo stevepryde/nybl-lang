@@ -83,7 +83,7 @@ pub(super) const CTX_BASE: &str = r#"pub struct Ctx<'h> {
     >,
     pub struct_defs: ::std::collections::HashMap<
         ::std::string::String,
-        ::std::collections::HashMap<::std::string::String, &'static [&'static str]>,
+        ::std::collections::HashMap<::std::string::String, __NyblStructDef>,
     >,
     pub enum_defs: ::std::collections::HashMap<
         ::std::string::String,
@@ -120,7 +120,7 @@ struct __NyblState {
     >,
     struct_defs: ::std::collections::HashMap<
         ::std::string::String,
-        ::std::collections::HashMap<::std::string::String, &'static [&'static str]>,
+        ::std::collections::HashMap<::std::string::String, __NyblStructDef>,
     >,
     enum_defs: ::std::collections::HashMap<
         ::std::string::String,
@@ -217,7 +217,13 @@ fn __nybl_tick(ctx: &mut Ctx<'_>, line: u32) -> Result<(), ::nybl::error::NyblEr
             "Your code is using too much memory. Check for large strings or arrays growing in loops.",
         ));
     }
-    ctx.host.on_tick()?;
+    if let Err(mut error) = ctx.host.on_tick() {
+        // A line-less host error is reported where a step-limit error would be.
+        if matches!(error.line, None | Some(0)) {
+            error.line = Some(line);
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -889,6 +895,14 @@ struct __NyblDeclarationAliasBinding {
     cached: ::std::option::Option<::nybl::value::Value>,
 }
 
+/// A registered struct declaration: its field list plus the shape every
+/// value constructed from it shares.
+#[derive(Clone)]
+pub struct __NyblStructDef {
+    fields: &'static [&'static str],
+    shape: ::nybl::value::StructShape,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum __NyblDynamicVariantShape {
     Unit,
@@ -915,9 +929,8 @@ fn __nybl_register_struct(
         .struct_defs
         .get(module)
         .and_then(|defs| defs.get(type_name))
-        .copied()
     {
-        if existing == fields {
+        if existing.fields == fields {
             return Ok(());
         }
         return Err(::nybl::error::NyblError::runtime(
@@ -925,10 +938,11 @@ fn __nybl_register_struct(
             line,
         ));
     }
+    let shape = ::nybl::value::StructShape::new(module, type_name, fields.iter().copied());
     ctx.struct_defs
         .entry(module.to_string())
         .or_default()
-        .insert(type_name.to_string(), fields);
+        .insert(type_name.to_string(), __NyblStructDef { fields, shape });
     Ok(())
 }
 
@@ -1009,16 +1023,16 @@ fn __nybl_register_enum(
     Ok(())
 }
 
-fn __nybl_struct_fields(
+fn __nybl_struct_def(
     ctx: &Ctx<'_>,
     module: &str,
     type_name: &str,
     line: u32,
-) -> Result<&'static [&'static str], ::nybl::error::NyblError> {
+) -> Result<__NyblStructDef, ::nybl::error::NyblError> {
     ctx.struct_defs
         .get(module)
         .and_then(|defs| defs.get(type_name))
-        .copied()
+        .cloned()
         .ok_or_else(|| ::nybl::error::NyblError::runtime(
             ::nybl::error_messages::struct_not_declared(type_name),
             line,
@@ -1082,7 +1096,7 @@ fn __nybl_clear_module_type_defs(ctx: &mut Ctx<'_>, module: &str) {
 
 struct __NyblModuleTypeDefs {
     structs: ::std::option::Option<
-        ::std::collections::HashMap<::std::string::String, &'static [&'static str]>,
+        ::std::collections::HashMap<::std::string::String, __NyblStructDef>,
     >,
     enums: ::std::option::Option<
         ::std::collections::HashMap<
@@ -1451,7 +1465,9 @@ fn __nybl_try_call(
             if err.is_fatal {
                 Err(err)
             } else {
-                Ok(::nybl::builtins::make_try_call_err_in(&err, &ctx.memory))
+                __nybl_struct_def(ctx, "<builtin>", "RuntimeError", line).map(|def| {
+                    ::nybl::builtins::make_try_call_err_in(&err, &def.shape, &ctx.memory)
+                })
             }
         }
     };
@@ -1588,8 +1604,7 @@ fn __nybl_field_get(
                 ::nybl::error_messages::struct_has_no_field(s.type_name(), field),
                 line,
             );
-            let names = s.fields().iter().map(|(k, _)| k.as_str());
-            if let Some(hint) = ::nybl::suggest::did_you_mean(field, names) {
+            if let Some(hint) = ::nybl::suggest::did_you_mean(field, s.shape().field_names()) {
                 err.friendly_hint = Some(hint);
             }
             err
@@ -1750,6 +1765,23 @@ fn __nybl_validate_named_fields(
         }
     }
     Ok(())
+}
+
+/// Order evaluated struct field values by declaration. The provided names
+/// were validated against `declared` before the values were evaluated.
+fn __nybl_order_struct_fields(
+    declared: &[&str],
+    mut provided: ::std::vec::Vec<(&'static str, ::nybl::value::Value)>,
+) -> ::std::vec::Vec<::nybl::value::Value> {
+    let mut ordered = ::std::vec::Vec::with_capacity(declared.len());
+    for field in declared {
+        let index = provided
+            .iter()
+            .position(|(name, _)| name == field)
+            .expect("dynamic construction shape was validated before payload evaluation");
+        ordered.push(provided.swap_remove(index).1);
+    }
+    ordered
 }
 
 fn __nybl_order_named_fields(

@@ -135,3 +135,15 @@ fn host_values_round_trip_through_conversion_traits_by_identity() {
         Some("secret")
     );
 }
+
+#[test]
+fn shape_built_structs_reject_a_value_count_that_does_not_match_the_shape() {
+    let shape = nybl::StructShape::new("<root>", "Point", ["x", "y"]);
+    for values in [
+        vec![Value::Int(1)],
+        vec![Value::Int(1), Value::Int(2), Value::Int(3)],
+    ] {
+        let error = Value::try_new_struct_from_shape(&shape, values, 4).unwrap_err();
+        assert!(!error.is_fatal, "{error:?}");
+    }
+}

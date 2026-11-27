@@ -68,7 +68,7 @@ use nybl::import_scope::{ImportScope, ImportedName};
 use nybl::methods;
 use nybl::ops;
 use nybl::parser::{ParamMode, Visibility};
-use nybl::value::{FnBody, NyblFn, NyblFnOrigin, Value};
+use nybl::value::{FnBody, NyblFn, NyblFnOrigin, StructShape, Value};
 use nybl::{EntryPoint, NyblHost, NyblLimits};
 
 use crate::chunk::{
@@ -86,6 +86,16 @@ const MAX_CALL_DEPTH: usize = 64;
 /// that `while true { }` still halts under `NyblLimits::demo()` and
 /// small programs like fizzbuzz don't exhaust `standard()`.
 const STEP_SCALE: u64 = 8;
+
+/// Convert a VM step count to the unscaled count an [`nybl::InstanceGroup`]
+/// shares, rounding up so sharing never grants extra steps.
+fn vm_steps_to_group(steps: u64) -> u64 {
+    steps.div_ceil(STEP_SCALE)
+}
+
+fn group_steps_to_vm(steps: u64) -> u64 {
+    steps.saturating_mul(STEP_SCALE)
+}
 
 /// Memory-limit check cadence. Checked every `1 << N` ticks; a
 /// power-of-two window lets us AND with a mask instead of
@@ -461,10 +471,10 @@ fn shapes_match(a: &[(String, EnumVariantShape)], b: &[(String, EnumVariantShape
 
 type TypeKey = (String, String);
 type RuntimeEnumVariants = Vec<(String, EnumVariantShape)>;
-type StructTypeTable = BTreeMap<TypeKey, Vec<String>>;
+type StructTypeTable = BTreeMap<TypeKey, StructShape>;
 type EnumTypeTable = BTreeMap<TypeKey, RuntimeEnumVariants>;
 type BuiltinTypeTables = (StructTypeTable, EnumTypeTable, BTreeMap<String, String>);
-type ModuleStructDef = (TypeKey, Vec<String>);
+type ModuleStructDef = (TypeKey, StructShape);
 type ModuleEnumDef = (TypeKey, RuntimeEnumVariants);
 type ModuleMethodDef = (TypeKey, String, Rc<FnEntry>);
 
@@ -483,13 +493,17 @@ type ModuleMethodDef = (TypeKey, String, Rc<FnEntry>);
 fn seed_builtin_types() -> BuiltinTypeTables {
     use nybl::parser::VariantKind;
     let builtin_mp = nybl::value::BUILTIN_MODULE_PATH.to_string();
-    let mut struct_defs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut struct_defs: StructTypeTable = BTreeMap::new();
     let mut enum_defs: BTreeMap<(String, String), Vec<(String, EnumVariantShape)>> =
         BTreeMap::new();
     let mut bindings: BTreeMap<String, String> = BTreeMap::new();
     struct_defs.insert(
         (builtin_mp.clone(), String::from("RuntimeError")),
-        nybl::builtins::builtin_runtime_error_fields(),
+        StructShape::new(
+            builtin_mp.clone(),
+            "RuntimeError",
+            nybl::builtins::builtin_runtime_error_fields(),
+        ),
     );
     bindings.insert(String::from("RuntimeError"), builtin_mp.clone());
     let variants: Vec<(String, EnumVariantShape)> = nybl::builtins::builtin_result_variants()
@@ -758,7 +772,7 @@ pub struct Vm<'h, H: NyblHost + ?Sized> {
     /// `(module_path, type_name)`. Populated by
     /// `DefineStruct` (which tags with `current_module`) and
     /// merged from imported modules via `exec_use`.
-    struct_defs: BTreeMap<(String, String), Vec<String>>,
+    struct_defs: StructTypeTable,
     /// Declared enum types, same `(module_path, type_name)`
     /// keying as `struct_defs`.
     enum_defs: BTreeMap<(String, String), Vec<(String, EnumVariantShape)>>,
@@ -798,6 +812,9 @@ pub struct Vm<'h, H: NyblHost + ?Sized> {
     live_value_environments: LiveValueEnvironments,
     binding_origins: BTreeMap<String, BindingOrigin>,
     live_binding_origins: LiveBindingOrigins,
+    /// Instance group this operation belongs to. Its counts are published
+    /// around every host hook so a nested grouped operation continues them.
+    group: Option<nybl::InstanceGroup>,
 }
 
 struct VmState {
@@ -809,7 +826,7 @@ struct VmState {
     compiled_modules: Option<CompiledModuleGraph>,
     import_scopes: Vec<ImportScope>,
     current_module: String,
-    struct_defs: BTreeMap<(String, String), Vec<String>>,
+    struct_defs: StructTypeTable,
     enum_defs: BTreeMap<(String, String), Vec<(String, EnumVariantShape)>>,
     user_methods: BTreeMap<(String, String), BTreeMap<String, Rc<FnEntry>>>,
     type_exports: BTreeMap<String, String>,
@@ -834,6 +851,7 @@ pub struct NyblInstance {
     in_operation: Cell<bool>,
     memory: nybl::memory::MemoryContext,
     identity: Rc<()>,
+    group: Option<nybl::InstanceGroup>,
 }
 
 /// An opaque, pre-resolved public entry point for repeated VM dispatch.
@@ -956,6 +974,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             live_value_environments: module_runtime.environments,
             binding_origins: BTreeMap::new(),
             live_binding_origins: module_runtime.origins,
+            group: None,
         }
     }
 
@@ -1029,6 +1048,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             live_value_environments: state.live_value_environments,
             binding_origins: state.binding_origins,
             live_binding_origins: state.live_binding_origins,
+            group: None,
         }
     }
 
@@ -1180,8 +1200,64 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 "Your code is using too much memory. Check for large strings or arrays growing in loops.",
             ));
         }
-        self.host.on_tick()?;
+        if let Err(error) = self.host_hook(|host| host.on_tick()) {
+            return Err(self.tick_hook_error(error, line));
+        }
         Ok(())
+    }
+
+    /// Give a line-less `on_tick` error the line a step-limit error would
+    /// report at this tick.
+    #[cold]
+    fn tick_hook_error(&self, mut error: NyblError, line: u32) -> NyblError {
+        if matches!(error.line, None | Some(0)) {
+            error.line = Some(self.active_loop_line().unwrap_or(line));
+        }
+        error
+    }
+
+    /// Run one host hook. In an instance group, publish this operation's
+    /// counts first so an operation the hook starts on the group continues
+    /// them, and resume from the steps that operation reached.
+    #[inline]
+    fn host_hook<R>(&mut self, hook: impl FnOnce(&mut H) -> R) -> R {
+        if let Some(group) = &self.group {
+            let published = vm_steps_to_group(self.steps);
+            group.__publish(published, self.active_call_depth(), self.nesting_used());
+            let result = hook(self.host);
+            // Adopt the shared count only when a nested operation advanced
+            // it, so rounding at this boundary never inflates our own count.
+            let after = group.__steps();
+            if after != published {
+                self.steps = group_steps_to_vm(after);
+            }
+            result
+        } else {
+            hook(self.host)
+        }
+    }
+
+    /// Join a group operation: continue the enclosing operation's steps,
+    /// call depth, and nesting (all zero for an outermost operation).
+    fn join_group(&mut self, operation: Option<&nybl::GroupOperation>) {
+        let Some(operation) = operation else {
+            return;
+        };
+        let start = operation.__start();
+        self.group = Some(operation.__group().clone());
+        self.steps = group_steps_to_vm(start.steps);
+        self.call_depth_base = start.call_depth;
+        if let Some(root) = self.frames.first_mut() {
+            root.nesting_total = root.nesting_total.saturating_add(start.nesting_used);
+        }
+    }
+
+    /// Record this operation's final steps so the operation it is nested in
+    /// resumes from them.
+    fn finish_group(&self) {
+        if let Some(group) = &self.group {
+            group.__set_steps(vm_steps_to_group(self.steps));
+        }
     }
 
     /// Header line of the outermost source loop the VM is currently
@@ -3486,7 +3562,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let next = match prepared.callable {
             PreparedCallable::User(entry) => self.enter_user_fn_args(entry, args, line)?,
             PreparedCallable::HostThenUser { name, entry } => {
-                if let Some(result) = self.host.call(&name, &args, line) {
+                if let Some(result) = self.host_hook(|host| host.call(&name, &args, line)) {
                     self.push_value(result?);
                     return Ok(Next::Continue);
                 }
@@ -3951,8 +4027,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
             "print" => {
                 let message = nybl::formatting::__format_values_in(&args, " ", line, &self.memory)?;
-                self.host.on_print(&message);
-                if let Some(error) = self.host.print_error(line) {
+                if let Some(error) = self.host_hook(|host| {
+                    host.on_print(&message);
+                    host.print_error(line)
+                }) {
                     return Err(error);
                 }
                 self.push_value(Value::None);
@@ -3966,7 +4044,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
             _ => {}
         }
-        let host_result = self.host.call(name, &args, line);
+        let host_result = self.host_hook(|host| host.call(name, &args, line));
         if let Some(result) = host_result {
             self.push_value(result?);
             return Ok(Next::Continue);
@@ -3978,7 +4056,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 hint,
             ));
         }
-        let host_hint = self.host.function_hint().to_string();
+        let host_hint = self.host_hook(|host| host.function_hint().to_string());
         Err(if host_hint.is_empty() {
             error(line, nybl::error_messages::function_not_found(name))
         } else {
@@ -4131,8 +4209,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             }
             "print" => {
                 let message = nybl::formatting::__format_values_in(&args, " ", line, &self.memory)?;
-                self.host.on_print(&message);
-                if let Some(error) = self.host.print_error(line) {
+                if let Some(error) = self.host_hook(|host| {
+                    host.on_print(&message);
+                    host.print_error(line)
+                }) {
                     return Err(error);
                 }
                 self.push_value(Value::None);
@@ -4152,7 +4232,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
 
         // 2. Host-provided builtins.
-        let host_result = self.host.call(name, &args, line);
+        let host_result = self.host_hook(|host| host.call(name, &args, line));
         if let Some(result) = host_result {
             let v = result?;
             self.push_value(v);
@@ -4171,7 +4251,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 hint,
             ));
         }
-        let host_hint = self.host.function_hint().to_string();
+        let host_hint = self.host_hook(|host| host.function_hint().to_string());
         Err(if host_hint.is_empty() {
             error(line, nybl::error_messages::function_not_found(name))
         } else {
@@ -4546,7 +4626,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             Value::Bool(_) => methods::bool_method(&obj, method, &args, line)?,
             Value::Iter(_) => methods::iter_method_in(&obj, method, &args, line, &self.memory)?,
             Value::Host(value) => {
-                let result = self.host.call_method(value, method, &args, line);
+                let result = self.host_hook(|host| host.call_method(value, method, &args, line));
                 match result {
                     Some(result) => (result?, None),
                     None => {
@@ -4608,7 +4688,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // on matching shape and an error otherwise.
         let key = (self.current_module.clone(), def.name.clone());
         if let Some(existing) = self.struct_defs.get(&key) {
-            if existing == &def.fields {
+            if existing.field_names() == def.fields.as_slice() {
                 self.bind_local_type(&def.name);
                 return Ok(());
             }
@@ -4617,7 +4697,10 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 format!("Struct `{}` is already declared", def.name),
             ));
         }
-        self.struct_defs.insert(key, def.fields);
+        // One shape per executed declaration; every value built by
+        // `ConstructStruct` shares it.
+        let shape = StructShape::new(key.0.clone(), key.1.clone(), def.fields);
+        self.struct_defs.insert(key, shape);
         self.bind_local_type(&def.name);
         Ok(())
     }
@@ -4737,23 +4820,23 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 )
             })?,
         };
-        let key = (module_path.clone(), type_name_s.clone());
-        let decl = self
+        let key = (module_path, type_name_s);
+        let shape = self
             .struct_defs
             .get(&key)
-            .ok_or_else(|| {
-                error(
-                    line,
-                    nybl::error_messages::struct_not_declared(&type_name_s),
-                )
-            })?
+            .ok_or_else(|| error(line, nybl::error_messages::struct_not_declared(&key.1)))?
             .clone();
+        let type_name_s = key.1;
+        let decl = shape.field_names();
         let flat = self.pop_n_values(count * 2, line)?;
-        let mut provided: BTreeMap<String, Value> = BTreeMap::new();
+        // Validation guarantees every placeholder is overwritten
+        // before the value is built.
+        let mut values = vec![Value::None; decl.len()];
+        let mut seen = vec![false; decl.len()];
         let mut iter = flat.into_iter();
         while let (Some(key), Some(val)) = (iter.next(), iter.next()) {
             let key_str = match &key {
-                Value::Str(s) => s.as_str().to_string(),
+                Value::Str(s) => s.as_str(),
                 other => {
                     return Err(error(
                         line,
@@ -4764,40 +4847,32 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                     ));
                 }
             };
-            drop(key);
-            if provided.contains_key(&key_str) {
+            let Some(index) = shape.field_index(key_str) else {
+                let msg = nybl::error_messages::struct_has_no_field(&type_name_s, key_str);
+                let err = match nybl::suggest::did_you_mean(key_str, decl) {
+                    Some(hint) => error_with_hint(line, msg, hint),
+                    None => error(line, msg),
+                };
+                return Err(err);
+            };
+            if core::mem::replace(&mut seen[index], true) {
                 return Err(error(
                     line,
                     format!("Field `{key_str}` specified twice in `{type_name_s}` construction"),
                 ));
             }
-            if !decl.iter().any(|d| d == &key_str) {
-                let msg = nybl::error_messages::struct_has_no_field(&type_name_s, &key_str);
-                let err =
-                    match nybl::suggest::did_you_mean(&key_str, decl.iter().map(|s| s.as_str())) {
-                        Some(hint) => error_with_hint(line, msg, hint),
-                        None => error(line, msg),
-                    };
-                return Err(err);
-            }
-            provided.insert(key_str, val);
+            values[index] = val;
         }
-        let mut fields: Vec<(String, Value)> = Vec::with_capacity(decl.len());
-        for d in &decl {
-            match provided.remove(d) {
-                Some(v) => fields.push((d.clone(), v)),
-                None => {
-                    return Err(error(
-                        line,
-                        format!("Missing field `{d}` in `{type_name_s}` construction"),
-                    ));
-                }
-            }
+        if let Some(missing) = seen.iter().position(|seen| !seen) {
+            let d = &decl[missing];
+            return Err(error(
+                line,
+                format!("Missing field `{d}` in `{type_name_s}` construction"),
+            ));
         }
-        self.push_value(Value::__try_new_struct_in(
-            module_path,
-            type_name_s,
-            fields,
+        self.push_value(Value::__try_new_struct_from_shape_in(
+            &shape,
+            values,
             line,
             &self.memory,
         )?);
@@ -4820,7 +4895,8 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         let declared = self
             .struct_defs
             .get(&(module_path, type_name.to_string()))
-            .ok_or_else(|| error(line, nybl::error_messages::struct_not_declared(type_name)))?;
+            .ok_or_else(|| error(line, nybl::error_messages::struct_not_declared(type_name)))?
+            .field_names();
         for (index, field) in provided.iter().enumerate() {
             if provided[..index].contains(field) {
                 return Err(error(
@@ -5097,7 +5173,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         match obj {
             Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
                 let msg = nybl::error_messages::struct_has_no_field(s.type_name(), field);
-                let names = s.fields().iter().map(|(k, _)| k.as_str());
+                let names = s.shape().field_names();
                 match nybl::suggest::did_you_mean(field, names) {
                     Some(hint) => error_with_hint(line, msg, hint),
                     None => error(line, msg),
@@ -5534,7 +5610,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // with different source).
         for (key, fields) in &artifacts.struct_defs {
             if let Some(existing) = self.struct_defs.get(key) {
-                if existing == fields {
+                if existing.field_names() == fields.field_names() {
                     continue;
                 }
                 return Err(error(
@@ -6079,7 +6155,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
                 ));
             }
             None => {
-                let source = match self.host.resolve_module(path) {
+                let source = match self.host_hook(|host| host.resolve_module(path)) {
                     Some(Ok(source)) => source,
                     Some(Err(error)) => return Err(error),
                     None => return Err(error(line, format!("Module `{path}` not found"))),
@@ -6169,6 +6245,7 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         // and nesting budget.
         sub.steps = steps;
         sub.call_depth_base = call_depth_base;
+        sub.group = self.group.clone();
         if let Some(top) = sub.frames.first_mut() {
             top.nesting_total = nesting_base.saturating_add(top.chunk.nesting_depth);
         }
@@ -6496,6 +6573,19 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
     /// the outcome (whether a normal return or a non-fatal
     /// error) gets wrapped in a `Result::Ok`/`Result::Err`
     /// before returning to the original `try_call` caller.
+    /// The builtin `RuntimeError` shape this engine registered at
+    /// construction; every caught `try_call` error shares it.
+    fn runtime_error_shape(&self) -> StructShape {
+        let key = (
+            String::from(nybl::value::BUILTIN_MODULE_PATH),
+            String::from("RuntimeError"),
+        );
+        self.struct_defs
+            .get(&key)
+            .expect("builtin RuntimeError is seeded at construction")
+            .clone()
+    }
+
     fn builtin_try_call(&mut self, args: Vec<Value>, line: u32) -> Result<Next, NyblError> {
         if args.len() != 1 {
             return Err(error(
@@ -6519,7 +6609,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
             if err.is_fatal {
                 return Err(err);
             }
-            self.push_value(builtins::make_try_call_err_in(&err, &self.memory));
+            self.push_value(builtins::make_try_call_err_in(
+                &err,
+                &self.runtime_error_shape(),
+                &self.memory,
+            ));
             if self.memory.__exceeded() {
                 return Err(error_fatal_with_hint(
                     line,
@@ -6808,7 +6902,11 @@ impl<'h, H: NyblHost + ?Sized> Vm<'h, H> {
         }
         self.restore_active_defining_environment();
         self.stack.truncate(wrapper_stack_base);
-        self.push_value(builtins::make_try_call_err_in(&err, &self.memory));
+        self.push_value(builtins::make_try_call_err_in(
+            &err,
+            &self.runtime_error_shape(),
+            &self.memory,
+        ));
         if self.memory.__exceeded() {
             Err(error_fatal_with_hint(
                 wrapper_line,
@@ -7107,6 +7205,26 @@ impl NyblInstance {
         Self::from_compiled(&program, host, limits)
     }
 
+    /// Like [`Self::load`], but the instance joins `group`: it runs under
+    /// the group's limits, charges the group's memory account, and shares
+    /// step, call-depth, and nesting accounting with operations of the group
+    /// (walker or VM) that are running when this instance is called.
+    pub fn load_in(
+        source: &str,
+        host: &mut dyn NyblHost,
+        group: &nybl::InstanceGroup,
+    ) -> Result<Self, NyblError> {
+        let operation = group.__begin();
+        let program = CompiledScript::compile(source)?;
+        Self::instantiate(
+            &program,
+            host,
+            group.limits(),
+            group.__memory().clone(),
+            Some(&operation),
+        )
+    }
+
     /// Instantiate a compiled program: enforce the deny list in
     /// `limits`, execute the top-level statements once against `host`,
     /// and retain the resulting VM state for calls.
@@ -7121,8 +7239,43 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
         limits: &NyblLimits,
     ) -> Result<Self, NyblError> {
+        Self::instantiate(
+            program,
+            host,
+            limits,
+            nybl::memory::MemoryContext::__new(limits.max_memory),
+            None,
+        )
+    }
+
+    /// Like [`Self::from_compiled`], but the instance joins `group` (see
+    /// [`Self::load_in`]); the group's limits replace a limits argument.
+    pub fn from_compiled_in(
+        program: &CompiledScript,
+        host: &mut dyn NyblHost,
+        group: &nybl::InstanceGroup,
+    ) -> Result<Self, NyblError> {
+        let operation = group.__begin();
+        Self::instantiate(
+            program,
+            host,
+            group.limits(),
+            group.__memory().clone(),
+            Some(&operation),
+        )
+    }
+
+    fn instantiate(
+        program: &CompiledScript,
+        host: &mut dyn NyblHost,
+        limits: &NyblLimits,
+        memory: nybl::memory::MemoryContext,
+        operation: Option<&nybl::GroupOperation>,
+    ) -> Result<Self, NyblError> {
+        if memory.__exceeded() {
+            return Err(instance_memory_error());
+        }
         nybl::check::check_disabled_builtins(&program.builtin_usage, &limits.disabled_builtins)?;
-        let memory = nybl::memory::MemoryContext::__new(limits.max_memory);
         let mut vm = Vm::new_internal(
             Arc::clone(&program.chunk),
             host,
@@ -7134,8 +7287,11 @@ impl NyblInstance {
             NyblFnOrigin::__instance("vm"),
             memory.clone(),
         );
+        vm.join_group(operation);
         vm.check_root_nesting()?;
-        vm.run_internal()?;
+        let run = vm.run_internal();
+        vm.finish_group();
+        run?;
         if memory.__exceeded() {
             return Err(instance_memory_error());
         }
@@ -7158,6 +7314,7 @@ impl NyblInstance {
             in_operation: Cell::new(false),
             memory,
             identity: Rc::new(()),
+            group: operation.map(|operation| operation.__group().clone()),
         })
     }
 
@@ -7221,6 +7378,7 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         let _operation = VmOperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(nybl::InstanceGroup::__begin);
         self.validate_prepared_entry(entry)?;
         validate_prepared_arity(entry, args.len())?;
         if self.memory.__exceeded() {
@@ -7228,6 +7386,7 @@ impl NyblInstance {
         }
         let state = self.state.take().expect("instance state present");
         let mut vm = Vm::from_state(state, host, self.limits.clone(), self.memory.clone());
+        vm.join_group(group.as_ref());
         let result = {
             for argument in args {
                 vm.push_value(argument.clone());
@@ -7243,6 +7402,7 @@ impl NyblInstance {
                 value
             }
         };
+        vm.finish_group();
         self.state = Some(vm.into_state());
         result
     }
@@ -7259,18 +7419,25 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Vec<Value>, NyblError> {
         let _operation = VmOperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(nybl::InstanceGroup::__begin);
         self.validate_prepared_entry(entry)?;
         if self.memory.__exceeded() {
             return Err(instance_memory_error());
         }
         let state = self.state.take().expect("instance state present");
         let mut vm = Vm::from_state(state, host, self.limits.clone(), self.memory.clone());
+        vm.join_group(group.as_ref());
         let mut values = Vec::with_capacity(calls.len());
+        // An outermost batch gives every item a fresh step budget; a batch
+        // nested in a running group operation counts every item toward it.
+        let reset_steps = group.as_ref().is_none_or(|group| group.__start().outermost);
         let result = (|| {
             for call in calls {
                 let args = call.as_ref();
                 validate_prepared_arity(entry, args.len())?;
-                vm.steps = 0;
+                if reset_steps {
+                    vm.steps = 0;
+                }
                 for argument in args {
                     vm.push_value(argument.clone());
                 }
@@ -7286,6 +7453,7 @@ impl NyblInstance {
             }
             Ok(values)
         })();
+        vm.finish_group();
         self.state = Some(vm.into_state());
         result
     }
@@ -7308,6 +7476,7 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         let _operation = VmOperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(nybl::InstanceGroup::__begin);
         let state = self.state.as_ref().expect("instance state present");
         let target = state
             .abi_declarations
@@ -7327,6 +7496,7 @@ impl NyblInstance {
         }
         let state = self.state.take().expect("instance state present");
         let mut vm = Vm::from_state(state, host, self.limits.clone(), self.memory.clone());
+        vm.join_group(group.as_ref());
         let result = {
             for argument in args {
                 vm.push_value(argument.clone());
@@ -7342,6 +7512,7 @@ impl NyblInstance {
                 value
             }
         };
+        vm.finish_group();
         self.state = Some(vm.into_state());
         result
     }
@@ -7353,6 +7524,7 @@ impl NyblInstance {
         host: &mut dyn NyblHost,
     ) -> Result<Value, NyblError> {
         let _operation = VmOperationGuard::begin(&self.in_operation)?;
+        let group = self.group.as_ref().map(nybl::InstanceGroup::__begin);
         let function = match callable {
             Value::Fn(function) => Rc::clone(function),
             other => {
@@ -7382,6 +7554,7 @@ impl NyblInstance {
         }
         let state = self.state.take().expect("instance state present");
         let mut vm = Vm::from_state(state, host, self.limits.clone(), self.memory.clone());
+        vm.join_group(group.as_ref());
         let result = {
             let execution = vm
                 .call_closure(&function, args.to_vec(), 0)
@@ -7394,6 +7567,7 @@ impl NyblInstance {
                 value
             }
         };
+        vm.finish_group();
         self.state = Some(vm.into_state());
         result
     }

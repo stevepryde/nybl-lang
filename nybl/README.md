@@ -33,7 +33,7 @@ For a faster runtime (2–3× this crate's tree-walker, same semantics), add [`n
 - **Zero Rust deps** Nothing to audit in your supply chain.
 - **`no_std` support** via the `no_std` feature (uses the `libm` crate internally for float math, nothing else).
 - **WASM-compatible.** Builds clean for `wasm32-unknown-unknown`. Use it in browsers, edge workers, or wherever you can run Rust.
-- **Sandboxed by default.** `NyblLimits` caps step count, tracked memory, and nesting across active calls (`max_nesting`), and the runtime caps function-call depth, so runaway user scripts halt cleanly. Native stack use is bounded too: under default limits a thread of 10 MiB (release) or 128 MiB (debug) suffices for any program, and the requirement scales roughly with `max_nesting`.
+- **Sandboxed by default.** `NyblLimits` caps step count, tracked memory, and nesting across active calls (`max_nesting`), and the runtime caps function-call depth, so runaway user scripts halt cleanly. Native stack use is bounded too: under default limits a thread of 10 MiB (release) or 24 MiB (debug) suffices for any program, and the requirement scales roughly with `max_nesting`.
 
 ## Quick start
 
@@ -108,10 +108,25 @@ let value = instance.call("add", &[Value::Int(3)], &mut host)?;
 [stateful embedding guide](https://nybl-lang.com/docs/embedding/instances/)
 for lifecycle, affinity, limits, and error-state behavior.
 
+When a host call into one instance can call another instance (script A asks
+script B, which asks C), load them into one `InstanceGroup` with
+`NyblInstance::load_in(source, &mut host, &group)`. The group's limits then
+bound the whole chain: one memory account for all its instances, and a call
+started from inside a host hook while another call of the group is running
+continues that call's steps, call depth, and nesting. Walker and VM instances
+can share a group; `ReplSession::eval_in` runs a snippet as a group operation.
+
 Host arguments support borrowed or owned typed extraction through
 `Value::to_rust` (`&str`, integers, `Vec<T>`, `Option<T>`, `Result<T, E>`, and
 deterministic `BTreeMap<String, T>`). Use the fallible, JSON-like `nybl_value!`
 macro to construct nested values while retaining Nybl's depth checks.
+
+To pass many values of one struct type, build its `StructShape` (module path,
+type name, field names) once and construct each value with
+`Value::try_new_struct_from_shape(&shape, values, line)`, giving the field
+values in the shape's order. Values share the shape instead of copying the
+names, and a value whose module path and type name match a script's struct
+declaration is that type to the script (`<root>` for the root program).
 
 Hosts can also return `Value::new_host("type", payload)` for an opaque resource
 handle and implement `NyblHost::call_method`. Handles clone cheaply, compare by

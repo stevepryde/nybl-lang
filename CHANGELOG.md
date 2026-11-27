@@ -5,6 +5,62 @@ publishable workspace crates unless a section says otherwise.
 
 ## Unreleased
 
+### Embedding
+
+- Add `nybl::InstanceGroup`: instances loaded with `NyblInstance::load_in`
+  (walker and VM), `nybl_vm::NyblInstance::from_compiled_in`, or run through
+  `ReplSession::eval_in` share the group's limits and one memory account. A
+  call a host hook starts on a grouped instance while another call of the
+  group is running continues that call's steps, call depth, and nesting
+  budget, so `max_steps`, the 64-frame cap, and `max_nesting` bound the whole
+  chain; a nested `call_batch` counts every item toward it. Walker and VM
+  instances may share a group. Ungrouped instances are unchanged. Sandboxed
+  AOT instances do not join groups.
+- An error returned from `NyblHost::on_tick` with no line (or line 0) is now
+  reported at the line a step-limit error would use at that tick, with the
+  same module ownership, in the walker, VM, and sandboxed AOT.
+- Add `nybl::StructShape`, the shared identity and field names of a struct
+  type. Build it once and construct values with
+  `Value::try_new_struct_from_shape(&shape, values, line)`, which takes field
+  values in the shape's order and stores no names per value; a wrong value
+  count is an ordinary error. `NyblStruct::shape()` and `NyblStruct::values()`
+  read them back. Shape-built values are ordinary struct values, identified by
+  module path and type name. All three engines now build one shape per struct
+  declaration, so constructing and first-writing a struct value no longer
+  copies its field names.
+- A struct value's tracked memory is now its field values only; its type and
+  field names are no longer charged per value.
+- **Breaking:** `NyblStruct::fields()` returns an iterator of
+  `(&str, &Value)` pairs in declaration order instead of
+  `&[(String, Value)]`.
+- The tree-walker uses far less native stack in debug builds: about 0.9 to
+  3.7 KiB per nesting unit (`max_nesting`) across every measured shape, down
+  from 6 to 21 KiB, and 0.3 to 1.1 KiB in release (arm64 macOS, Rust 1.98).
+  The costliest shapes are a call nested in the index of its own `ref`
+  argument (3.7 KiB debug) and struct-variant construction (3.2 KiB); plain
+  recursion, literals, and calls nested in argument position cost 0.9 to
+  1.8 KiB. RUN-002's debug thread size drops from 128 MiB to 24 MiB, and the
+  CLI runs scripts on a 24 MiB thread in debug builds. A host on a smaller
+  stack can size `max_nesting` from these per-unit costs, plus up to 4.5 MiB
+  (debug) or 0.8 MiB (release) for parsing code at the parse-depth cap.
+
+### Specs
+
+- RUN-017, RUN-018, and AC-RUN-012 cover instance groups; RUN-028 and
+  AC-RUN-022 add instance groups; RUN-007 and AC-RUN-023 add the tick-hook
+  line; ARCH-013 states the group accounting invariant.
+- RUN-029 and AC-RUN-024 add shared struct shapes; ARCH-006 states that
+  struct values own only their field values.
+- RUN-002 restates the measured stack worst cases and what the bound covers
+  for the sandboxed AOT; AC-RUN-020 adds calls nested in argument position to
+  the stack corpus.
+
+### Migration from 0.5
+
+- Replace slice use of `NyblStruct::fields()` with the iterator
+  (`s.fields().map(|(name, value)| ...)`), or use `s.values()` for positional
+  values and `s.shape().field_names()` for names.
+
 ## 0.5.0
 
 `0.5.0` bounds the native stack an execution can use, so a host can size its

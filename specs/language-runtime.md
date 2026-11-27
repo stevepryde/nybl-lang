@@ -14,12 +14,19 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   runtime resource boundary or exercises adversarial input must halt with a
   Nybl diagnostic; it must not hang, panic, overflow the native stack, or abort
   the host process. Native stack use is bounded by the limits: under default
-  limits a thread of 10 MiB (release builds) or 128 MiB (debug builds) suffices
+  limits a thread of 10 MiB (release builds) or 24 MiB (debug builds) suffices
   for parsing and running any program in the walker, VM, or sandboxed AOT,
-  including its module loads. These sizes are about twice the worst measured
-  corpus shape (walker 4.9 MiB release, 64.7 MiB debug — nested `Ok(...)`
-  recursion that loads a parse-cap module from its deepest frame; VM 0.8 MiB
-  and 4.7 MiB; arm64 macOS, Rust 1.98) and scale roughly with `max_nesting`.
+  including its module loads. These sizes are at least twice the worst
+  measured corpus shape (walker 3.0 MiB release, 11.8 MiB debug — user-method
+  calls, each nested in the index of the next one's `ref` argument, recursing
+  to fill the nesting budget and then loading a parse-cap module from the
+  deepest frame;
+  VM 0.8 MiB and 4.6 MiB; arm64 macOS, Rust 1.98) and scale roughly with
+  `max_nesting`. For the sandboxed AOT they bound the transpiler, which
+  parses and generates code in the host process (0.8 MiB release, 4.4 MiB
+  debug on the corpus), and the generated program compiled in release
+  (0.3 MiB on the corpus); a generated program compiled unoptimised is not
+  measured.
 - **RUN-003 — Resource accounting.** Walker and VM execution, plus AOT output
   emitted with sandboxing enabled, must enforce their applicable step,
   tracked-memory, call-depth, and nesting boundaries. AOT sandboxing is
@@ -51,7 +58,10 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   engine failures should retain the same error shape and helpful hints.
   Diagnostics originating in imported modules must identify the deepest owning
   module and render only that module's source; if its source is unavailable,
-  they must omit the snippet rather than substituting root source.
+  they must omit the snippet rather than substituting root source. An error
+  returned from `NyblHost::on_tick` without a line (or with line 0) takes the
+  line and module ownership a step-limit error raised at that tick would
+  have; a non-zero line is kept.
 - **RUN-008 — General-purpose language semantics.** Functions and closures,
   collections, user-defined types, pattern matching, control flow, iterators,
   and modules must compose according to the documented grammar and reference
@@ -101,15 +111,17 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
 - **RUN-017 — Instance isolation and calls.** An instance borrows a host for one
   operation and never retains it. Function values are callable only by the
   instance that created them; same-instance re-entry is rejected, while a host
-  may nest a different instance without crossing state or accounting.
+  may nest a different instance without crossing state. Nested instances share
+  accounting only when they belong to one instance group (RUN-028).
 - **RUN-018 — Persistent limits and failure state.** Step, call-depth, and
-  nesting state reset for each instance operation, while tracked memory belongs to the
-  instance across calls. Errors unwind transient frames but do not roll back
-  completed mutations. Step/depth failures leave an instance reusable; memory
-  exhaustion leaves an instance reusable when unwinding releases the transient
-  peak, but calls fail fast while retained charged storage remains over budget.
-  Releasing enough charged storage to return to budget makes the instance
-  callable again.
+  nesting state reset for each instance operation (for a grouped instance,
+  each outermost group operation), while tracked memory belongs to the
+  instance, or to its group, across calls. Errors unwind transient frames but
+  do not roll back completed mutations. Step/depth failures leave an instance
+  reusable; memory exhaustion leaves an instance reusable when unwinding
+  releases the transient peak, but calls fail fast while retained charged
+  storage remains over budget. Releasing enough charged storage to return to
+  budget makes the instance callable again.
 - **RUN-019 — Executed declarations.** Struct, enum, and method declarations
   take effect when execution reaches their source site. Dead sites have no
   runtime effect, nested type declarations obey lexical scope, and the last
@@ -186,6 +198,30 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   and nesting accounting per item, retain persistent memory accounting, and enforce the
   existing same-instance re-entry fence. Script-level batches are one call and
   apply one step budget to the complete batch.
+- **RUN-028 — Instance groups.** Walker and VM instances, and walker REPL
+  evaluations, may join an `InstanceGroup`, whose limits (including disabled
+  builtins) replace per-instance limits. All its instances charge one memory
+  account, so `max_memory` bounds the group's total, values passed between
+  them keep their owner, and every group operation fails fast while the
+  group is over budget. An operation that starts while no operation of the
+  group runs starts from zero; one a host hook starts while another runs
+  continues that operation's steps, active call depth, and nesting, and the
+  enclosing operation resumes from the steps it reached. The step limit, the
+  call-depth cap, and `max_nesting` therefore bound the whole chain, a nested
+  host batch does not reset per item, and a nested step-limit failure also
+  fails the enclosing operation's next tick. VM steps convert to `max_steps`
+  units rounding up. Instances in different groups or in none share nothing.
+  Sandboxed AOT instances do not join groups.
+- **RUN-029 — Shared struct shapes.** A host may build a `StructShape` (module
+  path, type name, field names in declaration order) once and construct
+  struct values from it with positional field values; a value count that does
+  not match the shape is an ordinary error. Shape-built values are ordinary
+  struct values: identity is module path plus type name, so one matching a
+  script-declared type is that type for equality, patterns, and methods in
+  every engine. A struct value's tracked memory is its field-value storage
+  only; the shared shape, including its names, is not charged per value.
+  Engines build one shape per executed struct declaration and do not allocate
+  field-name strings per constructed value.
 
 ## Acceptance criteria
 
@@ -236,10 +272,10 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   same-instance re-entry with equivalent diagnostics.
 - **AC-RUN-012:** Instance tests prove that hosts are borrowed per operation,
   different instances can nest safely, step/call-depth/nesting budgets restart,
-  memory accounts remain independent and persistent, transient frames unwind,
-  transient memory peaks do not poison later calls, retained over-budget
-  receipts fail fast until released, and mutations before ordinary or fatal
-  failures remain visible.
+  ungrouped memory accounts remain independent and persistent, transient
+  frames unwind, transient memory peaks do not poison later calls, retained
+  over-budget receipts fail fast until released, and mutations before ordinary
+  or fatal failures remain visible.
 - **AC-RUN-013:** Parser and cross-engine tests cover root-only `pub fn`, final
   public/private redeclaration rules, top-level early return, and immunity of
   the public entry table to ordinary-name reassignment.
@@ -287,9 +323,14 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   call-depth, parse-depth, or step error from every shape: deep recursion
   through nested `if`-expressions, lists, dicts, unary operators, matches,
   patterns, calls, methods, callbacks, and `Ok`/`Err`/enum tuple and
-  struct-variant construction; recursion that fills the nesting budget and
-  then loads a module nested at the parse cap from its deepest frame;
-  recursion that loads a chain of libraries from its deepest frame; a 70-module import chain; operator and
+  struct-variant construction; calls nested in argument position (user
+  methods, module-alias calls, calls with a `ref` argument, immediately
+  invoked lambdas, and mutating methods on a place receiver); recursion that
+  fills the nesting budget and then loads a module nested at the parse cap
+  from its deepest frame, including under nested user-method arguments,
+  calls nested in the index of their own `ref` argument, and struct-variant
+  construction; recursion that loads a chain of libraries from its deepest
+  frame; a 70-module import chain; operator and
   postfix chains past the cap; and a module top level that exhausts the
   shared step budget.
 - **AC-RUN-021:** Cross-engine tests show the nesting budget trips at the same
@@ -298,6 +339,37 @@ bytecode VM, AOT compiler, CLI, and embedding APIs.
   shares its importer's step budget; and a module load costs exactly its
   token count once (lazy, cached, and precompiled VM loads agree) while root
   source is free.
+
+- **AC-RUN-022:** Walker, VM, and mixed walker/VM instance-group tests show
+  that a chain of grouped instances trips the nesting budget and the call-depth
+  cap with the ordinary catchable error in the nested instance, and the step
+  limit with a fatal error in the nested instance followed by the outer
+  instance's next tick even when the host swallows it, while the same pairs
+  ungrouped or in separate groups succeed; sums that fit succeed across
+  engines; outermost operations restart from zero after failed and finished
+  ones; a nested batch counts every item while an outermost batch resets;
+  retained values of two instances share one `max_memory`; a value handed
+  between instances is charged once without a copy; the group's deny list
+  applies; and `ReplSession::eval_in` is an outermost group operation. Two
+  nested calls made from one hook each start from the hook caller's own
+  counts; a nested call made from a module top level, or from `on_tick`,
+  `on_print`, a host-value method, or `resolve_module`, continues the shared
+  step count and hands its steps back.
+- **AC-RUN-023:** Walker, VM, and sandboxed AOT tests show that a line-less
+  `on_tick` error reports the step-limit line (the outermost active loop
+  header in the walker and VM, else a statement line), takes the step-limit
+  error's module ownership for a loop in an imported module function, and
+  keeps an explicit non-zero line.
+- **AC-RUN-024:** Walker and VM instance tests pass a shape-built struct to a
+  script that reads, writes, and returns it; the host reads the result by
+  position and by name while its own value is unchanged. A shape-built value
+  with the script type's module path and name equals a script-built value and
+  matches its pattern, and dispatches the type's value and `ref self` methods;
+  one with another module path does neither. Errors caught by `try_call` in
+  one instance share one `RuntimeError` shape. Retaining
+  values of a script type with long names charges the same memory as one with
+  short names. Value tests show a wrong value count is an ordinary error and
+  shape-built structs keep the value-nesting depth limit.
 
 ## Design notes
 

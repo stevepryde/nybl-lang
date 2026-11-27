@@ -31,7 +31,9 @@ use crate::lexer::StringPart;
 use crate::methods;
 use crate::ops;
 use crate::parser::*;
-use crate::value::{EnumPayload, FnBody, NyblFn, NyblFnOrigin, NyblTypeExports, Value};
+use crate::value::{
+    EnumPayload, FnBody, NyblFn, NyblFnOrigin, NyblTypeExports, StructShape, Value,
+};
 use crate::{NyblHost, NyblLimits};
 
 /// What the tree-walker stores for each imported module once it
@@ -67,7 +69,7 @@ struct ModuleBindings {
     /// `struct_defs` without rewriting keys, so type identity
     /// stays pinned to the declaring module across the import
     /// boundary.
-    struct_defs: Vec<((String, String), Vec<String>)>,
+    struct_defs: Vec<((String, String), StructShape)>,
     /// Enum type declarations, qualified the same way as
     /// `struct_defs` above.
     enum_defs: Vec<((String, String), Vec<crate::parser::VariantDecl>)>,
@@ -307,6 +309,74 @@ struct ResolvedPlace {
 struct MethodReceiver {
     value: Value,
     place: Option<ResolvedPlace>,
+}
+
+/// A call's evaluated arguments, its resolved `ref` places, and their
+/// argument positions.
+struct StagedCall {
+    args: Vec<Value>,
+    places: Vec<ResolvedPlace>,
+    ref_positions: Vec<usize>,
+}
+
+/// What a call expression invokes, with the checks that precede its
+/// argument expressions already run.
+enum CallTarget<'a> {
+    /// A Nybl callable called with ref-aware arguments.
+    Nybl {
+        func: Rc<NyblFn>,
+        plans: Vec<PlacePlan>,
+    },
+    /// A declared value-only function, dispatched host-first.
+    Declared {
+        function: FunctionDefinition,
+        name: &'a str,
+    },
+    /// A builtin or host function.
+    Builtin { name: &'a str },
+}
+
+/// A method call's evaluated receiver, any place it was read from, and its
+/// dispatch.
+struct MethodCallSite {
+    place: Option<ResolvedPlace>,
+    value: Value,
+    target: MethodTarget,
+}
+
+/// How a method call dispatches, with the checks that precede its argument
+/// expressions already run.
+enum MethodTarget {
+    /// A mutating built-in on a bare array or dict binding.
+    BindingCollection(BindingIdentity),
+    /// A mutating built-in on the receiver's index or field place.
+    PlaceCollection,
+    /// A user method; a `ref self` receiver commits through its place.
+    User {
+        definition: FunctionDefinition,
+        ref_receiver: bool,
+        plans: Vec<PlacePlan>,
+    },
+    /// An exported function called through a module alias.
+    ModuleExport {
+        func: Rc<NyblFn>,
+        plans: Vec<PlacePlan>,
+    },
+    /// A built-in method.
+    Builtin,
+}
+
+/// Caller state saved across a walker function body.
+struct CallFrame {
+    nesting: u32,
+    saved_ref_bindings: BTreeSet<BindingIdentity>,
+    saved_capture_bindings: BTreeSet<BindingIdentity>,
+    function_module: String,
+    saved_scopes: Vec<BTreeMap<String, Value>>,
+    caller_binding_origins: BTreeMap<String, (String, String)>,
+    caller_value_module: String,
+    type_scope_floor: usize,
+    alias_scope_floor: usize,
 }
 
 /// Lexical free-variable analysis for walker-created lambdas.
@@ -578,7 +648,7 @@ pub struct Evaluator<'h, H: NyblHost + ?Sized> {
     /// values carry. Two modules declaring the same struct name
     /// coexist at different keys with independently-validated
     /// field lists.
-    struct_defs: BTreeMap<(String, String), Vec<String>>,
+    struct_defs: BTreeMap<(String, String), StructShape>,
     /// User-defined enum types, same `(module_path, type_name)`
     /// keying scheme as [`Self::struct_defs`].
     enum_defs: BTreeMap<(String, String), Vec<VariantDecl>>,
@@ -682,6 +752,9 @@ pub struct Evaluator<'h, H: NyblHost + ?Sized> {
     /// Captures seeded into the active closure frame. Explicit `ref`
     /// arguments may not target these second-class bindings.
     active_capture_bindings: alloc_import::collections::BTreeSet<BindingIdentity>,
+    /// Instance group this operation belongs to. Its counts are published
+    /// around every host hook so a nested grouped operation continues them.
+    group: Option<crate::InstanceGroup>,
 }
 
 impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
@@ -728,6 +801,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             pending_try_return: None,
             active_ref_bindings: alloc_import::collections::BTreeSet::new(),
             active_capture_bindings: alloc_import::collections::BTreeSet::new(),
+            group: None,
         }
     }
 
@@ -789,6 +863,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             pending_try_return: None,
             active_ref_bindings: alloc_import::collections::BTreeSet::new(),
             active_capture_bindings: alloc_import::collections::BTreeSet::new(),
+            group: None,
         }
     }
 
@@ -844,8 +919,35 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 "Your code is using too much memory. Check for large strings or arrays growing in loops.",
             ));
         }
-        self.host.on_tick()?;
+        if let Err(error) = self.host_hook(|host| host.on_tick()) {
+            return Err(self.tick_hook_error(error, line));
+        }
         Ok(())
+    }
+
+    /// Give a line-less `on_tick` error the line a step-limit error would
+    /// report at this tick.
+    #[cold]
+    fn tick_hook_error(&self, mut error: NyblError, line: u32) -> NyblError {
+        if matches!(error.line, None | Some(0)) {
+            error.line = Some(self.loop_lines.first().copied().unwrap_or(line));
+        }
+        error
+    }
+
+    /// Run one host hook. In an instance group, publish this operation's
+    /// counts first so an operation the hook starts on the group continues
+    /// them, and resume from the steps that operation reached.
+    #[inline]
+    fn host_hook<R>(&mut self, hook: impl FnOnce(&mut H) -> R) -> R {
+        if let Some(group) = &self.group {
+            group.__publish(self.steps, self.active_call_depth(), self.nesting_used);
+            let result = hook(self.host);
+            self.steps = group.__steps();
+            result
+        } else {
+            hook(self.host)
+        }
     }
 
     /// Charge a fixed step cost (a module load) against the step budget.
@@ -1205,6 +1307,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         Ok(places)
     }
 
+    /// Evaluate a place's index projections left to right, then snapshot
+    /// its root.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
     fn resolve_place(
         &mut self,
         plan: PlacePlan,
@@ -1214,20 +1322,31 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         let mut projections = Vec::with_capacity(plan.projections.len());
         for projection in plan.projections {
             projections.push(match projection {
-                PlaceProjectionExpr::Index(index) => {
-                    PlaceProjection::Index(self.eval_expr(&index)?)
-                }
+                PlaceProjectionExpr::Index(index) => match self.eval_expr(&index) {
+                    Ok(value) => PlaceProjection::Index(value),
+                    Err(error) => return Err(error),
+                },
                 PlaceProjectionExpr::Field(field) => PlaceProjection::Field(field),
             });
         }
+        self.snapshot_place(plan.target, projections, position, line)
+    }
+
+    fn snapshot_place(
+        &self,
+        target: BindingIdentity,
+        projections: Vec<PlaceProjection>,
+        position: usize,
+        line: u32,
+    ) -> Result<ResolvedPlace, NyblError> {
         // Projection expressions may mutate the root. Snapshot only after
         // each projection has been evaluated so the resolved leaf observes
         // those effects (and so every expression still runs exactly once).
         let root = self
-            .binding_value(&plan.target)
+            .binding_value(&target)
             .ok_or_else(|| crate::ref_params::invalid_ref_target(position, line))?;
         Ok(ResolvedPlace {
-            target: plan.target,
+            target,
             root,
             projections,
         })
@@ -1572,49 +1691,10 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 name,
                 value,
                 is_const: _,
-            } => {
-                let val = self.eval_expr(value)?;
-                let module = match &val {
-                    Value::Module(module) => Some(Rc::clone(module)),
-                    _ => None,
-                };
-                if self.is_module_top_scope()
-                    && let Some(origin) = self.binding_origins.get(name).cloned()
-                    && (origin.0 != self.current_module || origin.1 != name.as_str())
-                    && let Some(previous) =
-                        self.scopes.last_mut().and_then(|scope| scope.remove(name))
-                {
-                    self.live_value_environments
-                        .borrow_mut()
-                        .entry(origin.0)
-                        .or_default()
-                        .insert(origin.1, previous);
-                }
-                self.define(name.clone(), val);
-                if let Some(imports) = self.import_scopes.last_mut() {
-                    imports.forget(name);
-                }
-                if self.is_module_top_scope() {
-                    self.binding_origins
-                        .insert(name.clone(), (self.current_module.clone(), name.clone()));
-                }
-                let published_module = module.as_ref().map(Rc::clone);
-                let aliases = self.module_aliases.last_mut().expect("module alias scope");
-                if let Some(module) = module {
-                    aliases.insert(name.clone(), module);
-                } else {
-                    aliases.remove(name);
-                }
-                if self.is_module_top_scope() {
-                    self.publish_root_module_alias(name.clone(), published_module);
-                }
-                Ok(Signal::None)
-            }
+            } => self.exec_let(name, value),
 
             StmtKind::Assign { target, op, value } => {
-                let new_val = self.eval_expr(value)?;
-                self.exec_assign(target, op, new_val, stmt.line)?;
-                Ok(Signal::None)
+                self.exec_assign_stmt(stmt, target, op, value)
             }
 
             StmtKind::If {
@@ -1622,378 +1702,519 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 body,
                 else_ifs,
                 else_body,
-            } => {
-                if self.eval_expr(condition)?.is_truthy() {
-                    self.push_scope();
-                    let sig = self.exec_block(body)?;
-                    self.pop_scope();
-                    return Ok(sig);
-                }
-                for (elif_cond, elif_body) in else_ifs {
-                    if self.eval_expr(elif_cond)?.is_truthy() {
-                        self.push_scope();
-                        let sig = self.exec_block(elif_body)?;
-                        self.pop_scope();
-                        return Ok(sig);
-                    }
-                }
-                if let Some(else_body) = else_body {
-                    self.push_scope();
-                    let sig = self.exec_block(else_body)?;
-                    self.pop_scope();
-                    return Ok(sig);
-                }
-                Ok(Signal::None)
-            }
+            } => self.exec_if(condition, body, else_ifs, else_body.as_deref()),
 
-            StmtKind::While { condition, body } => {
-                // The loop-line entry must come off on every exit —
-                // including caught errors — so the body runs inside
-                // a closure and the pop is unconditional.
-                self.loop_lines.push(stmt.line);
-                let result = (|| {
-                    loop {
-                        self.tick(stmt.line)?;
-                        if !self.eval_expr(condition)?.is_truthy() {
-                            break;
-                        }
-                        self.push_scope();
-                        let sig = self.exec_block(body)?;
-                        self.pop_scope();
-                        match sig {
-                            Signal::Break => break,
-                            Signal::Continue => continue,
-                            Signal::Return(v) => return Ok(Signal::Return(v)),
-                            Signal::None => {}
-                        }
-                    }
-                    Ok(Signal::None)
-                })();
-                self.loop_lines.pop();
-                result
-            }
+            StmtKind::While { condition, body } => self.exec_while(stmt, condition, body),
 
-            StmtKind::Repeat { count, body } => {
-                let n = match self.eval_expr(count)? {
-                    Value::Int(n) => n,
-                    Value::Number(n) => n as i64,
-                    other => {
-                        return Err(error(
-                            stmt.line,
-                            format!("repeat needs a number, but got {}", other.type_name()),
-                        ));
-                    }
-                };
-                // Count evaluation stays outside the loop context —
-                // it runs once, like the VM's `MakeRepeatCount`.
-                self.loop_lines.push(stmt.line);
-                let result = (|| {
-                    for _ in 0..n.max(0) {
-                        self.tick(stmt.line)?;
-                        self.push_scope();
-                        let sig = self.exec_block(body)?;
-                        self.pop_scope();
-                        match sig {
-                            Signal::Break => break,
-                            Signal::Continue => continue,
-                            Signal::Return(v) => return Ok(Signal::Return(v)),
-                            Signal::None => {}
-                        }
-                    }
-                    Ok(Signal::None)
-                })();
-                self.loop_lines.pop();
-                result
-            }
+            StmtKind::Repeat { count, body } => self.exec_repeat(stmt, count, body),
 
             StmtKind::ForIn {
                 var,
                 iterable,
                 body,
-            } => {
-                let val = self.eval_expr(iterable)?;
-                // Fast path for the three built-in iterables:
-                // materialise up-front and loop over the Vec
-                // directly, skipping the method-dispatch cost of
-                // the iterator protocol. Semantically identical
-                // to `for x in v.iter()` for these types.
-                if matches!(&val, Value::Array(_) | Value::Str(_) | Value::Dict(_)) {
-                    let mut val = val;
-                    let items: Vec<Value> = match &mut val {
-                        Value::Array(arr) => arr.__take_in(&self.memory),
-                        Value::Str(s) => s
-                            .chars()
-                            .map(|c| Value::__new_str_in(c.to_string(), &self.memory))
-                            .collect(),
-                        Value::Dict(d) => d
-                            .iter()
-                            .map(|(k, _)| Value::__new_str_in(k.clone(), &self.memory))
-                            .collect(),
-                        _ => unreachable!(),
-                    };
-                    self.loop_lines.push(stmt.line);
-                    let result = (|| {
-                        for item in items {
-                            self.tick(stmt.line)?;
-                            self.push_scope();
-                            self.define(var.clone(), item);
-                            let sig = self.exec_block(body)?;
-                            self.pop_scope();
-                            match sig {
-                                Signal::Break => break,
-                                Signal::Continue => continue,
-                                Signal::Return(v) => return Ok(Signal::Return(v)),
-                                Signal::None => {}
-                            }
-                        }
-                        Ok(Signal::None)
-                    })();
-                    self.loop_lines.pop();
-                    return result;
-                }
-                // Protocol path: anything else must either be an
-                // iterator already (Value::Iter, or a user value
-                // with a `.next()` method that returns
-                // `Iter::Next/Done`) or an iterable — a value
-                // whose `.iter()` method returns an iterator.
-                // Primitives and callables that don't fit get a
-                // clean "can't iterate over X" error instead of
-                // a raw "no such method" surface from the
-                // dispatcher below.
-                let iterator = match &val {
-                    Value::Iter(_) | Value::Struct(_) | Value::EnumVariant(_) => {
-                        // Ask the value for an iterator. User
-                        // structs typically implement `iter` to
-                        // return either a built-in iterator or
-                        // themselves.
-                        self.call_method_full(&val, "iter", Vec::new(), stmt.line)?
-                    }
-                    other => {
-                        return Err(error(
-                            stmt.line,
-                            crate::error_messages::cant_iterate_over(other.type_name()),
-                        ));
-                    }
-                };
-                // Iterator acquisition above stays outside the loop
-                // context — it runs once, like the VM's `MakeIter`.
-                self.loop_lines.push(stmt.line);
-                let result = (|| {
-                    loop {
-                        self.tick(stmt.line)?;
-                        let next_val =
-                            self.call_method_full(&iterator, "next", Vec::new(), stmt.line)?;
-                        let item = match unwrap_iter_result(&next_val) {
-                            Some(IterStep::Next(v)) => v,
-                            Some(IterStep::Done) => break,
-                            None => {
-                                return Err(error(
-                                    stmt.line,
-                                    format!(
-                                        "`.next()` on a `for` iterator must return `Iter::Next(v)` or `Iter::Done`, got {}",
-                                        next_val.inspect()
-                                    ),
-                                ));
-                            }
-                        };
-                        self.push_scope();
-                        self.define(var.clone(), item);
-                        let sig = self.exec_block(body)?;
-                        self.pop_scope();
-                        match sig {
-                            Signal::Break => break,
-                            Signal::Continue => continue,
-                            Signal::Return(v) => return Ok(Signal::Return(v)),
-                            Signal::None => {}
-                        }
-                    }
-                    Ok(Signal::None)
-                })();
-                self.loop_lines.pop();
-                result
-            }
+            } => self.exec_for_in(stmt, var, iterable, body),
 
             StmtKind::FnDecl {
                 name,
                 params,
                 body,
                 visibility,
-            } => {
-                // A flat `use` already bound this name in this scope; a
-                // declaration silently replacing the import (or being
-                // shadowed by it) would lose one of the two definitions.
-                if let Some(imported) = self
-                    .import_scopes
-                    .last()
-                    .and_then(|scope| scope.names.get(name))
-                {
-                    return Err(crate::error_messages::function_replaces_import_error(
-                        name,
-                        &imported.path,
-                        stmt.line,
-                    ));
-                }
-                if let Some(imports) = self.import_scopes.last_mut() {
-                    imports.functions.insert(name.clone());
-                }
-                let is_direct_root = self.is_module_top_scope()
-                    && self.current_module == crate::value::ROOT_MODULE_PATH;
-                let module_path = self
-                    .function_modules
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| self.current_module.clone());
-                let definition = function_definition(
-                    params,
-                    body,
-                    Some(name.clone()),
-                    module_path,
-                    self.function_origin.clone(),
-                    stmt.line,
-                )?;
-                self.functions.insert(name.clone(), Rc::clone(&definition));
-                if is_direct_root {
-                    self.abi_declarations
-                        .retain(|(existing, _, _)| existing != name);
-                    self.abi_declarations
-                        .push((name.clone(), *visibility, definition));
-                }
-                Ok(Signal::None)
-            }
+            } => self.exec_fn_decl(stmt, name, params, body, *visibility),
 
             StmtKind::MethodDecl {
                 type_name,
                 method_name,
                 params,
                 body,
-            } => {
-                // Methods belong to a *specific* type identity —
-                // `fn Color.area(self)` inside module `paint`
-                // registers under `(paint, Color)` and doesn't
-                // leak to `other.Color`. If the named type isn't
-                // declared in this module, that's an error at
-                // parse/emit consistency — fall back to the
-                // current module as the owner.
-                let type_key = (self.current_module.clone(), type_name.clone());
-                let definition = function_definition(
-                    params,
-                    body,
-                    None,
-                    self.current_module.clone(),
-                    self.function_origin.clone(),
-                    stmt.line,
-                )?;
-                self.methods
-                    .entry(type_key)
-                    .or_default()
-                    .insert(method_name.clone(), definition);
-                Ok(Signal::None)
-            }
+            } => self.exec_method_decl(stmt, type_name, method_name, params, body),
 
-            StmtKind::Return { value } => {
-                let val = match value {
-                    Some(expr) => self.eval_expr(expr)?,
-                    None => Value::None,
-                };
-                Ok(Signal::Return(val))
-            }
+            StmtKind::Return { value } => self.exec_return(value.as_ref()),
 
             StmtKind::Break => Ok(Signal::Break),
             StmtKind::Continue => Ok(Signal::Continue),
 
             StmtKind::Use { path, items, alias } => {
-                self.exec_import(path, items.as_deref(), alias.as_deref(), stmt.line)?;
-                Ok(Signal::None)
+                self.exec_use(stmt, path, items.as_deref(), alias.as_deref())
             }
 
-            StmtKind::StructDecl { name, fields } => {
-                // Reject duplicate field names at decl time so
-                // downstream code doesn't have to re-check. Walker,
-                // VM, and AOT all assume unique fields per struct.
-                let mut seen = alloc_import::collections::BTreeSet::new();
-                for f in fields {
-                    if !seen.insert(f.clone()) {
-                        return Err(error(
-                            stmt.line,
-                            format!("Struct `{name}` has duplicate field `{f}`"),
-                        ));
-                    }
-                }
-                // Type identity is `(current_module, name)` —
-                // two different modules declaring the same name
-                // coexist because their keys differ. A redecl
-                // *in the same module* is a no-op when the shape
-                // matches (mirrors the same-module idempotency
-                // rule for re-imports) and a clash otherwise.
-                let key = (self.current_module.clone(), name.clone());
-                if let Some(existing) = self.struct_defs.get(&key) {
-                    if existing == fields {
-                        self.bind_local_type(name);
-                        return Ok(Signal::None);
-                    }
-                    return Err(error(
-                        stmt.line,
-                        format!("Struct `{name}` is already declared"),
-                    ));
-                }
-                self.struct_defs.insert(key, fields.clone());
-                self.bind_local_type(name);
-                Ok(Signal::None)
-            }
+            StmtKind::StructDecl { name, fields } => self.exec_struct_decl(stmt, name, fields),
 
-            StmtKind::EnumDecl { name, variants } => {
-                let key = (self.current_module.clone(), name.clone());
-                if let Some(existing) = self.enum_defs.get(&key) {
-                    // Same rule as `StructDecl` above — a
-                    // same-module same-shape redeclaration is a
-                    // no-op, anything else is a clash.
-                    if variants_equivalent(existing, variants) {
-                        self.bind_local_type(name);
-                        return Ok(Signal::None);
-                    }
-                    return Err(error(
-                        stmt.line,
-                        format!("Enum `{name}` is already declared"),
-                    ));
-                }
-                let mut seen_variants = alloc_import::collections::BTreeSet::new();
-                for v in variants {
-                    if !seen_variants.insert(v.name.clone()) {
-                        return Err(error(
-                            stmt.line,
-                            format!("Enum `{}` has duplicate variant `{}`", name, v.name),
-                        ));
-                    }
-                    if let VariantKind::Struct(fields) | VariantKind::Tuple(fields) = &v.kind {
-                        let mut seen_fields = alloc_import::collections::BTreeSet::new();
-                        for f in fields {
-                            if !seen_fields.insert(f.clone()) {
-                                return Err(error(
-                                    stmt.line,
-                                    format!(
-                                        "Enum variant `{}::{}` has duplicate field `{}`",
-                                        name, v.name, f
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                }
-                self.enum_defs.insert(key, variants.clone());
-                self.bind_local_type(name);
-                Ok(Signal::None)
-            }
+            StmtKind::EnumDecl { name, variants } => self.exec_enum_decl(stmt, name, variants),
 
-            StmtKind::ExprStmt(expr) => {
-                self.eval_expr(expr)?;
-                Ok(Signal::None)
-            }
+            StmtKind::ExprStmt(expr) => self.exec_expr_stmt(expr),
 
             // Module export validation and filtering are handled by the
             // module surface pass. The declaration itself has no runtime
             // side effect.
             StmtKind::PublicSurface { .. } => Ok(Signal::None),
         }
+    }
+
+    fn exec_assign_stmt(
+        &mut self,
+        stmt: &Stmt,
+        target: &AssignTarget,
+        op: &AssignOp,
+        value: &Expr,
+    ) -> Result<Signal, NyblError> {
+        let new_val = self.eval_expr(value)?;
+        self.exec_assign(target, op, new_val, stmt.line)?;
+        Ok(Signal::None)
+    }
+
+    fn exec_return(&mut self, value: Option<&Expr>) -> Result<Signal, NyblError> {
+        let val = match value {
+            Some(expr) => self.eval_expr(expr)?,
+            None => Value::None,
+        };
+        Ok(Signal::Return(val))
+    }
+
+    #[inline(never)]
+    fn exec_use(
+        &mut self,
+        stmt: &Stmt,
+        path: &str,
+        items: Option<&[String]>,
+        alias: Option<&str>,
+    ) -> Result<Signal, NyblError> {
+        self.exec_import(path, items, alias, stmt.line)?;
+        Ok(Signal::None)
+    }
+
+    fn exec_expr_stmt(&mut self, expr: &Expr) -> Result<Signal, NyblError> {
+        self.eval_expr(expr)?;
+        Ok(Signal::None)
+    }
+
+    fn exec_let(&mut self, name: &str, value: &Expr) -> Result<Signal, NyblError> {
+        let val = self.eval_expr(value)?;
+        let module = match &val {
+            Value::Module(module) => Some(Rc::clone(module)),
+            _ => None,
+        };
+        if self.is_module_top_scope()
+            && let Some(origin) = self.binding_origins.get(name).cloned()
+            && (origin.0 != self.current_module || origin.1 != name)
+            && let Some(previous) = self.scopes.last_mut().and_then(|scope| scope.remove(name))
+        {
+            self.live_value_environments
+                .borrow_mut()
+                .entry(origin.0)
+                .or_default()
+                .insert(origin.1, previous);
+        }
+        self.define(name.to_string(), val);
+        if let Some(imports) = self.import_scopes.last_mut() {
+            imports.forget(name);
+        }
+        if self.is_module_top_scope() {
+            self.binding_origins.insert(
+                name.to_string(),
+                (self.current_module.clone(), name.to_string()),
+            );
+        }
+        let published_module = module.as_ref().map(Rc::clone);
+        let aliases = self.module_aliases.last_mut().expect("module alias scope");
+        if let Some(module) = module {
+            aliases.insert(name.to_string(), module);
+        } else {
+            aliases.remove(name);
+        }
+        if self.is_module_top_scope() {
+            self.publish_root_module_alias(name.to_string(), published_module);
+        }
+        Ok(Signal::None)
+    }
+
+    fn exec_if(
+        &mut self,
+        condition: &Expr,
+        body: &[Stmt],
+        else_ifs: &[(Expr, Vec<Stmt>)],
+        else_body: Option<&[Stmt]>,
+    ) -> Result<Signal, NyblError> {
+        // Conditions are evaluated in a separate frame, so only this small
+        // one stays live while the chosen body runs.
+        let Some(branch) = self.if_branch(condition, body, else_ifs, else_body)? else {
+            return Ok(Signal::None);
+        };
+        self.push_scope();
+        let sig = self.exec_block(branch)?;
+        self.pop_scope();
+        Ok(sig)
+    }
+
+    /// The body of the first `if` / `else if` whose condition is truthy,
+    /// else the `else` body. Conditions after the chosen one are not
+    /// evaluated.
+    fn if_branch<'b>(
+        &mut self,
+        condition: &Expr,
+        body: &'b [Stmt],
+        else_ifs: &'b [(Expr, Vec<Stmt>)],
+        else_body: Option<&'b [Stmt]>,
+    ) -> Result<Option<&'b [Stmt]>, NyblError> {
+        if self.eval_expr(condition)?.is_truthy() {
+            return Ok(Some(body));
+        }
+        for (elif_cond, elif_body) in else_ifs {
+            if self.eval_expr(elif_cond)?.is_truthy() {
+                return Ok(Some(elif_body));
+            }
+        }
+        Ok(else_body)
+    }
+
+    fn exec_while(
+        &mut self,
+        stmt: &Stmt,
+        condition: &Expr,
+        body: &[Stmt],
+    ) -> Result<Signal, NyblError> {
+        // The loop-line entry must come off on every exit —
+        // including caught errors — so the body runs inside
+        // a closure and the pop is unconditional.
+        self.loop_lines.push(stmt.line);
+        let result = (|| {
+            loop {
+                self.tick(stmt.line)?;
+                if !self.eval_expr(condition)?.is_truthy() {
+                    break;
+                }
+                self.push_scope();
+                let sig = self.exec_block(body)?;
+                self.pop_scope();
+                match sig {
+                    Signal::Break => break,
+                    Signal::Continue => continue,
+                    Signal::Return(v) => return Ok(Signal::Return(v)),
+                    Signal::None => {}
+                }
+            }
+            Ok(Signal::None)
+        })();
+        self.loop_lines.pop();
+        result
+    }
+
+    fn exec_repeat(
+        &mut self,
+        stmt: &Stmt,
+        count: &Expr,
+        body: &[Stmt],
+    ) -> Result<Signal, NyblError> {
+        let n = match self.eval_expr(count)? {
+            Value::Int(n) => n,
+            Value::Number(n) => n as i64,
+            other => {
+                return Err(error(
+                    stmt.line,
+                    format!("repeat needs a number, but got {}", other.type_name()),
+                ));
+            }
+        };
+        // Count evaluation stays outside the loop context —
+        // it runs once, like the VM's `MakeRepeatCount`.
+        self.loop_lines.push(stmt.line);
+        let result = (|| {
+            for _ in 0..n.max(0) {
+                self.tick(stmt.line)?;
+                self.push_scope();
+                let sig = self.exec_block(body)?;
+                self.pop_scope();
+                match sig {
+                    Signal::Break => break,
+                    Signal::Continue => continue,
+                    Signal::Return(v) => return Ok(Signal::Return(v)),
+                    Signal::None => {}
+                }
+            }
+            Ok(Signal::None)
+        })();
+        self.loop_lines.pop();
+        result
+    }
+
+    fn exec_for_in(
+        &mut self,
+        stmt: &Stmt,
+        var: &str,
+        iterable: &Expr,
+        body: &[Stmt],
+    ) -> Result<Signal, NyblError> {
+        let val = self.eval_expr(iterable)?;
+        // Fast path for the three built-in iterables:
+        // materialise up-front and loop over the Vec
+        // directly, skipping the method-dispatch cost of
+        // the iterator protocol. Semantically identical
+        // to `for x in v.iter()` for these types.
+        if matches!(&val, Value::Array(_) | Value::Str(_) | Value::Dict(_)) {
+            let mut val = val;
+            let items: Vec<Value> = match &mut val {
+                Value::Array(arr) => arr.__take_in(&self.memory),
+                Value::Str(s) => s
+                    .chars()
+                    .map(|c| Value::__new_str_in(c.to_string(), &self.memory))
+                    .collect(),
+                Value::Dict(d) => d
+                    .iter()
+                    .map(|(k, _)| Value::__new_str_in(k.clone(), &self.memory))
+                    .collect(),
+                _ => unreachable!(),
+            };
+            self.loop_lines.push(stmt.line);
+            let result = (|| {
+                for item in items {
+                    self.tick(stmt.line)?;
+                    self.push_scope();
+                    self.define(var.to_string(), item);
+                    let sig = self.exec_block(body)?;
+                    self.pop_scope();
+                    match sig {
+                        Signal::Break => break,
+                        Signal::Continue => continue,
+                        Signal::Return(v) => return Ok(Signal::Return(v)),
+                        Signal::None => {}
+                    }
+                }
+                Ok(Signal::None)
+            })();
+            self.loop_lines.pop();
+            return result;
+        }
+        // Protocol path: anything else must either be an
+        // iterator already (Value::Iter, or a user value
+        // with a `.next()` method that returns
+        // `Iter::Next/Done`) or an iterable — a value
+        // whose `.iter()` method returns an iterator.
+        // Primitives and callables that don't fit get a
+        // clean "can't iterate over X" error instead of
+        // a raw "no such method" surface from the
+        // dispatcher below.
+        let iterator = match &val {
+            Value::Iter(_) | Value::Struct(_) | Value::EnumVariant(_) => {
+                // Ask the value for an iterator. User
+                // structs typically implement `iter` to
+                // return either a built-in iterator or
+                // themselves.
+                self.call_method_full(&val, "iter", Vec::new(), stmt.line)?
+            }
+            other => {
+                return Err(error(
+                    stmt.line,
+                    crate::error_messages::cant_iterate_over(other.type_name()),
+                ));
+            }
+        };
+        // Iterator acquisition above stays outside the loop
+        // context — it runs once, like the VM's `MakeIter`.
+        self.loop_lines.push(stmt.line);
+        let result = (|| {
+            loop {
+                self.tick(stmt.line)?;
+                let next_val = self.call_method_full(&iterator, "next", Vec::new(), stmt.line)?;
+                let item = match unwrap_iter_result(&next_val) {
+                    Some(IterStep::Next(v)) => v,
+                    Some(IterStep::Done) => break,
+                    None => {
+                        return Err(error(
+                            stmt.line,
+                            format!(
+                                "`.next()` on a `for` iterator must return `Iter::Next(v)` or `Iter::Done`, got {}",
+                                next_val.inspect()
+                            ),
+                        ));
+                    }
+                };
+                self.push_scope();
+                self.define(var.to_string(), item);
+                let sig = self.exec_block(body)?;
+                self.pop_scope();
+                match sig {
+                    Signal::Break => break,
+                    Signal::Continue => continue,
+                    Signal::Return(v) => return Ok(Signal::Return(v)),
+                    Signal::None => {}
+                }
+            }
+            Ok(Signal::None)
+        })();
+        self.loop_lines.pop();
+        result
+    }
+
+    fn exec_fn_decl(
+        &mut self,
+        stmt: &Stmt,
+        name: &str,
+        params: &[Parameter],
+        body: &[Stmt],
+        visibility: Visibility,
+    ) -> Result<Signal, NyblError> {
+        // A flat `use` already bound this name in this scope; a
+        // declaration silently replacing the import (or being
+        // shadowed by it) would lose one of the two definitions.
+        if let Some(imported) = self
+            .import_scopes
+            .last()
+            .and_then(|scope| scope.names.get(name))
+        {
+            return Err(crate::error_messages::function_replaces_import_error(
+                name,
+                &imported.path,
+                stmt.line,
+            ));
+        }
+        if let Some(imports) = self.import_scopes.last_mut() {
+            imports.functions.insert(name.to_string());
+        }
+        let is_direct_root =
+            self.is_module_top_scope() && self.current_module == crate::value::ROOT_MODULE_PATH;
+        let module_path = self
+            .function_modules
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.current_module.clone());
+        let definition = function_definition(
+            params,
+            body,
+            Some(name.to_string()),
+            module_path,
+            self.function_origin.clone(),
+            stmt.line,
+        )?;
+        self.functions
+            .insert(name.to_string(), Rc::clone(&definition));
+        if is_direct_root {
+            self.abi_declarations
+                .retain(|(existing, _, _)| existing != name);
+            self.abi_declarations
+                .push((name.to_string(), visibility, definition));
+        }
+        Ok(Signal::None)
+    }
+
+    fn exec_method_decl(
+        &mut self,
+        stmt: &Stmt,
+        type_name: &str,
+        method_name: &str,
+        params: &[Parameter],
+        body: &[Stmt],
+    ) -> Result<Signal, NyblError> {
+        // Methods belong to a *specific* type identity —
+        // `fn Color.area(self)` inside module `paint`
+        // registers under `(paint, Color)` and doesn't
+        // leak to `other.Color`. If the named type isn't
+        // declared in this module, that's an error at
+        // parse/emit consistency — fall back to the
+        // current module as the owner.
+        let type_key = (self.current_module.clone(), type_name.to_string());
+        let definition = function_definition(
+            params,
+            body,
+            None,
+            self.current_module.clone(),
+            self.function_origin.clone(),
+            stmt.line,
+        )?;
+        self.methods
+            .entry(type_key)
+            .or_default()
+            .insert(method_name.to_string(), definition);
+        Ok(Signal::None)
+    }
+
+    fn exec_struct_decl(
+        &mut self,
+        stmt: &Stmt,
+        name: &str,
+        fields: &[String],
+    ) -> Result<Signal, NyblError> {
+        // Reject duplicate field names at decl time so
+        // downstream code doesn't have to re-check. Walker,
+        // VM, and AOT all assume unique fields per struct.
+        let mut seen = alloc_import::collections::BTreeSet::new();
+        for f in fields {
+            if !seen.insert(f.clone()) {
+                return Err(error(
+                    stmt.line,
+                    format!("Struct `{name}` has duplicate field `{f}`"),
+                ));
+            }
+        }
+        // Type identity is `(current_module, name)` —
+        // two different modules declaring the same name
+        // coexist because their keys differ. A redecl
+        // *in the same module* is a no-op when the shape
+        // matches (mirrors the same-module idempotency
+        // rule for re-imports) and a clash otherwise.
+        let key = (self.current_module.clone(), name.to_string());
+        if let Some(existing) = self.struct_defs.get(&key) {
+            if existing.field_names() == fields {
+                self.bind_local_type(name);
+                return Ok(Signal::None);
+            }
+            return Err(error(
+                stmt.line,
+                format!("Struct `{name}` is already declared"),
+            ));
+        }
+        // The shape is built once per declaration; every
+        // value constructed from it shares the field names.
+        let shape = StructShape::new(key.0.clone(), key.1.clone(), fields.iter().cloned());
+        self.struct_defs.insert(key, shape);
+        self.bind_local_type(name);
+        Ok(Signal::None)
+    }
+
+    fn exec_enum_decl(
+        &mut self,
+        stmt: &Stmt,
+        name: &str,
+        variants: &[VariantDecl],
+    ) -> Result<Signal, NyblError> {
+        let key = (self.current_module.clone(), name.to_string());
+        if let Some(existing) = self.enum_defs.get(&key) {
+            // Same rule as `StructDecl` above — a
+            // same-module same-shape redeclaration is a
+            // no-op, anything else is a clash.
+            if variants_equivalent(existing, variants) {
+                self.bind_local_type(name);
+                return Ok(Signal::None);
+            }
+            return Err(error(
+                stmt.line,
+                format!("Enum `{name}` is already declared"),
+            ));
+        }
+        let mut seen_variants = alloc_import::collections::BTreeSet::new();
+        for v in variants {
+            if !seen_variants.insert(v.name.clone()) {
+                return Err(error(
+                    stmt.line,
+                    format!("Enum `{}` has duplicate variant `{}`", name, v.name),
+                ));
+            }
+            if let VariantKind::Struct(fields) | VariantKind::Tuple(fields) = &v.kind {
+                let mut seen_fields = alloc_import::collections::BTreeSet::new();
+                for f in fields {
+                    if !seen_fields.insert(f.clone()) {
+                        return Err(error(
+                            stmt.line,
+                            format!(
+                                "Enum variant `{}::{}` has duplicate field `{}`",
+                                name, v.name, f
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        self.enum_defs.insert(key, variants.to_vec());
+        self.bind_local_type(name);
+        Ok(Signal::None)
     }
 
     /// Execute a `use` statement.
@@ -2089,7 +2310,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         // a different source, which we treat as a hard error.
         for (key, fields) in &bindings.struct_defs {
             if let Some(existing) = self.struct_defs.get(key) {
-                if existing == fields {
+                if existing.field_names() == fields.field_names() {
                     continue;
                 }
                 return Err(error(
@@ -2429,7 +2650,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         }
 
         // Ask the host for source.
-        let resolved = self.host.resolve_module(path);
+        let resolved = self.host_hook(|host| host.resolve_module(path));
         let source = match resolved {
             Some(Ok(s)) => s,
             Some(Err(e)) => return Err(e),
@@ -2523,6 +2744,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             self.memory.clone(),
         );
         sub.steps = self.steps;
+        sub.group = self.group.clone();
         sub.rand_state = self.rand_state;
         sub.call_depth_base = self.call_depth_base + self.call_depth + 1;
         sub.nesting_used = self.nesting_used;
@@ -2614,7 +2836,7 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         // those out here to avoid duplicating them in the
         // importer's merge step.
         let builtin_mp = crate::value::BUILTIN_MODULE_PATH;
-        let struct_defs: Vec<((String, String), Vec<String>)> = sub
+        let struct_defs: Vec<((String, String), StructShape)> = sub
             .struct_defs
             .into_iter()
             .filter(|((mp, _), _)| mp != builtin_mp)
@@ -2738,6 +2960,34 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         payload: &VariantPayload,
         line: u32,
     ) -> Result<Value, NyblError> {
+        let (module_path, decl) = self.resolve_enum_variant(namespace, type_name, variant, line)?;
+
+        match (&decl.kind, payload) {
+            (VariantKind::Unit, VariantPayload::Unit) => Ok(Value::__new_enum_unit_in(
+                module_path,
+                type_name.to_string(),
+                variant.to_string(),
+                &self.memory,
+            )),
+            (VariantKind::Tuple(fields), VariantPayload::Tuple(args)) => {
+                self.eval_enum_tuple(module_path, type_name, variant, fields, args, line)
+            }
+            (VariantKind::Struct(decl_fields), VariantPayload::Struct(provided)) => {
+                self.eval_enum_struct(module_path, type_name, variant, decl_fields, provided, line)
+            }
+            (kind, _) => Err(enum_payload_error(kind, type_name, variant, line)),
+        }
+    }
+
+    /// Resolve `[namespace.]type_name::variant` to its owning module path and
+    /// declared variant.
+    fn resolve_enum_variant(
+        &self,
+        namespace: Option<&str>,
+        type_name: &str,
+        variant: &str,
+        line: u32,
+    ) -> Result<(String, VariantDecl), NyblError> {
         // Resolve the type reference to its full
         // `(module_path, type_name)` identity before validating
         // the variant shape. `namespace` means the source wrote
@@ -2774,102 +3024,96 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 }
             })?
             .clone();
+        Ok((module_path, decl))
+    }
 
-        match (&decl.kind, payload) {
-            (VariantKind::Unit, VariantPayload::Unit) => Ok(Value::__new_enum_unit_in(
-                module_path,
-                type_name.to_string(),
-                variant.to_string(),
-                &self.memory,
-            )),
-            (VariantKind::Tuple(fields), VariantPayload::Tuple(args)) => {
-                if args.len() != fields.len() {
-                    return Err(error(
-                        line,
-                        format!(
-                            "`{}::{}` expects {} argument{}, but got {}",
-                            type_name,
-                            variant,
-                            fields.len(),
-                            if fields.len() == 1 { "" } else { "s" },
-                            args.len()
-                        ),
-                    ));
-                }
-                let mut items = Vec::with_capacity(args.len());
-                for arg in args {
-                    items.push(self.eval_expr(arg)?);
-                }
-                Value::__try_new_enum_tuple_in(
-                    module_path,
-                    type_name.to_string(),
-                    variant.to_string(),
-                    items,
-                    line,
-                    &self.memory,
-                )
-            }
-            (VariantKind::Struct(decl_fields), VariantPayload::Struct(provided)) => {
-                let mut seen = alloc_import::collections::BTreeSet::new();
-                for (fname, _) in provided {
-                    if !seen.insert(fname.clone()) {
-                        return Err(error(
-                            line,
-                            format!("Field `{fname}` specified twice in `{type_name}::{variant}`"),
-                        ));
-                    }
-                    if !decl_fields.iter().any(|d| d == fname) {
-                        return Err(error(
-                            line,
-                            crate::error_messages::variant_has_no_field(type_name, variant, fname),
-                        ));
-                    }
-                }
-                for decl_field in decl_fields {
-                    if !seen.contains(decl_field) {
-                        return Err(error(
-                            line,
-                            format!(
-                                "Missing field `{decl_field}` in `{type_name}::{variant}` construction"
-                            ),
-                        ));
-                    }
-                }
-                let mut provided_map: BTreeMap<String, Value> = BTreeMap::new();
-                for (fname, fexpr) in provided {
-                    provided_map.insert(fname.clone(), self.eval_expr(fexpr)?);
-                }
-                let mut values: Vec<(String, Value)> = Vec::with_capacity(decl_fields.len());
-                for decl_field in decl_fields {
-                    values.push((
-                        decl_field.clone(),
-                        provided_map
-                            .remove(decl_field)
-                            .expect("variant shape validated before payload evaluation"),
-                    ));
-                }
-                Value::__try_new_enum_struct_in(
-                    module_path,
-                    type_name.to_string(),
-                    variant.to_string(),
-                    values,
-                    line,
-                    &self.memory,
-                )
-            }
-            (VariantKind::Unit, _) => Err(error(
+    fn eval_enum_tuple(
+        &mut self,
+        module_path: String,
+        type_name: &str,
+        variant: &str,
+        fields: &[String],
+        args: &[Expr],
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        if args.len() != fields.len() {
+            return Err(enum_tuple_arity_error(
+                type_name,
+                variant,
+                fields.len(),
+                args.len(),
                 line,
-                format!("Variant `{type_name}::{variant}` takes no payload"),
-            )),
-            (VariantKind::Tuple(_), _) => Err(error(
-                line,
-                format!("Variant `{type_name}::{variant}` expects positional arguments `(…)`"),
-            )),
-            (VariantKind::Struct(_), _) => Err(error(
-                line,
-                format!("Variant `{type_name}::{variant}` expects named fields `{{ … }}`"),
-            )),
+            ));
         }
+        let mut items = Vec::with_capacity(args.len());
+        for arg in args {
+            items.push(self.eval_expr(arg)?);
+        }
+        Value::__try_new_enum_tuple_in(
+            module_path,
+            type_name.to_string(),
+            variant.to_string(),
+            items,
+            line,
+            &self.memory,
+        )
+    }
+
+    fn eval_enum_struct(
+        &mut self,
+        module_path: String,
+        type_name: &str,
+        variant: &str,
+        decl_fields: &[String],
+        provided: &[(String, Expr)],
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        let mut seen = alloc_import::collections::BTreeSet::new();
+        for (fname, _) in provided {
+            if !seen.insert(fname.clone()) {
+                return Err(error(
+                    line,
+                    format!("Field `{fname}` specified twice in `{type_name}::{variant}`"),
+                ));
+            }
+            if !decl_fields.iter().any(|d| d == fname) {
+                return Err(error(
+                    line,
+                    crate::error_messages::variant_has_no_field(type_name, variant, fname),
+                ));
+            }
+        }
+        for decl_field in decl_fields {
+            if !seen.contains(decl_field) {
+                return Err(error(
+                    line,
+                    format!(
+                        "Missing field `{decl_field}` in `{type_name}::{variant}` construction"
+                    ),
+                ));
+            }
+        }
+        let mut provided_map: BTreeMap<String, Value> = BTreeMap::new();
+        for (fname, fexpr) in provided {
+            provided_map.insert(fname.clone(), self.eval_expr(fexpr)?);
+        }
+        let mut values: Vec<(String, Value)> = Vec::with_capacity(decl_fields.len());
+        for decl_field in decl_fields {
+            values.push((
+                decl_field.clone(),
+                provided_map
+                    .remove(decl_field)
+                    .expect("variant shape validated before payload evaluation"),
+            ));
+        }
+        Value::__try_new_enum_struct_in(
+            module_path,
+            type_name.to_string(),
+            variant.to_string(),
+            values,
+            line,
+            &self.memory,
+        )
     }
 
     fn exec_assign(
@@ -2987,517 +3231,27 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             ExprKind::Bool(b) => Ok(Value::Bool(*b)),
             ExprKind::None => Ok(Value::None),
 
-            ExprKind::StringInterp(parts) => {
-                let mut result = String::new();
-                for part in parts {
-                    match part {
-                        StringPart::Literal(s) => result.push_str(s),
-                        StringPart::Variable(name) => {
-                            let val = self.get_var_value(name).ok_or_else(|| {
-                                error_at(
-                                    expr.line,
-                                    expr.column,
-                                    crate::error_messages::variable_not_found(name),
-                                )
-                            })?;
-                            result.push_str(&format!("{val}"));
-                        }
-                    }
-                }
-                Ok(Value::__new_str_in(result, &self.memory))
-            }
+            ExprKind::StringInterp(parts) => self.eval_string_interp(expr, parts),
 
-            ExprKind::Ident(name) => {
-                // Lexical lookup first — matches the intuition that
-                // `let x = ...` locally shadows everything else.
-                if let Some(v) = self.get_var_value(name) {
-                    return Ok(v);
-                }
-                // Fall back to the canonical callable created when the named
-                // declaration was reached. First-class access only clones the
-                // `Rc`; it never clones or reconstructs the function AST.
-                if let Some(f) = self.lookup_function(name) {
-                    return Ok(Value::Fn(f));
-                }
-                // Typo? Offer a "did you mean" hint if something
-                // close is visible in the current scope / fn
-                // registry. Falls back to the original "did you
-                // forget `let`" when no candidate is similar
-                // enough.
-                let hint = self
-                    .value_candidates_hint(name)
-                    .unwrap_or_else(|| "Did you forget to create it with `let`?".to_string());
-                Err(error_with_hint_at(
-                    expr.line,
-                    expr.column,
-                    crate::error_messages::variable_not_found(name),
-                    hint,
-                ))
-            }
+            ExprKind::Ident(name) => self.eval_ident(expr, name),
 
-            ExprKind::BinaryOp { left, op, right } => {
-                // Short-circuit for && and ||
-                if matches!(op, BinOp::And) {
-                    let lval = self.eval_expr(left)?;
-                    if !lval.is_truthy() {
-                        return Ok(Value::Bool(false));
-                    }
-                    let rval = self.eval_expr(right)?;
-                    return Ok(Value::Bool(rval.is_truthy()));
-                }
-                if matches!(op, BinOp::Or) {
-                    let lval = self.eval_expr(left)?;
-                    if lval.is_truthy() {
-                        return Ok(Value::Bool(true));
-                    }
-                    let rval = self.eval_expr(right)?;
-                    return Ok(Value::Bool(rval.is_truthy()));
-                }
+            ExprKind::BinaryOp { left, op, right } => self.eval_binary(expr, left, op, right),
 
-                let lval = self.eval_expr(left)?;
-                let rval = self.eval_expr(right)?;
-                self.binary_op(&lval, op, &rval, expr.line)
-            }
+            ExprKind::UnaryOp { op, expr: inner } => self.eval_unary(expr, op, inner),
 
-            ExprKind::UnaryOp { op, expr: inner } => {
-                let val = self.eval_expr(inner)?;
-                match op {
-                    UnaryOp::Neg => ops::neg(&val, expr.line),
-                    UnaryOp::Not => Ok(ops::not(&val)),
-                }
-            }
+            ExprKind::Call { callee, args } => self.eval_call(expr, callee, args),
 
-            ExprKind::Call { callee, args } => {
-                if let ExprKind::Ident(name) = &callee.kind {
-                    // Lexical callable first: if the name is bound
-                    // to a `Value::Fn` in the current scope, call
-                    // it. A bound non-callable is an explicit
-                    // error — "shadowing a builtin with a number
-                    // then calling it" should fail loudly, not
-                    // silently dispatch to the builtin.
-                    if let Some(v) = self.get_var(name).cloned() {
-                        return match v {
-                            Value::Fn(func) => self.eval_nybl_call(func, args, expr.line, name),
-                            other => Err(error(
-                                expr.line,
-                                format!("`{}` is a {}, not a function", name, other.type_name()),
-                            )),
-                        };
-                    }
-                    let declaration_alias =
-                        self.active_lexical_contexts.last().and_then(|context| {
-                            if context.module_aliases.is_empty() {
-                                None
-                            } else {
-                                context.module_aliases.get(name).cloned()
-                            }
-                        });
-                    if declaration_alias.is_some() {
-                        return Err(error(
-                            expr.line,
-                            format!("`{name}` is a module, not a function"),
-                        ));
-                    }
-                    if let Some(function) = self.lookup_function(name) {
-                        // Preserve the established host-before-named-function
-                        // dispatch for legacy value-only calls. Ref-aware
-                        // calls must use the retained Nybl callable metadata so
-                        // their staged targets can be committed transactionally.
-                        if function
-                            .param_modes
-                            .iter()
-                            .all(|mode| *mode == ParamMode::Value)
-                            && args.iter().all(|arg| arg.mode == ParamMode::Value)
-                        {
-                            if args.len() != function.params.len() {
-                                return Err(error(
-                                    expr.line,
-                                    format!(
-                                        "`{}` expects {} argument{}, but got {}",
-                                        name,
-                                        function.params.len(),
-                                        if function.params.len() == 1 { "" } else { "s" },
-                                        args.len()
-                                    ),
-                                ));
-                            }
-                            let mut eval_args = Vec::with_capacity(args.len());
-                            for arg in args {
-                                eval_args.push(self.eval_expr(&arg.value)?);
-                            }
-                            return self.call_function(name, eval_args, expr.line, Some(function));
-                        }
-                        return self.eval_nybl_call(function, args, expr.line, name);
-                    }
-
-                    let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
-                    crate::validate_value_only_call_modes(name, &actual_modes, expr.line)?;
-                    self.validate_builtin_arity(name, args.len(), expr.line)?;
-                    let mut eval_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        eval_args.push(self.eval_expr(&arg.value)?);
-                    }
-                    return self.call_function(name, eval_args, expr.line, None);
-                }
-
-                // The callee expression is always resolved exactly once before
-                // preflight and before any argument expression.
-                let callee_val = self.eval_expr(callee)?;
-                match callee_val {
-                    Value::Fn(func) => {
-                        let label = func.self_name.as_deref().unwrap_or("fn").to_string();
-                        self.eval_nybl_call(func, args, expr.line, &label)
-                    }
-                    other => Err(error(
-                        expr.line,
-                        crate::error_messages::cant_call_a(other.type_name()),
-                    )),
-                }
-            }
-
-            ExprKind::Lambda { params, body } => {
-                let free_variables = FreeVariableCollector::for_lambda(params).finish(body);
-                if free_variables.iter().any(|name| {
-                    self.resolve_binding_identity(name)
-                        .is_some_and(|identity| self.active_ref_bindings.contains(&identity))
-                }) {
-                    return Err(crate::ref_params::ref_capture_error(expr.line));
-                }
-                let captures = self.snapshot_captures(&free_variables);
-                let module_path = self
-                    .function_modules
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| self.current_module.clone());
-                let (param_names, param_modes) = parameter_metadata(params);
-                NyblFn::try_new_ast_in_module_with_origin_and_modes(
-                    param_names,
-                    param_modes,
-                    captures,
-                    body.clone(),
-                    None,
-                    Some(module_path),
-                    self.function_origin.clone(),
-                    expr.line,
-                )
-                .map(Value::Fn)
-            }
+            ExprKind::Lambda { params, body } => self.eval_lambda(expr, params, body),
 
             ExprKind::MethodCall {
                 object,
                 method,
                 args,
-            } => {
-                let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
+            } => self.eval_method_call(expr, object, method, args),
 
-                // Keep the direct-binding fast path for a bare array or dict.
-                // It avoids manufacturing a second CoW owner immediately
-                // before mutation, which preserves exact instance memory
-                // accounting.
-                if let ExprKind::Ident(name) = &object.kind
-                    && self.get_var(name).is_some_and(|value| {
-                        methods::is_mutating_collection_receiver(value, method)
-                    })
-                {
-                    crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
-                    let expected = methods::builtin_method_arity(method)
-                        .expect("mutating built-in has arity metadata");
-                    if args.len() != expected {
-                        return Err(error(
-                            expr.line,
-                            format!(
-                                "`.{}()` needs {} argument{}",
-                                method,
-                                expected,
-                                if expected == 1 { "" } else { "s" }
-                            ),
-                        ));
-                    }
-                    methods::reject_constant_array_mutation(name, method, expr.line)?;
-                    let target = self
-                        .resolve_binding_identity(name)
-                        .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
-                    if self.active_capture_bindings.contains(&target) {
-                        return Err(crate::ref_params::captured_ref_target(1, expr.line));
-                    }
-                    let mut eval_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        eval_args.push(self.eval_expr(&arg.value)?);
-                    }
-                    if let Some(error) = self.pending_memory_error(expr.line) {
-                        return Err(error);
-                    }
-                    let binding = self
-                        .scopes
-                        .get_mut(target.scope)
-                        .and_then(|scope| scope.get_mut(&target.name))
-                        .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
-                    return methods::transactional_collection_method_in(
-                        binding,
-                        method,
-                        eval_args,
-                        expr.line,
-                        &self.memory,
-                    );
-                }
+            ExprKind::Index { object, index } => self.eval_index(expr, object, index),
 
-                // Preserve a resolved place while evaluating an index/field
-                // receiver exactly once. Read-only methods use only the leaf;
-                // mutating built-ins and `ref self` methods can later commit a
-                // replacement leaf through the retained projection chain.
-                let mut receiver_place = if let Some(plan) = self.read_place_plan(object) {
-                    Some(self.resolve_place(plan, 1, expr.line)?)
-                } else {
-                    None
-                };
-                let obj_val = if let Some(place) = &receiver_place {
-                    self.place_value_from(&place.root, &place.projections, expr.line)?
-                } else {
-                    self.eval_expr(object)?
-                };
-
-                if methods::is_mutating_collection_receiver(&obj_val, method)
-                    && receiver_place.is_some()
-                {
-                    crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
-                    let expected = methods::builtin_method_arity(method)
-                        .expect("mutating built-in has arity metadata");
-                    if args.len() != expected {
-                        return Err(error(
-                            expr.line,
-                            format!(
-                                "`.{}()` needs {} argument{}",
-                                method,
-                                expected,
-                                if expected == 1 { "" } else { "s" }
-                            ),
-                        ));
-                    }
-                    let place = receiver_place
-                        .take()
-                        .expect("place presence checked for mutating receiver");
-                    self.validate_mutable_place(&place, 1, expr.line)?;
-                    let mut eval_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        eval_args.push(self.eval_expr(&arg.value)?);
-                    }
-                    if let Some(error) = self.pending_memory_error(expr.line) {
-                        return Err(error);
-                    }
-                    // Arguments may mutate the same root. Copy-in therefore
-                    // occurs after argument evaluation, using the already
-                    // evaluated projection values.
-                    let current_root = self
-                        .binding_value(&place.target)
-                        .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
-                    let mut leaf =
-                        self.place_value_from(&current_root, &place.projections, expr.line)?;
-                    let result = methods::transactional_collection_method_in(
-                        &mut leaf,
-                        method,
-                        eval_args,
-                        expr.line,
-                        &self.memory,
-                    )?;
-                    let committed = ResolvedPlace {
-                        target: place.target,
-                        root: current_root,
-                        projections: place.projections,
-                    };
-                    self.commit_ref_places(&[committed], vec![leaf], expr.line)?;
-                    return Ok(result);
-                }
-                let type_key: Option<(String, String)> = match &obj_val {
-                    Value::Struct(s) => {
-                        Some((s.module_path().to_string(), s.type_name().to_string()))
-                    }
-                    Value::EnumVariant(e) => {
-                        Some((e.module_path().to_string(), e.type_name().to_string()))
-                    }
-                    _ => None,
-                };
-                if let Some(key) = type_key {
-                    let user = self
-                        .methods
-                        .get(&key)
-                        .and_then(|ms| ms.get(method))
-                        .cloned();
-                    if let Some(m) = user {
-                        let receiver_place = if m
-                            .param_modes
-                            .first()
-                            .is_some_and(|mode| *mode == ParamMode::Ref)
-                        {
-                            let Some(place) = receiver_place.take() else {
-                                let mut error = NyblError::runtime(
-                                    "a `ref` method receiver must be a mutable place",
-                                    expr.line,
-                                );
-                                error.friendly_hint = Some(
-                                    "Store the value in a `let` binding, or call through one of its fields or indexes."
-                                        .to_string(),
-                                );
-                                return Err(error);
-                            };
-                            self.validate_mutable_place(&place, 1, expr.line)?;
-                            Some(place)
-                        } else {
-                            None
-                        };
-                        return self.eval_user_method_call(
-                            MethodReceiver {
-                                value: obj_val,
-                                place: receiver_place,
-                            },
-                            &key.1,
-                            method,
-                            m,
-                            args,
-                            expr.line,
-                        );
-                    }
-                }
-
-                // Module export calls retain callable metadata too. Common
-                // value methods still win over an export with the same name.
-                if let Value::Module(module) = &obj_val
-                    && !matches!(method.as_str(), "type" | "to_str" | "inspect")
-                {
-                    let callee = self.module_binding(module, method).ok_or_else(|| {
-                        error(
-                            expr.line,
-                            format!("`{}` isn't exported from `{}`", method, module.path),
-                        )
-                    })?;
-                    return match callee {
-                        Value::Fn(func) => self.eval_nybl_call(func, args, expr.line, method),
-                        other => Err(error(
-                            expr.line,
-                            format!("`{}` is a {}, not a function", method, other.type_name()),
-                        )),
-                    };
-                }
-
-                // Index and field reads currently produce values,
-                // not write-back places. Reject only built-in array
-                // mutations on those syntactic receiver forms so
-                // they cannot silently mutate-and-discard. Genuine
-                // temporaries remain legal, and user methods above
-                // retain precedence even when named `push`, `pop`,
-                // and so on.
-                if matches!(
-                    &object.kind,
-                    ExprKind::Index { .. } | ExprKind::FieldAccess { .. }
-                ) {
-                    methods::reject_nested_array_mutation(&obj_val, method, expr.line)?;
-                }
-
-                crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
-                if !matches!(&obj_val, Value::Host(_))
-                    && let Some(expected) = methods::builtin_method_arity(method)
-                    && args.len() != expected
-                {
-                    return Err(error(
-                        expr.line,
-                        format!(
-                            "`.{}()` needs {} argument{}",
-                            method,
-                            expected,
-                            if expected == 1 { "" } else { "s" }
-                        ),
-                    ));
-                }
-                let mut eval_args = Vec::with_capacity(args.len());
-                for arg in args {
-                    eval_args.push(self.eval_expr(&arg.value)?);
-                }
-
-                // Callable-taking Result methods — `r.map(f)`,
-                // `r.map_err(f)`, `r.and_then(f)`. These need the
-                // evaluator's call primitive to invoke `f`, which
-                // `call_method` doesn't have access to, so they
-                // dispatch inline before the pure `call_method`
-                // fall-through. Receiver must be the built-in
-                // Result; user enums named `Result` don't qualify.
-                if methods::is_builtin_result(&obj_val)
-                    && let Some(kind) = methods::is_result_callable_method(method)
-                {
-                    return self
-                        .call_result_callable_method(&obj_val, kind, method, eval_args, expr.line);
-                }
-
-                let (ret, mutated) = self.call_method(&obj_val, method, &eval_args, expr.line)?;
-                // A true temporary mutates its staged owned value and discards
-                // the update. Named array receivers returned through the
-                // transactional path above.
-                let _ = mutated;
-                Ok(ret)
-            }
-
-            ExprKind::Index { object, index } => {
-                let obj = self.eval_expr(object)?;
-                let idx = self.eval_expr(index)?;
-                ops::index_get_in(&obj, &idx, expr.line, &self.memory)
-            }
-
-            ExprKind::FieldAccess { object, field } => {
-                let obj = self.eval_expr(object)?;
-                match &obj {
-                    Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
-                        let msg = crate::error_messages::struct_has_no_field(s.type_name(), field);
-                        // Suggest from the struct's own declared
-                        // field list — `p.z` when `Point` has `x`
-                        // and `y` should point to `x`/`y`.
-                        let field_names: Vec<&str> =
-                            s.fields().iter().map(|(k, _)| k.as_str()).collect();
-                        match crate::suggest::did_you_mean(field, field_names) {
-                            Some(hint) => error_with_hint_at(expr.line, expr.column, msg, hint),
-                            None => error_at(expr.line, expr.column, msg),
-                        }
-                    }),
-                    Value::EnumVariant(e) => e.field(field).cloned().ok_or_else(|| {
-                        error(
-                            expr.line,
-                            crate::error_messages::variant_has_no_field(
-                                e.type_name(),
-                                e.variant(),
-                                field,
-                            ),
-                        )
-                    }),
-                    Value::Module(m) => {
-                        // `alias.name` — look up an export in the
-                        // aliased module.
-                        if let Some(v) = self.module_binding(m, field) {
-                            return Ok(v);
-                        }
-                        if m.has_type(field) {
-                            // Types aren't first-class values; the
-                            // parser should have taken the namespaced
-                            // struct-lit / variant-ctor path
-                            // already. Reaching a FieldAccess here
-                            // means the user wrote `m.Type` in a
-                            // value-returning position.
-                            let alias = m.path.rsplit('.').next().unwrap_or(&m.path);
-                            return Err(error_with_hint(
-                                expr.line,
-                                format!("`{}` in `{}` is a type, not a value", field, m.path),
-                                format!(
-                                    "construct through the alias: `{alias}.{field} {{ ... }}` or `{alias}.{field}::Variant(...)`",
-                                ),
-                            ));
-                        }
-                        Err(error(
-                            expr.line,
-                            format!("`{}` isn't exported from `{}`", field, m.path),
-                        ))
-                    }
-                    other => Err(error(
-                        expr.line,
-                        crate::error_messages::cant_read_field(field, other.type_name()),
-                    )),
-                }
-            }
+            ExprKind::FieldAccess { object, field } => self.eval_field_access(expr, object, field),
 
             ExprKind::EnumConstruct {
                 namespace,
@@ -3516,119 +3270,1007 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 namespace,
                 type_name,
                 fields,
-            } => {
-                let module_path = match namespace {
-                    Some(ns) => {
-                        self.validate_namespaced_type(ns, type_name, expr.line)?;
-                        self.resolve_type_ref(Some(ns), type_name)
-                            .unwrap_or_else(|| self.current_module.clone())
-                    }
-                    None => self.resolve_type_ref(None, type_name).ok_or_else(|| {
-                        error(
-                            expr.line,
-                            crate::error_messages::struct_not_declared(type_name),
-                        )
-                    })?,
-                };
-                let key = (module_path.clone(), type_name.clone());
-                let decl_fields = self
-                    .struct_defs
-                    .get(&key)
-                    .ok_or_else(|| {
-                        error(
-                            expr.line,
-                            crate::error_messages::struct_not_declared(type_name),
-                        )
-                    })?
-                    .clone();
-                // Enforce exactly-this-field-set at construction:
-                // no duplicates, no unknown fields, no missing
-                // fields. The per-field loops below produce the
-                // specific messages the tests assert on.
-                let mut seen = alloc_import::collections::BTreeSet::new();
-                for (fname, _) in fields {
-                    if !seen.insert(fname.clone()) {
-                        return Err(error(
-                            expr.line,
-                            format!(
-                                "Field `{fname}` specified twice in `{type_name}` construction"
-                            ),
-                        ));
-                    }
-                    if !decl_fields.iter().any(|d| d == fname) {
-                        let msg = crate::error_messages::struct_has_no_field(type_name, fname);
-                        let err = match crate::suggest::did_you_mean(
-                            fname,
-                            decl_fields.iter().map(|s| s.as_str()),
-                        ) {
-                            Some(hint) => error_with_hint_at(expr.line, expr.column, msg, hint),
-                            None => error_at(expr.line, expr.column, msg),
-                        };
-                        return Err(err);
-                    }
-                }
-                for decl in &decl_fields {
-                    if !seen.contains(decl) {
-                        return Err(error(
-                            expr.line,
-                            format!("Missing field `{decl}` in `{type_name}` construction"),
-                        ));
-                    }
-                }
-                let mut provided: BTreeMap<String, Value> = BTreeMap::new();
-                for (fname, fexpr) in fields {
-                    provided.insert(fname.clone(), self.eval_expr(fexpr)?);
-                }
-                let mut values: Vec<(String, Value)> = Vec::with_capacity(decl_fields.len());
-                for decl in &decl_fields {
-                    values.push((
-                        decl.clone(),
-                        provided
-                            .remove(decl)
-                            .expect("struct shape validated before payload evaluation"),
-                    ));
-                }
-                Value::__try_new_struct_in(
-                    module_path,
-                    type_name.clone(),
-                    values,
-                    expr.line,
-                    &self.memory,
-                )
-            }
+            } => self.eval_struct_construct(expr, namespace.as_deref(), type_name, fields),
 
-            ExprKind::Array(elements) => {
-                let mut items = Vec::new();
-                for elem in elements {
-                    items.push(self.eval_expr(elem)?);
-                }
-                Value::__try_new_array_in(items, expr.line, &self.memory)
-            }
+            ExprKind::Array(elements) => self.eval_array(expr, elements),
 
-            ExprKind::Dict(entries) => {
-                let mut result = Vec::new();
-                for (key, value_expr) in entries {
-                    let val = self.eval_expr(value_expr)?;
-                    result.push((key.clone(), val));
-                }
-                Value::__try_new_dict_in(result, expr.line, &self.memory)
-            }
+            ExprKind::Dict(entries) => self.eval_dict(expr, entries),
 
             ExprKind::IfExpr {
                 condition,
                 then_expr,
                 else_expr,
-            } => {
-                if self.eval_expr(condition)?.is_truthy() {
-                    self.eval_expr(then_expr)
-                } else {
-                    self.eval_expr(else_expr)
-                }
-            }
+            } => self.eval_if_expr(condition, then_expr, else_expr),
 
             ExprKind::Match { scrutinee, arms } => self.eval_match(scrutinee, arms, expr.line),
 
             ExprKind::Try(inner) => self.eval_try(inner, expr.line),
+        }
+    }
+
+    fn eval_string_interp(
+        &mut self,
+        expr: &Expr,
+        parts: &[StringPart],
+    ) -> Result<Value, NyblError> {
+        let mut result = String::new();
+        for part in parts {
+            match part {
+                StringPart::Literal(s) => result.push_str(s),
+                StringPart::Variable(name) => {
+                    let val = self.get_var_value(name).ok_or_else(|| {
+                        error_at(
+                            expr.line,
+                            expr.column,
+                            crate::error_messages::variable_not_found(name),
+                        )
+                    })?;
+                    result.push_str(&format!("{val}"));
+                }
+            }
+        }
+        Ok(Value::__new_str_in(result, &self.memory))
+    }
+
+    fn eval_ident(&mut self, expr: &Expr, name: &str) -> Result<Value, NyblError> {
+        // Lexical lookup first — matches the intuition that
+        // `let x = ...` locally shadows everything else.
+        if let Some(v) = self.get_var_value(name) {
+            return Ok(v);
+        }
+        // Fall back to the canonical callable created when the named
+        // declaration was reached. First-class access only clones the
+        // `Rc`; it never clones or reconstructs the function AST.
+        if let Some(f) = self.lookup_function(name) {
+            return Ok(Value::Fn(f));
+        }
+        // Typo? Offer a "did you mean" hint if something
+        // close is visible in the current scope / fn
+        // registry. Falls back to the original "did you
+        // forget `let`" when no candidate is similar
+        // enough.
+        let hint = self
+            .value_candidates_hint(name)
+            .unwrap_or_else(|| "Did you forget to create it with `let`?".to_string());
+        Err(error_with_hint_at(
+            expr.line,
+            expr.column,
+            crate::error_messages::variable_not_found(name),
+            hint,
+        ))
+    }
+
+    fn eval_binary(
+        &mut self,
+        expr: &Expr,
+        left: &Expr,
+        op: &BinOp,
+        right: &Expr,
+    ) -> Result<Value, NyblError> {
+        // Short-circuit for && and ||
+        if matches!(op, BinOp::And | BinOp::Or) {
+            return self.eval_short_circuit(left, op, right);
+        }
+
+        let lval = self.eval_expr(left)?;
+        let rval = self.eval_expr(right)?;
+        self.binary_op(&lval, op, &rval, expr.line)
+    }
+
+    fn eval_short_circuit(
+        &mut self,
+        left: &Expr,
+        op: &BinOp,
+        right: &Expr,
+    ) -> Result<Value, NyblError> {
+        if matches!(op, BinOp::And) {
+            let lval = self.eval_expr(left)?;
+            if !lval.is_truthy() {
+                return Ok(Value::Bool(false));
+            }
+            let rval = self.eval_expr(right)?;
+            return Ok(Value::Bool(rval.is_truthy()));
+        }
+        let lval = self.eval_expr(left)?;
+        if lval.is_truthy() {
+            return Ok(Value::Bool(true));
+        }
+        let rval = self.eval_expr(right)?;
+        Ok(Value::Bool(rval.is_truthy()))
+    }
+
+    fn eval_unary(&mut self, expr: &Expr, op: &UnaryOp, inner: &Expr) -> Result<Value, NyblError> {
+        let val = self.eval_expr(inner)?;
+        match op {
+            UnaryOp::Neg => ops::neg(&val, expr.line),
+            UnaryOp::Not => Ok(ops::not(&val)),
+        }
+    }
+
+    /// A call expression. The callee and every check that precedes argument
+    /// evaluation are resolved in [`Self::call_target`], and staging and the
+    /// call itself run in [`Self::finish_call`], so this frame, which stays
+    /// live while the arguments are evaluated, holds little beyond the
+    /// chosen target.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
+    fn eval_call(
+        &mut self,
+        expr: &Expr,
+        callee: &Expr,
+        args: &[CallArg],
+    ) -> Result<Value, NyblError> {
+        let target = match self.call_target(expr, callee, args) {
+            Ok(target) => target,
+            Err(error) => return Err(error),
+        };
+        // Argument expressions run left to right, inline here rather than in
+        // a shared helper so optimised builds keep one frame per level. A
+        // `ref` argument gets a `None` placeholder: its place is
+        // intentionally not read yet, so side effects of these expressions
+        // are visible in the copy-in snapshot staged afterwards.
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(match arg.mode {
+                ParamMode::Value => match self.eval_expr(&arg.value) {
+                    Ok(value) => value,
+                    Err(error) => return Err(error),
+                },
+                ParamMode::Ref => Value::None,
+                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
+            });
+        }
+        self.finish_call(target, values, args, expr.line)
+    }
+
+    /// Resolve what a call invokes and run every check that precedes its
+    /// argument expressions.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
+    fn call_target<'a>(
+        &mut self,
+        expr: &Expr,
+        callee: &'a Expr,
+        args: &[CallArg],
+    ) -> Result<CallTarget<'a>, NyblError> {
+        if let ExprKind::Ident(name) = &callee.kind {
+            return self.named_call_target(expr, name, args);
+        }
+
+        // The callee expression is always resolved exactly once before
+        // preflight and before any argument expression.
+        let callee_val = match self.eval_expr(callee) {
+            Ok(value) => value,
+            Err(error) => return Err(error),
+        };
+        match callee_val {
+            Value::Fn(func) => self.nybl_call_target(func, args, expr.line, None),
+            other => Err(cant_call_error(&other, expr.line)),
+        }
+    }
+
+    /// Resolve a call through a bare name: a lexical callable, a declared
+    /// function, or a builtin/host function.
+    fn named_call_target<'a>(
+        &self,
+        expr: &Expr,
+        name: &'a str,
+        args: &[CallArg],
+    ) -> Result<CallTarget<'a>, NyblError> {
+        // Lexical callable first: if the name is bound
+        // to a `Value::Fn` in the current scope, call
+        // it. A bound non-callable is an explicit
+        // error — "shadowing a builtin with a number
+        // then calling it" should fail loudly, not
+        // silently dispatch to the builtin.
+        if let Some(v) = self.get_var(name).cloned() {
+            return match v {
+                Value::Fn(func) => self.nybl_call_target(func, args, expr.line, Some(name)),
+                other => Err(error(
+                    expr.line,
+                    format!("`{}` is a {}, not a function", name, other.type_name()),
+                )),
+            };
+        }
+        let declaration_alias = self.active_lexical_contexts.last().and_then(|context| {
+            if context.module_aliases.is_empty() {
+                None
+            } else {
+                context.module_aliases.get(name).cloned()
+            }
+        });
+        if declaration_alias.is_some() {
+            return Err(error(
+                expr.line,
+                format!("`{name}` is a module, not a function"),
+            ));
+        }
+        if let Some(function) = self.lookup_function(name) {
+            // Preserve the established host-before-named-function
+            // dispatch for legacy value-only calls. Ref-aware
+            // calls must use the retained Nybl callable metadata so
+            // their staged targets can be committed transactionally.
+            if function
+                .param_modes
+                .iter()
+                .all(|mode| *mode == ParamMode::Value)
+                && args.iter().all(|arg| arg.mode == ParamMode::Value)
+            {
+                if args.len() != function.params.len() {
+                    return Err(named_call_arity_error(
+                        name,
+                        function.params.len(),
+                        args.len(),
+                        expr.line,
+                    ));
+                }
+                return Ok(CallTarget::Declared { function, name });
+            }
+            return self.nybl_call_target(function, args, expr.line, Some(name));
+        }
+        // A builtin or host function.
+        let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
+        crate::validate_value_only_call_modes(name, &actual_modes, expr.line)?;
+        self.validate_builtin_arity(name, args.len(), expr.line)?;
+        Ok(CallTarget::Builtin { name })
+    }
+
+    /// Check a ref-aware call to a Nybl function. `callable` names it in
+    /// error messages; `None` uses the function's own name.
+    fn nybl_call_target<'a>(
+        &self,
+        func: Rc<NyblFn>,
+        args: &[CallArg],
+        line: u32,
+        callable: Option<&str>,
+    ) -> Result<CallTarget<'a>, NyblError> {
+        let plans = self.check_nybl_call_args(&func, args, line, callable)?;
+        Ok(CallTarget::Nybl { func, plans })
+    }
+
+    /// Stage and run a call whose arguments have been evaluated.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
+    fn finish_call(
+        &mut self,
+        target: CallTarget<'_>,
+        values: Vec<Value>,
+        args: &[CallArg],
+        line: u32,
+    ) -> Result<Value, NyblError> {
+        let (func, plans) = match target {
+            CallTarget::Nybl { func, plans } => (func, plans),
+            CallTarget::Declared { function, name } => {
+                return self.call_function(name, values, line, Some(function));
+            }
+            CallTarget::Builtin { name } => return self.call_function(name, values, line, None),
+        };
+        let staged = match self.stage_nybl_call_args(plans, values, args, line) {
+            Ok(staged) => staged,
+            Err(error) => return Err(error),
+        };
+        // The staged places stay alive for the whole call, as the `ref`
+        // transaction requires. (Inline rather than a shared helper so
+        // optimised builds add no frame below a function body.)
+        let StagedCall {
+            args: call_args,
+            places,
+            ref_positions,
+        } = staged;
+        let (value, outputs) =
+            match self.call_nybl_fn_with_refs(&func, call_args, &ref_positions, line) {
+                Ok(result) => result,
+                Err(error) => return Err(error),
+            };
+        match self.commit_ref_places(&places, outputs, line) {
+            Ok(()) => Ok(value),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn eval_lambda(
+        &mut self,
+        expr: &Expr,
+        params: &[Parameter],
+        body: &[Stmt],
+    ) -> Result<Value, NyblError> {
+        let free_variables = FreeVariableCollector::for_lambda(params).finish(body);
+        if free_variables.iter().any(|name| {
+            self.resolve_binding_identity(name)
+                .is_some_and(|identity| self.active_ref_bindings.contains(&identity))
+        }) {
+            return Err(crate::ref_params::ref_capture_error(expr.line));
+        }
+        let captures = self.snapshot_captures(&free_variables);
+        let module_path = self
+            .function_modules
+            .last()
+            .cloned()
+            .unwrap_or_else(|| self.current_module.clone());
+        let (param_names, param_modes) = parameter_metadata(params);
+        NyblFn::try_new_ast_in_module_with_origin_and_modes(
+            param_names,
+            param_modes,
+            captures,
+            body.to_vec(),
+            None,
+            Some(module_path),
+            self.function_origin.clone(),
+            expr.line,
+        )
+        .map(Value::Fn)
+    }
+
+    /// A method call. Every check that precedes argument evaluation runs
+    /// in the `*_site` helpers, and the call itself in
+    /// [`Self::finish_method_call`], so this frame, which stays live while
+    /// the receiver and arguments are evaluated, holds only the receiver,
+    /// its place, and the chosen target.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
+    #[inline(never)]
+    fn eval_method_call(
+        &mut self,
+        expr: &Expr,
+        object: &Expr,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<Value, NyblError> {
+        // Keep the direct-binding fast path for a bare array or dict.
+        // It avoids manufacturing a second CoW owner immediately
+        // before mutation, which preserves exact instance memory
+        // accounting.
+        //
+        // Otherwise preserve a resolved place while evaluating an
+        // index/field receiver exactly once. Read-only methods use only
+        // the leaf; mutating built-ins and `ref self` methods can later
+        // commit a replacement leaf through the retained projection chain.
+        let site = if matches!(
+            object.kind,
+            ExprKind::Ident(_) | ExprKind::Index { .. } | ExprKind::FieldAccess { .. }
+        ) {
+            self.binding_receiver_site(expr, object, method, args)
+        } else {
+            match self.eval_expr(object) {
+                Ok(value) => self.method_site(expr, object, None, value, method, args),
+                Err(error) => Err(error),
+            }
+        };
+        let site = match site {
+            Ok(site) => site,
+            Err(error) => return Err(error),
+        };
+        // Argument expressions run left to right, inline here rather than in
+        // a shared helper so optimised builds keep one frame per level. A
+        // `ref` argument gets a `None` placeholder: its place is
+        // intentionally not read yet, so side effects of these expressions
+        // are visible in the copy-in snapshot staged afterwards.
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(match arg.mode {
+                ParamMode::Value => match self.eval_expr(&arg.value) {
+                    Ok(value) => value,
+                    Err(error) => return Err(error),
+                },
+                ParamMode::Ref => Value::None,
+                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
+            });
+        }
+        self.finish_method_call(expr, method, args, site, values)
+    }
+
+    /// A binding, index, or field receiver: the bare-collection fast path,
+    /// a resolved place, or (for a root that is not a binding) a plain
+    /// value.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
+    #[inline(never)]
+    fn binding_receiver_site(
+        &mut self,
+        expr: &Expr,
+        object: &Expr,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<MethodCallSite, NyblError> {
+        if let ExprKind::Ident(name) = &object.kind
+            && self.is_binding_collection_receiver(name, method)
+        {
+            return self.binding_collection_site(expr, name, method, args);
+        }
+        if let Some(plan) = self.read_place_plan(object) {
+            return match self.resolve_place(plan, 1, expr.line) {
+                Ok(place) => self.place_receiver_site(expr, object, place, method, args),
+                Err(error) => Err(error),
+            };
+        }
+        match self.eval_expr(object) {
+            Ok(value) => self.method_site(expr, object, None, value, method, args),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[inline(never)]
+    fn binding_collection_site(
+        &self,
+        expr: &Expr,
+        name: &str,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<MethodCallSite, NyblError> {
+        let binding = self.binding_collection_target(expr, name, method, args)?;
+        Ok(MethodCallSite {
+            place: None,
+            value: Value::None,
+            target: MethodTarget::BindingCollection(binding),
+        })
+    }
+
+    /// Read an index or field receiver's leaf from its resolved place.
+    #[inline(never)]
+    fn place_receiver_site(
+        &self,
+        expr: &Expr,
+        object: &Expr,
+        place: ResolvedPlace,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<MethodCallSite, NyblError> {
+        let value = self.place_value_from(&place.root, &place.projections, expr.line)?;
+        self.method_site(expr, object, Some(place), value, method, args)
+    }
+
+    fn method_site(
+        &self,
+        expr: &Expr,
+        object: &Expr,
+        place: Option<ResolvedPlace>,
+        value: Value,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<MethodCallSite, NyblError> {
+        let target = self.method_target(expr, object, &value, place.as_ref(), method, args)?;
+        Ok(MethodCallSite {
+            place,
+            value,
+            target,
+        })
+    }
+
+    fn is_binding_collection_receiver(&self, name: &str, method: &str) -> bool {
+        self.get_var(name)
+            .is_some_and(|value| methods::is_mutating_collection_receiver(value, method))
+    }
+
+    /// Choose how a method call on an evaluated receiver dispatches and run
+    /// that path's checks, all before any argument expression.
+    fn method_target(
+        &self,
+        expr: &Expr,
+        object: &Expr,
+        obj_val: &Value,
+        receiver_place: Option<&ResolvedPlace>,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<MethodTarget, NyblError> {
+        if methods::is_mutating_collection_receiver(obj_val, method)
+            && let Some(place) = receiver_place
+        {
+            self.check_place_collection_method(expr, place, method, args)?;
+            return Ok(MethodTarget::PlaceCollection);
+        }
+        let type_key: Option<(String, String)> = match obj_val {
+            Value::Struct(s) => Some((s.module_path().to_string(), s.type_name().to_string())),
+            Value::EnumVariant(e) => Some((e.module_path().to_string(), e.type_name().to_string())),
+            _ => None,
+        };
+        if let Some(key) = type_key {
+            let user = self
+                .methods
+                .get(&key)
+                .and_then(|ms| ms.get(method))
+                .cloned();
+            if let Some(m) = user {
+                let ref_receiver = self.check_user_method_receiver(expr, &m, receiver_place)?;
+                let ref_place = if ref_receiver { receiver_place } else { None };
+                let plans =
+                    self.check_user_method_args(ref_place, &m, &key.1, method, args, expr.line)?;
+                return Ok(MethodTarget::User {
+                    definition: m,
+                    ref_receiver,
+                    plans,
+                });
+            }
+        }
+
+        // Module export calls retain callable metadata too. Common
+        // value methods still win over an export with the same name.
+        if let Value::Module(module) = obj_val
+            && !matches!(method, "type" | "to_str" | "inspect")
+        {
+            let func = self.module_export_callee(expr, module, method)?;
+            let plans = self.check_nybl_call_args(&func, args, expr.line, Some(method))?;
+            return Ok(MethodTarget::ModuleExport { func, plans });
+        }
+
+        Self::check_builtin_method_call(expr, object, obj_val, method, args)?;
+        Ok(MethodTarget::Builtin)
+    }
+
+    /// Run a method call whose arguments have been evaluated. The receiver
+    /// value and any unused receiver place stay alive until the call
+    /// returns.
+    // Recursion path: `match` instead of `?` because, unoptimised, each `?`
+    // reserves several error-sized temporaries in this frame, which every
+    // nesting level pays (see RUN-002).
+    #[allow(clippy::question_mark)]
+    #[inline(never)]
+    fn finish_method_call(
+        &mut self,
+        expr: &Expr,
+        method: &str,
+        args: &[CallArg],
+        site: MethodCallSite,
+        values: Vec<Value>,
+    ) -> Result<Value, NyblError> {
+        let MethodCallSite {
+            mut place,
+            value,
+            target,
+        } = site;
+        // `receiver` keeps the receiver value alive, and `place` any receiver
+        // place a `ref self` call does not commit through, until the call
+        // returns.
+        let mut receiver = MethodReceiver { value, place: None };
+        let (func, staged) = match target {
+            MethodTarget::BindingCollection(binding) => {
+                return self.finish_binding_collection_method(expr, binding, method, values);
+            }
+            MethodTarget::PlaceCollection => {
+                let place = place
+                    .take()
+                    .expect("place presence checked for mutating receiver");
+                return self.finish_place_collection_method(expr, place, method, values);
+            }
+            MethodTarget::Builtin => {
+                return self.finish_builtin_method_call(expr, receiver.value, method, values);
+            }
+            MethodTarget::User {
+                definition,
+                ref_receiver,
+                plans,
+            } => {
+                if ref_receiver {
+                    receiver.place = place.take();
+                }
+                match self.stage_user_method_args(&mut receiver, plans, values, args, expr.line) {
+                    Ok(staged) => (definition, staged),
+                    Err(error) => return Err(error),
+                }
+            }
+            MethodTarget::ModuleExport { func, plans } => {
+                match self.stage_nybl_call_args(plans, values, args, expr.line) {
+                    Ok(staged) => (func, staged),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+        // The staged places stay alive for the whole call, as the `ref`
+        // transaction requires. (Inline rather than a shared helper so
+        // optimised builds add no frame below a function body.)
+        let StagedCall {
+            args: call_args,
+            places,
+            ref_positions,
+        } = staged;
+        let (value, outputs) =
+            match self.call_nybl_fn_with_refs(&func, call_args, &ref_positions, expr.line) {
+                Ok(result) => result,
+                Err(error) => return Err(error),
+            };
+        match self.commit_ref_places(&places, outputs, expr.line) {
+            Ok(()) => Ok(value),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Validate a mutating built-in call on a bare binding and resolve the
+    /// binding it mutates.
+    fn binding_collection_target(
+        &self,
+        expr: &Expr,
+        name: &str,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<BindingIdentity, NyblError> {
+        let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
+        crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
+        check_mutating_method_arity(method, args.len(), expr.line)?;
+        methods::reject_constant_array_mutation(name, method, expr.line)?;
+        let target = self
+            .resolve_binding_identity(name)
+            .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
+        if self.active_capture_bindings.contains(&target) {
+            return Err(crate::ref_params::captured_ref_target(1, expr.line));
+        }
+        Ok(target)
+    }
+
+    #[inline(never)]
+    fn finish_binding_collection_method(
+        &mut self,
+        expr: &Expr,
+        target: BindingIdentity,
+        method: &str,
+        eval_args: Vec<Value>,
+    ) -> Result<Value, NyblError> {
+        if let Some(error) = self.pending_memory_error(expr.line) {
+            return Err(error);
+        }
+        let binding = self
+            .scopes
+            .get_mut(target.scope)
+            .and_then(|scope| scope.get_mut(&target.name))
+            .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
+        methods::transactional_collection_method_in(
+            binding,
+            method,
+            eval_args,
+            expr.line,
+            &self.memory,
+        )
+    }
+
+    /// Validate a mutating built-in call on an index or field place.
+    fn check_place_collection_method(
+        &self,
+        expr: &Expr,
+        place: &ResolvedPlace,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<(), NyblError> {
+        let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
+        crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
+        check_mutating_method_arity(method, args.len(), expr.line)?;
+        self.validate_mutable_place(place, 1, expr.line)
+    }
+
+    /// Mutating built-in method on an index or field place, committed back
+    /// through the place.
+    #[inline(never)]
+    fn finish_place_collection_method(
+        &mut self,
+        expr: &Expr,
+        place: ResolvedPlace,
+        method: &str,
+        eval_args: Vec<Value>,
+    ) -> Result<Value, NyblError> {
+        if let Some(error) = self.pending_memory_error(expr.line) {
+            return Err(error);
+        }
+        // Arguments may mutate the same root. Copy-in therefore
+        // occurs after argument evaluation, using the already
+        // evaluated projection values.
+        let current_root = self
+            .binding_value(&place.target)
+            .ok_or_else(|| crate::ref_params::invalid_ref_target(1, expr.line))?;
+        let mut leaf = self.place_value_from(&current_root, &place.projections, expr.line)?;
+        let result = methods::transactional_collection_method_in(
+            &mut leaf,
+            method,
+            eval_args,
+            expr.line,
+            &self.memory,
+        )?;
+        let committed = ResolvedPlace {
+            target: place.target,
+            root: current_root,
+            projections: place.projections,
+        };
+        self.commit_ref_places(&[committed], vec![leaf], expr.line)?;
+        Ok(result)
+    }
+
+    /// Whether a user method's receiver commits through its place, as a
+    /// `ref self` method requires (rejecting a receiver that has none).
+    fn check_user_method_receiver(
+        &self,
+        expr: &Expr,
+        m: &FunctionDefinition,
+        receiver_place: Option<&ResolvedPlace>,
+    ) -> Result<bool, NyblError> {
+        if m.param_modes
+            .first()
+            .is_some_and(|mode| *mode == ParamMode::Ref)
+        {
+            let Some(place) = receiver_place else {
+                let mut error = NyblError::runtime(
+                    "a `ref` method receiver must be a mutable place",
+                    expr.line,
+                );
+                error.friendly_hint = Some(
+                    "Store the value in a `let` binding, or call through one of its fields or indexes."
+                        .to_string(),
+                );
+                return Err(error);
+            };
+            self.validate_mutable_place(place, 1, expr.line)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The exported function a module-alias method call invokes.
+    fn module_export_callee(
+        &self,
+        expr: &Expr,
+        module: &crate::value::NyblModule,
+        method: &str,
+    ) -> Result<Rc<NyblFn>, NyblError> {
+        let callee = self.module_binding(module, method).ok_or_else(|| {
+            error(
+                expr.line,
+                format!("`{}` isn't exported from `{}`", method, module.path),
+            )
+        })?;
+        match callee {
+            Value::Fn(func) => Ok(func),
+            other => Err(error(
+                expr.line,
+                format!("`{}` is a {}, not a function", method, other.type_name()),
+            )),
+        }
+    }
+
+    /// Validate a built-in method call before its arguments run.
+    fn check_builtin_method_call(
+        expr: &Expr,
+        object: &Expr,
+        obj_val: &Value,
+        method: &str,
+        args: &[CallArg],
+    ) -> Result<(), NyblError> {
+        // Index and field reads currently produce values,
+        // not write-back places. Reject only built-in array
+        // mutations on those syntactic receiver forms so
+        // they cannot silently mutate-and-discard. Genuine
+        // temporaries remain legal, and user methods above
+        // retain precedence even when named `push`, `pop`,
+        // and so on.
+        if matches!(
+            &object.kind,
+            ExprKind::Index { .. } | ExprKind::FieldAccess { .. }
+        ) {
+            methods::reject_nested_array_mutation(obj_val, method, expr.line)?;
+        }
+
+        let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
+        crate::validate_value_only_call_modes(method, &actual_modes, expr.line)?;
+        if !matches!(obj_val, Value::Host(_))
+            && let Some(expected) = methods::builtin_method_arity(method)
+            && args.len() != expected
+        {
+            return Err(method_arity_error(method, expected, expr.line));
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn finish_builtin_method_call(
+        &mut self,
+        expr: &Expr,
+        obj_val: Value,
+        method: &str,
+        eval_args: Vec<Value>,
+    ) -> Result<Value, NyblError> {
+        // Callable-taking Result methods — `r.map(f)`,
+        // `r.map_err(f)`, `r.and_then(f)`. These need the
+        // evaluator's call primitive to invoke `f`, which
+        // `call_method` doesn't have access to, so they
+        // dispatch inline before the pure `call_method`
+        // fall-through. Receiver must be the built-in
+        // Result; user enums named `Result` don't qualify.
+        if methods::is_builtin_result(&obj_val)
+            && let Some(kind) = methods::is_result_callable_method(method)
+        {
+            return self.call_result_callable_method(&obj_val, kind, method, eval_args, expr.line);
+        }
+
+        let (ret, mutated) = self.call_method(&obj_val, method, &eval_args, expr.line)?;
+        // A true temporary mutates its staged owned value and discards
+        // the update. Named array receivers returned through the
+        // transactional path above.
+        let _ = mutated;
+        Ok(ret)
+    }
+
+    fn eval_index(&mut self, expr: &Expr, object: &Expr, index: &Expr) -> Result<Value, NyblError> {
+        let obj = self.eval_expr(object)?;
+        let idx = self.eval_expr(index)?;
+        ops::index_get_in(&obj, &idx, expr.line, &self.memory)
+    }
+
+    fn eval_field_access(
+        &mut self,
+        expr: &Expr,
+        object: &Expr,
+        field: &str,
+    ) -> Result<Value, NyblError> {
+        let obj = self.eval_expr(object)?;
+        match &obj {
+            Value::Struct(s) => s.field(field).cloned().ok_or_else(|| {
+                let msg = crate::error_messages::struct_has_no_field(s.type_name(), field);
+                // Suggest from the struct's own declared
+                // field list — `p.z` when `Point` has `x`
+                // and `y` should point to `x`/`y`.
+                match crate::suggest::did_you_mean(field, s.shape().field_names()) {
+                    Some(hint) => error_with_hint_at(expr.line, expr.column, msg, hint),
+                    None => error_at(expr.line, expr.column, msg),
+                }
+            }),
+            Value::EnumVariant(e) => e.field(field).cloned().ok_or_else(|| {
+                error(
+                    expr.line,
+                    crate::error_messages::variant_has_no_field(e.type_name(), e.variant(), field),
+                )
+            }),
+            Value::Module(m) => {
+                // `alias.name` — look up an export in the
+                // aliased module.
+                if let Some(v) = self.module_binding(m, field) {
+                    return Ok(v);
+                }
+                if m.has_type(field) {
+                    // Types aren't first-class values; the
+                    // parser should have taken the namespaced
+                    // struct-lit / variant-ctor path
+                    // already. Reaching a FieldAccess here
+                    // means the user wrote `m.Type` in a
+                    // value-returning position.
+                    let alias = m.path.rsplit('.').next().unwrap_or(&m.path);
+                    return Err(error_with_hint(
+                        expr.line,
+                        format!("`{}` in `{}` is a type, not a value", field, m.path),
+                        format!(
+                            "construct through the alias: `{alias}.{field} {{ ... }}` or `{alias}.{field}::Variant(...)`",
+                        ),
+                    ));
+                }
+                Err(error(
+                    expr.line,
+                    format!("`{}` isn't exported from `{}`", field, m.path),
+                ))
+            }
+            other => Err(error(
+                expr.line,
+                crate::error_messages::cant_read_field(field, other.type_name()),
+            )),
+        }
+    }
+
+    fn eval_struct_construct(
+        &mut self,
+        expr: &Expr,
+        namespace: Option<&str>,
+        type_name: &str,
+        fields: &[(String, Expr)],
+    ) -> Result<Value, NyblError> {
+        let shape = self.struct_construct_shape(expr, namespace, type_name, fields)?;
+        // Evaluate in source order, store in declaration
+        // order. Validation guarantees every placeholder is
+        // overwritten.
+        let mut values = alloc_import::vec![Value::None; shape.field_names().len()];
+        for (fname, fexpr) in fields {
+            let index = shape
+                .field_index(fname)
+                .expect("struct shape validated before payload evaluation");
+            values[index] = self.eval_expr(fexpr)?;
+        }
+        Value::__try_new_struct_from_shape_in(&shape, values, expr.line, &self.memory)
+    }
+
+    /// Resolve a struct construction's shape and check its field set
+    /// before any field expression runs.
+    fn struct_construct_shape(
+        &self,
+        expr: &Expr,
+        namespace: Option<&str>,
+        type_name: &str,
+        fields: &[(String, Expr)],
+    ) -> Result<StructShape, NyblError> {
+        let module_path = match namespace {
+            Some(ns) => {
+                self.validate_namespaced_type(ns, type_name, expr.line)?;
+                self.resolve_type_ref(Some(ns), type_name)
+                    .unwrap_or_else(|| self.current_module.clone())
+            }
+            None => self.resolve_type_ref(None, type_name).ok_or_else(|| {
+                error(
+                    expr.line,
+                    crate::error_messages::struct_not_declared(type_name),
+                )
+            })?,
+        };
+        let key = (module_path, type_name.to_string());
+        let shape = self
+            .struct_defs
+            .get(&key)
+            .ok_or_else(|| {
+                error(
+                    expr.line,
+                    crate::error_messages::struct_not_declared(type_name),
+                )
+            })?
+            .clone();
+        let decl_fields = shape.field_names();
+        // Enforce exactly-this-field-set at construction:
+        // no duplicates, no unknown fields, no missing
+        // fields. The per-field loops below produce the
+        // specific messages the tests assert on.
+        let mut seen = alloc_import::vec![false; decl_fields.len()];
+        for (fname, _) in fields {
+            let Some(index) = shape.field_index(fname) else {
+                let msg = crate::error_messages::struct_has_no_field(type_name, fname);
+                let err = match crate::suggest::did_you_mean(fname, decl_fields) {
+                    Some(hint) => error_with_hint_at(expr.line, expr.column, msg, hint),
+                    None => error_at(expr.line, expr.column, msg),
+                };
+                return Err(err);
+            };
+            if core::mem::replace(&mut seen[index], true) {
+                return Err(error(
+                    expr.line,
+                    format!("Field `{fname}` specified twice in `{type_name}` construction"),
+                ));
+            }
+        }
+        if let Some(missing) = seen.iter().position(|seen| !seen) {
+            let decl = &decl_fields[missing];
+            return Err(error(
+                expr.line,
+                format!("Missing field `{decl}` in `{type_name}` construction"),
+            ));
+        }
+        Ok(shape)
+    }
+
+    fn eval_array(&mut self, expr: &Expr, elements: &[Expr]) -> Result<Value, NyblError> {
+        let mut items = Vec::new();
+        for elem in elements {
+            items.push(self.eval_expr(elem)?);
+        }
+        Value::__try_new_array_in(items, expr.line, &self.memory)
+    }
+
+    fn eval_dict(&mut self, expr: &Expr, entries: &[(String, Expr)]) -> Result<Value, NyblError> {
+        let mut result = Vec::new();
+        for (key, value_expr) in entries {
+            let val = self.eval_expr(value_expr)?;
+            result.push((key.clone(), val));
+        }
+        Value::__try_new_dict_in(result, expr.line, &self.memory)
+    }
+
+    fn eval_if_expr(
+        &mut self,
+        condition: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> Result<Value, NyblError> {
+        if self.eval_expr(condition)?.is_truthy() {
+            self.eval_expr(then_expr)
+        } else {
+            self.eval_expr(else_expr)
         }
     }
 
@@ -3800,13 +4442,16 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             .collect()
     }
 
-    fn eval_nybl_call(
-        &mut self,
-        func: Rc<NyblFn>,
+    /// Reject a callee the walker cannot run, an argument count or mode it
+    /// does not accept, or an invalid `ref` place, before any argument runs.
+    fn check_nybl_call_args(
+        &self,
+        func: &Rc<NyblFn>,
         args: &[CallArg],
         line: u32,
-        callable: &str,
-    ) -> Result<Value, NyblError> {
+        callable: Option<&str>,
+    ) -> Result<Vec<PlacePlan>, NyblError> {
+        let callable = callable.unwrap_or_else(|| func.self_name.as_deref().unwrap_or("fn"));
         if !func.__is_allowed_by(&self.function_origin, "walker") {
             return Err(error(
                 line,
@@ -3819,7 +4464,8 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 "This function was compiled for another engine and can't be run in the tree-walker",
             ));
         }
-        if !crate::ref_params::accepts_arity(&func.param_modes, args.len()) {
+        let arg_count = args.len();
+        if !crate::ref_params::accepts_arity(&func.param_modes, arg_count) {
             let required = crate::ref_params::required_arity(&func.param_modes);
             let variadic = matches!(func.param_modes.last(), Some(ParamMode::Rest));
             return Err(error(
@@ -3827,69 +4473,61 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 if variadic {
                     format!(
                         "`{callable}` expects at least {required} arguments, but got {}",
-                        args.len()
+                        arg_count
                     )
                 } else {
                     format!(
                         "`{callable}` expects {required} argument{}, but got {}",
                         if required == 1 { "" } else { "s" },
-                        args.len()
+                        arg_count
                     )
                 },
             ));
         }
         let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
         crate::validate_call_modes(callable, &func.param_modes, &actual_modes, line)?;
-        let plans = self.preflight_ref_places(args, line)?;
+        self.preflight_ref_places(args, line)
+    }
 
-        // Ordinary argument expressions run left-to-right. Ref places are
-        // intentionally not read yet: side effects here must be visible in
-        // the subsequent copy-in snapshot.
-        let mut evaluated: Vec<Option<Value>> = Vec::with_capacity(args.len());
-        for arg in args {
-            evaluated.push(match arg.mode {
-                ParamMode::Value => Some(self.eval_expr(&arg.value)?),
-                ParamMode::Ref => None,
-                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
-            });
-        }
-
+    /// Resolve and snapshot a call's `ref` places after its value arguments
+    /// ran, filling their placeholders in the argument list.
+    fn stage_nybl_call_args(
+        &mut self,
+        plans: Vec<PlacePlan>,
+        mut call_args: Vec<Value>,
+        args: &[CallArg],
+        line: u32,
+    ) -> Result<StagedCall, NyblError> {
         let mut plan_iter = plans.into_iter();
         let mut places = Vec::new();
         let mut ref_positions = Vec::new();
-        let mut call_args = Vec::with_capacity(args.len());
-        for (index, (arg, value)) in args.iter().zip(evaluated).enumerate() {
-            match arg.mode {
-                ParamMode::Value => {
-                    call_args.push(value.expect("value argument was evaluated"));
-                }
-                ParamMode::Ref => {
-                    let plan = plan_iter.next().expect("place preflight matched modes");
-                    let place = self.resolve_place(plan, index + 1, line)?;
-                    let snapshot = self.place_value_from(&place.root, &place.projections, line)?;
-                    call_args.push(snapshot);
-                    places.push(place);
-                    ref_positions.push(index);
-                }
-                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
+        for (index, arg) in args.iter().enumerate() {
+            if arg.mode == ParamMode::Ref {
+                let plan = plan_iter.next().expect("place preflight matched modes");
+                let place = self.resolve_place(plan, index + 1, line)?;
+                call_args[index] = self.place_value_from(&place.root, &place.projections, line)?;
+                places.push(place);
+                ref_positions.push(index);
             }
         }
-
-        let (value, staged) =
-            self.call_nybl_fn_with_refs(&func, call_args, &ref_positions, line)?;
-        self.commit_ref_places(&places, staged, line)?;
-        Ok(value)
+        Ok(StagedCall {
+            args: call_args,
+            places,
+            ref_positions,
+        })
     }
 
-    fn eval_user_method_call(
-        &mut self,
-        mut receiver: MethodReceiver,
+    /// Validate a user method call's arity and argument modes and preflight
+    /// its explicit `ref` places, before any argument runs.
+    fn check_user_method_args(
+        &self,
+        receiver_place: Option<&ResolvedPlace>,
+        definition: &FunctionDefinition,
         receiver_type: &str,
         method: &str,
-        definition: FunctionDefinition,
         args: &[CallArg],
         line: u32,
-    ) -> Result<Value, NyblError> {
+    ) -> Result<Vec<PlacePlan>, NyblError> {
         let actual_arity = args.len() + 1;
         if !crate::ref_params::accepts_arity(&definition.param_modes, actual_arity) {
             let required = crate::ref_params::required_arity(&definition.param_modes);
@@ -3915,24 +4553,29 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         let actual_modes: Vec<ParamMode> = args.iter().map(|arg| arg.mode).collect();
         crate::validate_call_modes(method, expected_modes, &actual_modes, line)?;
         let explicit_plans = self.preflight_ref_places(args, line)?;
-        if let Some(receiver_place) = &receiver.place
+        if let Some(receiver_place) = receiver_place
             && explicit_plans
                 .iter()
                 .any(|place| place.target == receiver_place.target)
         {
             return Err(crate::ref_params::duplicate_ref_target(line));
         }
+        Ok(explicit_plans)
+    }
 
-        let mut evaluated = Vec::with_capacity(args.len());
-        for arg in args {
-            evaluated.push(match arg.mode {
-                ParamMode::Value => Some(self.eval_expr(&arg.value)?),
-                ParamMode::Ref => None,
-                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
-            });
-        }
-        let mut plan_iter = explicit_plans.into_iter();
-        let mut explicit_places = Vec::new();
+    /// Copy in a user method call's receiver and `ref` places after its
+    /// value arguments ran. A receiver without a place moves its value into
+    /// the argument list; otherwise its place moves into the staged places
+    /// (first, matching `ref_positions`) and its value is left untouched.
+    #[inline(never)]
+    fn stage_user_method_args(
+        &mut self,
+        receiver: &mut MethodReceiver,
+        plans: Vec<PlacePlan>,
+        values: Vec<Value>,
+        args: &[CallArg],
+        line: u32,
+    ) -> Result<StagedCall, NyblError> {
         let mut full_args = Vec::with_capacity(args.len() + 1);
         let mut ref_positions = Vec::new();
         if let Some(place) = &mut receiver.place {
@@ -3944,33 +4587,32 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             full_args.push(self.place_value_from(&place.root, &place.projections, line)?);
             ref_positions.push(0);
         } else {
-            full_args.push(receiver.value);
+            full_args.push(core::mem::replace(&mut receiver.value, Value::None));
         }
-        for (index, (arg, value)) in args.iter().zip(evaluated).enumerate() {
-            match arg.mode {
-                ParamMode::Value => {
-                    full_args.push(value.expect("ordinary method argument was evaluated"));
-                }
-                ParamMode::Ref => {
-                    let plan = plan_iter.next().expect("place count matched ref modes");
-                    let place = self.resolve_place(plan, index + 1, line)?;
-                    full_args.push(self.place_value_from(&place.root, &place.projections, line)?);
-                    explicit_places.push(place);
-                    ref_positions.push(index + 1);
-                }
-                ParamMode::Rest => unreachable!("rest is a declaration-only parameter mode"),
+        full_args.extend(values);
+        let mut plan_iter = plans.into_iter();
+        let mut explicit_places = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            if arg.mode == ParamMode::Ref {
+                let plan = plan_iter.next().expect("place count matched ref modes");
+                let place = self.resolve_place(plan, index + 1, line)?;
+                full_args[index + 1] =
+                    self.place_value_from(&place.root, &place.projections, line)?;
+                explicit_places.push(place);
+                ref_positions.push(index + 1);
             }
         }
-        let (value, staged) =
-            self.call_nybl_fn_with_refs(&definition, full_args, &ref_positions, line)?;
         let mut places =
             Vec::with_capacity(explicit_places.len() + usize::from(receiver.place.is_some()));
-        if let Some(place) = receiver.place {
+        if let Some(place) = receiver.place.take() {
             places.push(place);
         }
         places.extend(explicit_places);
-        self.commit_ref_places(&places, staged, line)?;
-        Ok(value)
+        Ok(StagedCall {
+            args: full_args,
+            places,
+            ref_positions,
+        })
     }
 
     fn validate_builtin_arity(&self, name: &str, count: usize, line: u32) -> Result<(), NyblError> {
@@ -4056,6 +4698,23 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         ref_positions: &[usize],
         line: u32,
     ) -> Result<(Value, Vec<Value>), NyblError> {
+        // Entry checks, frame setup, and teardown live in their own
+        // methods so only the small saved-caller state stays on the native
+        // stack while the body runs.
+        let (body, nesting) = self.check_nybl_call(func, &mut args, line)?;
+        let frame = self.push_call_frame(func, args, nesting);
+        let raw_result = self.exec_block(body);
+        self.pop_call_frame(func, frame, raw_result, ref_positions, line)
+    }
+
+    /// Validate a call to `func`, pack its rest parameter, and charge its
+    /// nesting. Returns the body to run and the charged depth.
+    fn check_nybl_call<'f>(
+        &mut self,
+        func: &'f Rc<NyblFn>,
+        args: &mut Vec<Value>,
+        line: u32,
+    ) -> Result<(&'f [Stmt], u32), NyblError> {
         if !func.__is_allowed_by(&self.function_origin, "walker") {
             return Err(error(
                 line,
@@ -4102,7 +4761,12 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         }
         let nesting = func.body_depth();
         self.enter_nesting(nesting, line)?;
+        Ok((body, nesting))
+    }
 
+    /// Install the callee's scopes, environment, and parameters, returning
+    /// the caller state [`Self::pop_call_frame`] restores.
+    fn push_call_frame(&mut self, func: &Rc<NyblFn>, args: Vec<Value>, nesting: u32) -> CallFrame {
         // A function call gets a fresh scope stack: no outer
         // locals leak in. Captures and parameters seed the new
         // scope; self-reference via `self_name` lets recursive
@@ -4196,7 +4860,40 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             }
         }
 
-        let raw_result = self.exec_block(body);
+        CallFrame {
+            nesting,
+            saved_ref_bindings,
+            saved_capture_bindings,
+            function_module,
+            saved_scopes,
+            caller_binding_origins,
+            caller_value_module,
+            type_scope_floor,
+            alias_scope_floor,
+        }
+    }
+
+    /// Convert the body's outcome into the call's result and restore the
+    /// caller state saved by [`Self::push_call_frame`].
+    fn pop_call_frame(
+        &mut self,
+        func: &Rc<NyblFn>,
+        frame: CallFrame,
+        raw_result: Result<Signal, NyblError>,
+        ref_positions: &[usize],
+        line: u32,
+    ) -> Result<(Value, Vec<Value>), NyblError> {
+        let CallFrame {
+            nesting,
+            saved_ref_bindings,
+            saved_capture_bindings,
+            function_module,
+            mut saved_scopes,
+            caller_binding_origins,
+            caller_value_module,
+            type_scope_floor,
+            alias_scope_floor,
+        } = frame;
         // Convert every normal language return shape before looking at staged
         // outputs. A `try Err(...)` sentinel is a normal return and commits;
         // every other error rolls back.
@@ -4320,6 +5017,19 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
     /// Fatal errors (resource-limit violations — see
     /// `NyblError::is_fatal`) bypass the wrap and propagate
     /// unchanged, preserving the sandbox invariant.
+    /// The builtin `RuntimeError` shape this engine registered at
+    /// construction; every caught `try_call` error shares it.
+    fn runtime_error_shape(&self) -> StructShape {
+        let key = (
+            String::from(crate::value::BUILTIN_MODULE_PATH),
+            String::from("RuntimeError"),
+        );
+        self.struct_defs
+            .get(&key)
+            .expect("builtin RuntimeError is seeded at construction")
+            .clone()
+    }
+
     fn builtin_try_call(&mut self, args: Vec<Value>, line: u32) -> Result<Value, NyblError> {
         if args.len() != 1 {
             return Err(error(
@@ -4344,7 +5054,11 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 if err.is_fatal {
                     Err(err)
                 } else {
-                    Ok(builtins::make_try_call_err_in(&err, &self.memory))
+                    Ok(builtins::make_try_call_err_in(
+                        &err,
+                        &self.runtime_error_shape(),
+                        &self.memory,
+                    ))
                 }
             }
         };
@@ -4371,12 +5085,22 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
         // Direct-call classification passes the canonical declaration here,
         // avoiding a second lookup.
         if let Some(func) = resolved_function {
-            if let Some(result) = self.host.call(name, &args, line) {
+            if let Some(result) = self.host_hook(|host| host.call(name, &args, line)) {
                 return result;
             }
             return self.call_nybl_fn(&func, args, line);
         }
 
+        self.call_unresolved_function(name, args, line)
+    }
+
+    /// Call a builtin, host, or dynamically published function by name.
+    fn call_unresolved_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        line: u32,
+    ) -> Result<Value, NyblError> {
         // 1. Global builtins. The short list: anything variadic
         // (`print`), a collection constructor (`range`), session-
         // stateful (`rand`), or inherently takes a callable
@@ -4398,51 +5122,58 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
                 return builtins::builtin_range_in(&args, line, &mut self.rand_state, &self.memory);
             }
             "rand" => return builtins::builtin_rand(&args, line, &mut self.rand_state),
-            "print" => {
-                let message =
-                    crate::formatting::__format_values_in(&args, " ", line, &self.memory)?;
-                self.host.on_print(&message);
-                if let Some(error) = self.host.print_error(line) {
-                    return Err(error);
-                }
-                return Ok(Value::None);
-            }
+            "print" => return self.builtin_print(&args, line),
             "try_call" => return self.builtin_try_call(args, line),
             "panic" => return builtins::builtin_panic(&args, line),
             _ => {}
         }
 
         // 2. Host-provided builtins
-        let host_result = self.host.call(name, &args, line);
+        let host_result = self.host_hook(|host| host.call(name, &args, line));
         if let Some(result) = host_result {
             return result;
         }
 
         // 3. A dynamically published/imported user function not classified
         // by the direct-call path above.
-        let func = self.lookup_function(name).ok_or_else(|| {
-            // Preference order: "did you mean" suggestion first
-            // (most specific to the user's typo), then the
-            // host's generic function hint (embedder-specific
-            // tips like "available host functions: …"), then a
-            // bare error.
-            if let Some(hint) = self.callable_candidates_hint(name) {
-                error_with_hint(line, crate::error_messages::function_not_found(name), hint)
-            } else {
-                let host_hint = self.host.function_hint().to_string();
-                if host_hint.is_empty() {
-                    error(line, crate::error_messages::function_not_found(name))
-                } else {
-                    error_with_hint(
-                        line,
-                        crate::error_messages::function_not_found(name),
-                        host_hint,
-                    )
-                }
-            }
-        })?;
+        let func = self
+            .lookup_function(name)
+            .ok_or_else(|| self.function_not_found_error(name, line))?;
 
         self.call_nybl_fn(&func, args, line)
+    }
+
+    fn builtin_print(&mut self, args: &[Value], line: u32) -> Result<Value, NyblError> {
+        let message = crate::formatting::__format_values_in(args, " ", line, &self.memory)?;
+        if let Some(error) = self.host_hook(|host| {
+            host.on_print(&message);
+            host.print_error(line)
+        }) {
+            return Err(error);
+        }
+        Ok(Value::None)
+    }
+
+    fn function_not_found_error(&mut self, name: &str, line: u32) -> NyblError {
+        // Preference order: "did you mean" suggestion first
+        // (most specific to the user's typo), then the
+        // host's generic function hint (embedder-specific
+        // tips like "available host functions: …"), then a
+        // bare error.
+        if let Some(hint) = self.callable_candidates_hint(name) {
+            error_with_hint(line, crate::error_messages::function_not_found(name), hint)
+        } else {
+            let host_hint = self.host_hook(|host| host.function_hint().to_string());
+            if host_hint.is_empty() {
+                error(line, crate::error_messages::function_not_found(name))
+            } else {
+                error_with_hint(
+                    line,
+                    crate::error_messages::function_not_found(name),
+                    host_hint,
+                )
+            }
+        }
     }
 
     // ─── Methods ───────────────────────────────────────────────────
@@ -4539,13 +5270,15 @@ impl<'h, H: NyblHost + ?Sized> Evaluator<'h, H> {
             Value::Int(_) | Value::Number(_) => methods::numeric_method(obj, method, args, line),
             Value::Bool(_) => methods::bool_method(obj, method, args, line),
             Value::Iter(_) => methods::iter_method_in(obj, method, args, line, &self.memory),
-            Value::Host(value) => match self.host.call_method(value, method, args, line) {
-                Some(result) => result.map(|value| (value, None)),
-                None => Err(error(
-                    line,
-                    crate::error_messages::no_such_method(obj.type_name(), method),
-                )),
-            },
+            Value::Host(value) => {
+                match self.host_hook(|host| host.call_method(value, method, args, line)) {
+                    Some(result) => result.map(|value| (value, None)),
+                    None => Err(error(
+                        line,
+                        crate::error_messages::no_such_method(obj.type_name(), method),
+                    )),
+                }
+            }
             _ => Err(error(
                 line,
                 crate::error_messages::no_such_method(obj.type_name(), method),
@@ -4643,6 +5376,83 @@ enum IterStep {
 /// Returns `Some(step)` when the value is a well-formed
 /// `Iter::Next(v)` / `Iter::Done` (built-in or not), or `None`
 /// when it doesn't match so the caller can raise a clear error.
+fn enum_tuple_arity_error(
+    type_name: &str,
+    variant: &str,
+    expected: usize,
+    got: usize,
+    line: u32,
+) -> NyblError {
+    error(
+        line,
+        format!(
+            "`{}::{}` expects {} argument{}, but got {}",
+            type_name,
+            variant,
+            expected,
+            if expected == 1 { "" } else { "s" },
+            got
+        ),
+    )
+}
+
+fn cant_call_error(value: &Value, line: u32) -> NyblError {
+    error(line, crate::error_messages::cant_call_a(value.type_name()))
+}
+
+fn method_arity_error(method: &str, expected: usize, line: u32) -> NyblError {
+    error(
+        line,
+        format!(
+            "`.{}()` needs {} argument{}",
+            method,
+            expected,
+            if expected == 1 { "" } else { "s" }
+        ),
+    )
+}
+
+fn check_mutating_method_arity(method: &str, count: usize, line: u32) -> Result<(), NyblError> {
+    let expected =
+        methods::builtin_method_arity(method).expect("mutating built-in has arity metadata");
+    if count != expected {
+        return Err(method_arity_error(method, expected, line));
+    }
+    Ok(())
+}
+
+fn named_call_arity_error(name: &str, expected: usize, got: usize, line: u32) -> NyblError {
+    error(
+        line,
+        format!(
+            "`{}` expects {} argument{}, but got {}",
+            name,
+            expected,
+            if expected == 1 { "" } else { "s" },
+            got
+        ),
+    )
+}
+
+/// Error for an enum construction whose payload form does not match the
+/// declared variant `kind`.
+fn enum_payload_error(kind: &VariantKind, type_name: &str, variant: &str, line: u32) -> NyblError {
+    match kind {
+        VariantKind::Unit => error(
+            line,
+            format!("Variant `{type_name}::{variant}` takes no payload"),
+        ),
+        VariantKind::Tuple(_) => error(
+            line,
+            format!("Variant `{type_name}::{variant}` expects positional arguments `(…)`"),
+        ),
+        VariantKind::Struct(_) => error(
+            line,
+            format!("Variant `{type_name}::{variant}` expects named fields `{{ … }}`"),
+        ),
+    }
+}
+
 fn unwrap_iter_result(v: &Value) -> Option<IterStep> {
     let e = match v {
         Value::EnumVariant(e) => e,
@@ -4661,7 +5471,7 @@ fn unwrap_iter_result(v: &Value) -> Option<IterStep> {
 }
 
 type BuiltinTypeTables = (
-    BTreeMap<(String, String), Vec<String>>,
+    BTreeMap<(String, String), StructShape>,
     BTreeMap<(String, String), Vec<VariantDecl>>,
     BTreeMap<String, String>,
 );
@@ -4681,7 +5491,7 @@ type BuiltinTypeTables = (
 ///   an explicit `use`.
 fn seed_builtin_types() -> BuiltinTypeTables {
     use crate::value::BUILTIN_MODULE_PATH;
-    let mut struct_defs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut struct_defs: BTreeMap<(String, String), StructShape> = BTreeMap::new();
     let mut enum_defs: BTreeMap<(String, String), Vec<VariantDecl>> = BTreeMap::new();
     let mut type_bindings: BTreeMap<String, String> = BTreeMap::new();
     struct_defs.insert(
@@ -4689,7 +5499,11 @@ fn seed_builtin_types() -> BuiltinTypeTables {
             String::from(BUILTIN_MODULE_PATH),
             String::from("RuntimeError"),
         ),
-        crate::builtins::builtin_runtime_error_fields(),
+        StructShape::new(
+            BUILTIN_MODULE_PATH,
+            "RuntimeError",
+            crate::builtins::builtin_runtime_error_fields(),
+        ),
     );
     type_bindings.insert(
         String::from("RuntimeError"),
@@ -4971,7 +5785,19 @@ pub fn pattern_matches_in(
                 (
                     VariantPatternPayload::Struct { fields, rest },
                     crate::value::EnumPayload::Struct(entries),
-                ) => match_struct_fields(fields, *rest, entries, bindings, resolver, memory),
+                ) => match_struct_fields(
+                    fields,
+                    *rest,
+                    &|name| {
+                        entries
+                            .iter()
+                            .find(|(key, _)| key == name)
+                            .map(|(_, value)| value)
+                    },
+                    bindings,
+                    resolver,
+                    memory,
+                ),
                 _ => false,
             }
         }
@@ -4992,7 +5818,14 @@ pub fn pattern_matches_in(
             if st.module_path() != expected_mp.as_str() || st.type_name() != type_name.as_str() {
                 return false;
             }
-            match_struct_fields(fields, *rest, st.fields(), bindings, resolver, memory)
+            match_struct_fields(
+                fields,
+                *rest,
+                &|name| st.field(name),
+                bindings,
+                resolver,
+                memory,
+            )
         }
         Pattern::Array { elements, rest } => {
             let items = match value {
@@ -5045,10 +5878,10 @@ pub fn pattern_matches_in(
     }
 }
 
-fn match_struct_fields(
+fn match_struct_fields<'v>(
     fields: &[(String, Pattern)],
     rest: bool,
-    entries: &[(String, Value)],
+    field_value: &dyn Fn(&str) -> Option<&'v Value>,
     bindings: &mut Vec<(String, Value)>,
     resolver: TypeResolveFn<'_>,
     memory: &crate::memory::MemoryContext,
@@ -5061,9 +5894,8 @@ fn match_struct_fields(
     // destructuring.
     let _ = rest;
     for (fname, pat) in fields {
-        let value = match entries.iter().find(|(k, _)| k == fname) {
-            Some((_, v)) => v,
-            None => return false,
+        let Some(value) = field_value(fname) else {
+            return false;
         };
         if !pattern_matches_in(pat, value, bindings, resolver, memory) {
             return false;
@@ -5118,7 +5950,7 @@ pub struct ReplSession {
     active_value_module: String,
     function_origin: NyblFnOrigin,
     current_module: String,
-    struct_defs: BTreeMap<(String, String), Vec<String>>,
+    struct_defs: BTreeMap<(String, String), StructShape>,
     enum_defs: BTreeMap<(String, String), Vec<VariantDecl>>,
     methods: BTreeMap<(String, String), BTreeMap<String, FunctionDefinition>>,
     type_exports: BTreeMap<String, String>,
@@ -5265,6 +6097,26 @@ impl ReplSession {
         self.run_stmts(&stmts, host, limits)
     }
 
+    /// Like [`Self::eval`], but run as an operation of `group`: under the
+    /// group's limits, charging the group's memory account, and sharing step,
+    /// call-depth, and nesting accounting with grouped instances the host
+    /// calls from inside this evaluation (or with the running group operation
+    /// this evaluation is nested in).
+    pub fn eval_in<H: NyblHost + ?Sized>(
+        &mut self,
+        source: &str,
+        host: &mut H,
+        group: &crate::InstanceGroup,
+    ) -> Result<Option<Value>, NyblError> {
+        let operation = group.__begin();
+        let memory = group.__memory();
+        if memory.__exceeded() {
+            return Err(NyblError::fatal("Memory limit exceeded", 0));
+        }
+        let stmts = crate::parse(source)?;
+        self.run_stmts_in(&stmts, host, group.limits(), memory, Some(&operation))
+    }
+
     /// Like [`Self::eval`] but takes an already-parsed AST.
     /// Useful when the caller has already run a
     /// `parse_with_warnings` pass and wants to surface
@@ -5276,7 +6128,7 @@ impl ReplSession {
         limits: &NyblLimits,
     ) -> Result<Option<Value>, NyblError> {
         let memory = crate::memory::MemoryContext::__new(limits.max_memory);
-        self.run_stmts_in(stmts, host, limits, &memory)
+        self.run_stmts_in(stmts, host, limits, &memory, None)
     }
 
     pub(crate) fn run_stmts_in<H: NyblHost + ?Sized>(
@@ -5285,6 +6137,7 @@ impl ReplSession {
         host: &mut H,
         limits: &NyblLimits,
         memory: &crate::memory::MemoryContext,
+        group: Option<&crate::GroupOperation>,
     ) -> Result<Option<Value>, NyblError> {
         // If the last stmt is a bare expression we strip it
         // off, run the rest, and then evaluate it as an
@@ -5309,7 +6162,7 @@ impl ReplSession {
         // (possibly-mutated) state back so partial failures
         // still persist whatever changes happened before the
         // error.
-        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone(), group);
         let mut result: Result<Option<Value>, NyblError> = (|| {
             // The evaluated top level (including a tail expression) is the
             // first active frame of this operation.
@@ -5349,7 +6202,7 @@ impl ReplSession {
         limits: &NyblLimits,
     ) -> Result<Value, NyblError> {
         let memory = crate::memory::MemoryContext::__new(limits.max_memory);
-        self.call_fn_in(func, args, host, limits, &memory)
+        self.call_fn_in(func, args, host, limits, &memory, None)
     }
 
     pub(crate) fn call_fn_in<H: NyblHost + ?Sized>(
@@ -5359,6 +6212,7 @@ impl ReplSession {
         host: &mut H,
         limits: &NyblLimits,
         memory: &crate::memory::MemoryContext,
+        group: Option<&crate::GroupOperation>,
     ) -> Result<Value, NyblError> {
         let func = match &func {
             Value::Fn(f) => Rc::clone(f),
@@ -5370,7 +6224,7 @@ impl ReplSession {
             }
         };
 
-        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone(), group);
         let result = eval.call_nybl_fn(&func, args, 0);
         self.put_evaluator(eval);
         result
@@ -5407,8 +6261,9 @@ impl ReplSession {
         host: &mut H,
         limits: &NyblLimits,
         memory: &crate::memory::MemoryContext,
+        group: Option<&crate::GroupOperation>,
     ) -> Result<Value, NyblError> {
-        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone(), group);
         let result = eval
             .call_nybl_fn_with_refs(target, args.to_vec(), &[], 0)
             .map(|(value, _)| value);
@@ -5427,13 +6282,18 @@ impl ReplSession {
         host: &mut H,
         limits: &NyblLimits,
         memory: &crate::memory::MemoryContext,
+        group: Option<&crate::GroupOperation>,
     ) -> Result<Vec<Value>, NyblError>
     where
         H: NyblHost + ?Sized,
         A: AsRef<[Value]>,
     {
-        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone(), group);
         let mut values = Vec::with_capacity(calls.len());
+        // An outermost batch gives every item a fresh step budget; a batch
+        // nested in a running group operation counts every item toward it.
+        let reset_steps = group.is_none_or(|operation| operation.__start().outermost);
+        let base_nesting = eval.nesting_used;
         let result = (|| {
             for call in calls {
                 let args = call.as_ref();
@@ -5459,9 +6319,11 @@ impl ReplSession {
                         },
                     ));
                 }
-                eval.steps = 0;
+                if reset_steps {
+                    eval.steps = 0;
+                }
                 debug_assert_eq!(eval.call_depth, 0);
-                debug_assert_eq!(eval.nesting_used, 0);
+                debug_assert_eq!(eval.nesting_used, base_nesting);
                 let value = eval
                     .call_nybl_fn_with_refs(target, args.to_vec(), &[], 0)
                     .map(|(value, _)| value);
@@ -5480,6 +6342,7 @@ impl ReplSession {
         host: &mut H,
         limits: &NyblLimits,
         memory: &crate::memory::MemoryContext,
+        group: Option<&crate::GroupOperation>,
     ) -> Result<Value, NyblError> {
         let target = self
             .abi_declarations
@@ -5508,7 +6371,7 @@ impl ReplSession {
                 },
             ));
         }
-        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone());
+        let mut eval = self.take_evaluator(host, limits.clone(), memory.clone(), group);
         let result = eval.call_nybl_fn(&target, args.to_vec(), 0);
         self.put_evaluator(eval);
         result
@@ -5522,7 +6385,9 @@ impl ReplSession {
         host: &'h mut H,
         limits: NyblLimits,
         memory: crate::memory::MemoryContext,
+        group: Option<&crate::GroupOperation>,
     ) -> Evaluator<'h, H> {
+        let start = group.map(crate::GroupOperation::__start);
         let root_lexical_context = core::mem::replace(
             &mut self.root_lexical_context,
             Rc::new(ModuleLexicalContext::default()),
@@ -5550,11 +6415,11 @@ impl ReplSession {
             import_scopes: core::mem::take(&mut self.import_scopes),
             rand_state: self.rand_state,
             host,
-            steps: 0,
+            steps: start.map_or(0, |start| start.steps),
             loop_lines: Vec::new(),
             call_depth: 0,
-            call_depth_base: 0,
-            nesting_used: 0,
+            call_depth_base: start.map_or(0, |start| start.call_depth),
+            nesting_used: start.map_or(0, |start| start.nesting_used),
             function_modules: Vec::new(),
             alias_scope_floors: Vec::new(),
             limits,
@@ -5562,6 +6427,7 @@ impl ReplSession {
             pending_try_return: None,
             active_ref_bindings: alloc_import::collections::BTreeSet::new(),
             active_capture_bindings: alloc_import::collections::BTreeSet::new(),
+            group: group.map(|operation| operation.__group().clone()),
         }
     }
 
@@ -5570,6 +6436,10 @@ impl ReplSession {
     /// so a mid-block error doesn't leave leftover pushed
     /// scopes hanging around for the next input.
     fn put_evaluator<'h, H: NyblHost + ?Sized>(&mut self, eval: Evaluator<'h, H>) {
+        // The operation this one is nested in resumes from these steps.
+        if let Some(group) = &eval.group {
+            group.__set_steps(eval.steps);
+        }
         self.root_lexical_context = Rc::clone(&eval.root_lexical_context);
         let mut scopes = eval.scopes;
         if scopes.len() > 1 {

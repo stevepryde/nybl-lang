@@ -85,7 +85,10 @@ assert_eq!(second.inspect(), "2");
 ```
 
 The walker and VM instance APIs are equivalent: `load`, `entry_points`,
-`call`, and `call_value`.
+`call`, and `call_value`. `NyblInstance::load_in` and `from_compiled_in` join
+a `nybl::InstanceGroup`, whose limits and accounting the instance shares with
+the group's other walker and VM instances when a host hook nests a call to one
+of them.
 
 The VM implements Nybl's transactional `ref` parameters with the same
 copy-in/copy-out, target validation, commit, rollback, and diagnostic behavior

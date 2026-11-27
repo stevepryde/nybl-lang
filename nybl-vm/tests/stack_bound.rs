@@ -2,13 +2,14 @@
 //! the shared corpus ends in a clean `Err` on a thread of the documented
 //! size, in both the tree-walker and the VM.
 //!
-//! The sizes are the RUN-002 contract. They are about twice the smallest
+//! The sizes are the RUN-002 contract. They are at least twice the smallest
 //! stack the worst corpus shape survived (measured on arm64 macOS, Rust
-//! 1.98): the walker needed 4.9 MiB in release and 64.7 MiB in debug (a
-//! recursion of nested `Ok(...)` that loads a parse-cap module from its
-//! deepest frame), the VM 0.8 MiB and 4.7 MiB. A stack overflow aborts this
-//! test binary, so a
-//! regression fails loudly rather than as an assertion.
+//! 1.98): the walker needed 3.0 MiB in release and 11.8 MiB in debug (a
+//! recursion of user-method calls, each nested in the index of the next
+//! one's `ref` argument, that loads a parse-cap module from its deepest
+//! frame), the VM 0.8 MiB and 4.6 MiB. A stack overflow aborts this
+//! test binary, so a regression that fattens the walker's frames fails
+//! loudly rather than as an assertion.
 //!
 //! Run the release variant with
 //! `cargo test --release -p nybl-vm --test stack_bound`.
@@ -25,7 +26,7 @@ use stack_corpus::Shape;
 /// release build.
 const RELEASE_STACK: usize = 10 * 1024 * 1024;
 /// The same bound for an unoptimised (debug) build.
-const DEBUG_STACK: usize = 128 * 1024 * 1024;
+const DEBUG_STACK: usize = 24 * 1024 * 1024;
 
 fn documented_stack() -> usize {
     if cfg!(debug_assertions) {

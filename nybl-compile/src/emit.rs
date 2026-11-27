@@ -7247,19 +7247,15 @@ fn __nybl_function_site_value(
             let src = self.expr_src(expr)?;
             let tmp = self.fresh_tmp();
             write!(lets, "let {tmp} = {src}; ").unwrap();
-            provided.push(format!(
-                "({}.to_string(), {})",
-                rust_string_literal(name),
-                tmp
-            ));
+            provided.push(format!("({}, {})", rust_string_literal(name), tmp));
         }
         Ok(format!(
             "{{ let __module_path = {module_path_src}; \
-                let __declared_fields = __nybl_struct_fields(ctx, &__module_path, {type_name}, {line})?; \
-                __nybl_validate_named_fields(__declared_fields, &[{provided_names}], {type_name}, ::std::option::Option::None, {line})?; \
+                let __struct_def = __nybl_struct_def(ctx, &__module_path, {type_name}, {line})?; \
+                __nybl_validate_named_fields(__struct_def.fields, &[{provided_names}], {type_name}, ::std::option::Option::None, {line})?; \
                 {lets}let __provided = vec![{provided}]; \
-                let __ordered = __nybl_order_named_fields(__declared_fields, __provided); \
-                ::nybl::value::Value::__try_new_struct_in(__module_path, {type_name}.to_string(), __ordered, {line}, &ctx.memory)? }}",
+                let __ordered = __nybl_order_struct_fields(__struct_def.fields, __provided); \
+                ::nybl::value::Value::__try_new_struct_from_shape_in(&__struct_def.shape, __ordered, {line}, &ctx.memory)? }}",
             module_path_src = module_path_src,
             type_name = rust_string_literal(type_name),
             provided_names = provided_names,

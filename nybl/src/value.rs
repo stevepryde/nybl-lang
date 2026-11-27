@@ -349,16 +349,86 @@ fn try_copy_dict_key(key: &str, line: u32) -> Result<String, NyblError> {
 /// `RuntimeError`; for user modules it's the dot-joined `use`
 /// path (`"std.math"`, `"game.entity"`, …). Fields are stored
 /// in declaration order so iteration and `Display` stay stable.
+///
+/// The type identity and field names live in a shared
+/// [`StructShape`]; each value owns only its field values, stored
+/// positionally in the shape's field order.
 #[derive(Debug, Clone)]
 pub struct NyblStruct(Rc<StructData>);
 
 #[derive(Debug)]
 struct StructData {
-    module_path: String,
-    type_name: String,
-    fields: Vec<(String, Value)>,
+    shape: StructShape,
+    values: Vec<Value>,
     depth: u16,
     receipt: MemoryReceipt,
+}
+
+/// The identity and field names of a struct type, shared by its values.
+///
+/// A shape is immutable and cheap to clone (a reference-count bump).
+/// Hosts that build many values of one struct type should build its
+/// shape once and construct each value with
+/// [`Value::try_new_struct_from_shape`], which stores only the field
+/// values. Type identity is still the module path plus type name: a
+/// value built from a shape is the same type as any other struct value
+/// with the same module path and type name, however it was built.
+#[derive(Clone, Debug)]
+pub struct StructShape(Rc<StructShapeData>);
+
+#[derive(Debug)]
+struct StructShapeData {
+    module_path: String,
+    type_name: String,
+    field_names: Vec<String>,
+}
+
+impl StructShape {
+    /// Build a shape from the declaring module path, the bare type
+    /// name, and the field names in declaration order.
+    pub fn new(
+        module_path: impl Into<String>,
+        type_name: impl Into<String>,
+        field_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self(Rc::new(StructShapeData {
+            module_path: module_path.into(),
+            type_name: type_name.into(),
+            field_names: field_names.into_iter().map(Into::into).collect(),
+        }))
+    }
+
+    /// Module the struct type was declared in.
+    pub fn module_path(&self) -> &str {
+        &self.0.module_path
+    }
+
+    /// Bare struct type name.
+    pub fn type_name(&self) -> &str {
+        &self.0.type_name
+    }
+
+    /// Field names in declaration order.
+    pub fn field_names(&self) -> &[String] {
+        &self.0.field_names
+    }
+
+    /// Position of the named field in [`Self::field_names`].
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        // Struct field counts are small; a linear scan avoids a
+        // per-shape index allocation.
+        self.0.field_names.iter().position(|field| field == name)
+    }
+
+    /// True when both shapes carry the same type identity (module path
+    /// and type name) and the same field names in the same order.
+    /// Sharing one shape is only a fast path.
+    fn same_layout(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+            || (self.0.module_path == other.0.module_path
+                && self.0.type_name == other.0.type_name
+                && self.0.field_names == other.0.field_names)
+    }
 }
 
 /// A user-defined enum variant value — the concrete data side of
@@ -461,19 +531,16 @@ impl Clone for DictData {
 }
 
 impl StructData {
+    /// The shared shape is not charged per value: a struct value
+    /// accounts only for its own field-value storage.
     fn tracked_bytes(&self) -> usize {
-        let key_bytes: usize = self.fields.iter().map(|(key, _)| key.capacity()).sum();
-        self.module_path.capacity()
-            + self.type_name.capacity()
-            + self.fields.capacity() * core::mem::size_of::<(String, Value)>()
-            + key_bytes
+        self.values.capacity() * core::mem::size_of::<Value>()
     }
 
     fn clone_in(&self, memory: &MemoryContext) -> Self {
         let mut cloned = Self {
-            module_path: self.module_path.clone(),
-            type_name: self.type_name.clone(),
-            fields: self.fields.clone(),
+            shape: self.shape.clone(),
+            values: self.values.clone(),
             depth: self.depth,
             receipt: MemoryReceipt::new_in(memory, 0),
         };
@@ -1413,15 +1480,74 @@ impl Value {
         memory: &MemoryContext,
     ) -> Result<Self, NyblError> {
         let depth = checked_owner_depth(fields.iter().map(|(_, value)| value), 1, line)?;
+        let (field_names, values): (Vec<String>, Vec<Value>) = fields.into_iter().unzip();
+        let shape = StructShape::new(module_path, type_name, field_names);
+        Ok(Self::struct_from_parts(shape, values, depth, memory))
+    }
+
+    /// Build a struct value from a shared [`StructShape`]. `values`
+    /// are positional, in the shape's field order. A count that does
+    /// not match the shape is an ordinary error.
+    ///
+    /// The returned value is an ordinary struct value: it has the
+    /// type identity (module path plus type name) of its shape, and
+    /// behaves exactly like a value built with [`Self::try_new_struct`]
+    /// or by a script.
+    pub fn try_new_struct_from_shape(
+        shape: &StructShape,
+        values: Vec<Value>,
+        line: u32,
+    ) -> Result<Self, NyblError> {
+        Self::__try_new_struct_from_shape_in(
+            shape,
+            values,
+            line,
+            &MemoryContext::__legacy_current(),
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn __try_new_struct_from_shape_in(
+        shape: &StructShape,
+        values: Vec<Value>,
+        line: u32,
+        memory: &MemoryContext,
+    ) -> Result<Self, NyblError> {
+        let expected = shape.field_names().len();
+        if values.len() != expected {
+            return Err(NyblError::runtime(
+                format!(
+                    "Struct `{}` has {} fields, got {} values",
+                    shape.type_name(),
+                    expected,
+                    values.len()
+                ),
+                line,
+            ));
+        }
+        let depth = checked_owner_depth(&values, 1, line)?;
+        Ok(Self::struct_from_parts(
+            shape.clone(),
+            values,
+            depth,
+            memory,
+        ))
+    }
+
+    fn struct_from_parts(
+        shape: StructShape,
+        values: Vec<Value>,
+        depth: u16,
+        memory: &MemoryContext,
+    ) -> Self {
         let mut data = StructData {
-            module_path,
-            type_name,
-            fields,
+            shape,
+            values,
             depth,
             receipt: MemoryReceipt::new_in(memory, 0),
         };
         data.receipt.resize(data.tracked_bytes());
-        Ok(Value::Struct(NyblStruct(Rc::new(data))))
+        Value::Struct(NyblStruct(Rc::new(data)))
     }
 
     /// Build a built-in iterator that yields each item of
@@ -1980,20 +2106,15 @@ impl Value {
                 Value::Dict(NyblDict(Rc::new(data)))
             }
             Value::Struct(value) => {
-                let fields = value
+                let values = value
                     .0
-                    .fields
+                    .values
                     .iter()
-                    .map(|(name, value)| {
-                        value
-                            .compatibility_snapshot_inner(memo, line)
-                            .map(|value| (name.clone(), value))
-                    })
+                    .map(|value| value.compatibility_snapshot_inner(memo, line))
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut data = StructData {
-                    module_path: value.0.module_path.clone(),
-                    type_name: value.0.type_name.clone(),
-                    fields,
+                    shape: value.0.shape.clone(),
+                    values,
                     depth: value.0.depth,
                     receipt: MemoryReceipt::new_in(&MemoryContext::__untracked(), 0),
                 };
@@ -2186,13 +2307,13 @@ impl core::fmt::Display for Value {
             }
             Value::Struct(s) => {
                 write!(f, "{} {{", s.type_name())?;
-                for (i, (k, v)) in s.fields().iter().enumerate() {
+                for (i, (k, v)) in s.fields().enumerate() {
                     if i > 0 {
                         write!(f, ",")?;
                     }
                     write!(f, " {}: {}", k, Inspected(v))?;
                 }
-                if !s.fields().is_empty() {
+                if !s.values().is_empty() {
                     write!(f, " ")?;
                 }
                 write!(f, "}}")
@@ -2601,27 +2722,42 @@ impl NyblStruct {
     }
 
     pub fn type_name(&self) -> &str {
-        &self.0.type_name
+        self.0.shape.type_name()
     }
 
     /// Module this struct type was declared in. Forms one half
     /// of the type's identity — the other half is the bare
     /// [`Self::type_name`].
     pub fn module_path(&self) -> &str {
-        &self.0.module_path
+        self.0.shape.module_path()
     }
 
-    pub fn fields(&self) -> &[(String, Value)] {
-        &self.0.fields
+    /// The shared identity and field names of this value's type.
+    pub fn shape(&self) -> &StructShape {
+        &self.0.shape
+    }
+
+    /// Field values in the shape's field order.
+    pub fn values(&self) -> &[Value] {
+        &self.0.values
+    }
+
+    /// `(name, value)` pairs in declaration order.
+    pub fn fields(&self) -> impl ExactSizeIterator<Item = (&str, &Value)> + '_ {
+        self.0
+            .shape
+            .field_names()
+            .iter()
+            .map(String::as_str)
+            .zip(self.0.values.iter())
     }
 
     /// Look up a field by name. `None` if no such field.
     pub fn field(&self, name: &str) -> Option<&Value> {
         self.0
-            .fields
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v)
+            .shape
+            .field_index(name)
+            .map(|index| &self.0.values[index])
     }
 
     /// Replace the value of an existing field. Returns `true` if
@@ -2650,7 +2786,7 @@ impl NyblStruct {
         line: u32,
         memory: &MemoryContext,
     ) -> Result<bool, NyblError> {
-        let Some(index) = self.0.fields.iter().position(|(key, _)| key == name) else {
+        let Some(index) = self.0.shape.field_index(name) else {
             return Ok(false);
         };
         // Struct keys are a fixed declared field set: writes cannot add fields
@@ -2659,17 +2795,17 @@ impl NyblStruct {
         // allocation without recreating dictionary construction's O(n²) path.
         let depth = checked_owner_depth(
             self.0
-                .fields
+                .values
                 .iter()
                 .enumerate()
-                .filter_map(|(i, (_, value))| (i != index).then_some(value))
+                .filter_map(|(i, value)| (i != index).then_some(value))
                 .chain(core::iter::once(&value)),
             1,
             line,
         )?;
         self.ensure_owner(memory);
         let data = Rc::get_mut(&mut self.0).expect("struct backing was made unique");
-        data.fields[index].1 = value;
+        data.values[index] = value;
         data.depth = depth;
         Ok(true)
     }
@@ -2903,13 +3039,11 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         // name declared in different modules deliberately compare
         // as *not equal* — they're distinct types.
         (Value::Struct(a), Value::Struct(b)) => {
-            a.module_path() == b.module_path()
-                && a.type_name() == b.type_name()
-                && a.fields().len() == b.fields().len()
-                && a.fields()
+            a.shape().same_layout(b.shape())
+                && a.values()
                     .iter()
-                    .zip(b.fields().iter())
-                    .all(|((ka, va), (kb, vb))| ka == kb && values_equal(va, vb))
+                    .zip(b.values())
+                    .all(|(va, vb)| values_equal(va, vb))
         }
         // Enum variants: same full type identity (module_path +
         // type_name), same variant name, same payload shape +
@@ -3352,6 +3486,21 @@ mod depth_tests {
                 23,
             ),
             23,
+        );
+    }
+
+    #[test]
+    fn shape_built_structs_enforce_the_same_depth_boundary() {
+        let shape = StructShape::new("m", "S", ["x"]);
+        assert_eq!(
+            Value::try_new_struct_from_shape(&shape, vec![nested_array(MAX_VALUE_DEPTH - 1)], 1)
+                .unwrap()
+                .ownership_depth(),
+            MAX_VALUE_DEPTH
+        );
+        assert_depth_error(
+            Value::try_new_struct_from_shape(&shape, vec![nested_array(MAX_VALUE_DEPTH)], 29),
+            29,
         );
     }
 

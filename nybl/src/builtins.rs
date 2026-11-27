@@ -489,27 +489,34 @@ pub fn make_try_call_ok_in(
 /// `RuntimeError` is also a builtin — same `<builtin>` module
 /// path as `Result`.
 pub fn make_try_call_err(err: &NyblError) -> Value {
-    make_try_call_err_in(err, &MemoryContext::__legacy_current())
+    let shape = crate::value::StructShape::new(
+        crate::value::BUILTIN_MODULE_PATH,
+        "RuntimeError",
+        builtin_runtime_error_fields(),
+    );
+    make_try_call_err_in(err, &shape, &MemoryContext::__legacy_current())
 }
 
+/// Engine form of [`make_try_call_err`]. `runtime_error_shape` is the
+/// engine's registered builtin `RuntimeError` shape, so every caught
+/// error shares it instead of allocating field names per value.
 #[doc(hidden)]
-pub fn make_try_call_err_in(err: &NyblError, memory: &MemoryContext) -> Value {
+pub fn make_try_call_err_in(
+    err: &NyblError,
+    runtime_error_shape: &crate::value::StructShape,
+    memory: &MemoryContext,
+) -> Value {
     let message = Value::__new_str_in(err.message.clone(), memory);
     // Line numbers are integers — use Int now that phase 6
     // distinguishes them from floats.
     let line = Value::Int(err.line.unwrap_or(0) as i64);
-    let fields: Vec<(String, Value)> = alloc_import::vec![
-        (String::from("message"), message),
-        (String::from("line"), line),
-    ];
-    let rt_err = Value::__try_new_struct_in(
-        String::from(crate::value::BUILTIN_MODULE_PATH),
-        String::from("RuntimeError"),
-        fields,
+    let rt_err = Value::__try_new_struct_from_shape_in(
+        runtime_error_shape,
+        alloc_import::vec![message, line],
         0,
         memory,
     )
-    .expect("builtin RuntimeError has bounded ownership depth");
+    .expect("builtin RuntimeError shape has two fields and bounded ownership depth");
     let items: Vec<Value> = alloc_import::vec![rt_err];
     Value::__try_new_enum_tuple_in(
         String::from(crate::value::BUILTIN_MODULE_PATH),

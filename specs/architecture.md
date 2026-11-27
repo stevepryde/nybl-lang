@@ -57,13 +57,15 @@ depend on `nybl-sys`.
   the same `nybl::ast_depth` value). VM dispatch and loop control remain
   iterative.
 - **ARCH-006:** Public constructors preserve memory-accounting ownership by
-  keeping tracked collection storage encapsulated.
+  keeping tracked collection storage encapsulated. Struct values share an
+  immutable, untracked `StructShape` for their identity and field names and
+  own only their tracked field values.
 - **ARCH-007:** Differential tests are the acceptance boundary for engine
   parity; focused unit and regression tests establish component behaviour.
 - **ARCH-008:** Persistent state is owned by exactly one engine instance.
   Returned callable values carry origin metadata, retained language values
-  keep their instance memory account alive, and a value from one instance
-  cannot be executed by another.
+  keep their instance's (or its group's, ARCH-013) memory account alive, and a
+  callable from one instance cannot be executed by another.
 - **ARCH-009:** An instance stores limits and language state but never a host
   reference. A per-operation guard rejects same-instance re-entry; transient
   execution state is restored on every exit path so non-memory failures do not
@@ -84,6 +86,14 @@ depend on `nybl-sys`.
   origin, limits, diagnostics, and memory accounting remain instance-owned.
   Root-only artifacts preserve lazy host source resolution; complete graph
   artifacts never fall back to a runtime host for missing source.
+- **ARCH-013:** An instance group owns its limits, one memory account, an
+  active-operation count, and the steps, call depth, and nesting last
+  published by its innermost running operation. Engines keep their hot
+  counters local and publish them only around host hooks; a grouped operation
+  starts from the published values (zero when it is outermost), writes its
+  final steps back when it ends, and restores the published call depth and
+  nesting to its starting values. Groups use no thread-local or global state,
+  and ungrouped execution pays one branch per hook.
 
 ## Failure modes
 

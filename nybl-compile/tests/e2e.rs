@@ -4224,6 +4224,9 @@ mod stack_corpus;
 /// Thread stack RUN-002 documents for release builds (generated programs
 /// are built with `--release`); see `nybl-vm/tests/stack_bound.rs`.
 const RELEASE_STACK: usize = 10 * 1024 * 1024;
+/// The same bound for debug builds, which covers this test process's own
+/// parsing and transpiling at the parse-depth cap.
+const DEBUG_STACK: usize = 24 * 1024 * 1024;
 
 /// Generated-driver source for a host that serves `modules` and records
 /// prints, shared by the sandbox accounting tests below.
@@ -4358,10 +4361,11 @@ fn main() {{
 }
 
 /// Run a test body that parses or transpiles code at the parse-depth cap on
-/// a thread with the documented stack for this (test) build's profile.
+/// a thread with the documented stack for this (test) build's profile. The
+/// generated programs it runs are release binaries on `RELEASE_STACK`.
 fn on_documented_stack(test: impl FnOnce() + Send + 'static) {
     let size = if cfg!(debug_assertions) {
-        128 * 1024 * 1024
+        DEBUG_STACK
     } else {
         RELEASE_STACK
     };
@@ -4555,4 +4559,92 @@ fn sandbox_stack_corpus() {
         assert_eq!(shape.name, name);
         assert!(shape.accepts(message), "{name}: {message}");
     }
+}
+
+#[test]
+#[ignore]
+fn e2e_sandbox_line_less_tick_hook_error_reports_the_step_limit_line_and_owner() {
+    let root = "use lib
+fn inner(n) {
+  let total = 0
+  repeat n {
+    total += 1
+  }
+  return total
+}
+pub fn run() {
+  let count = 0
+  while true {
+    count += inner(5)
+  }
+}
+pub fn run_module() { return spin() }";
+    let modules = [(
+        "lib",
+        "let ready = true\nfn spin() {\n  let n = 0\n  while ready {\n    n += 1\n  }\n}",
+    )];
+    let mut rust_src = transpile(
+        root,
+        &Options {
+            emit_main: false,
+            use_nybl_sys: false,
+            sandbox: true,
+            module_resolver: Some(modules_from_map(modules)),
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    rust_src.push_str(
+        r#"
+struct HookTickHost { ticks: u64, fail_on: u64, line: u32 }
+impl ::nybl::NyblHost for HookTickHost {
+    fn call(&mut self, _name: &str, _args: &[::nybl::value::Value], _line: u32) -> Option<Result<::nybl::value::Value, ::nybl::error::NyblError>> { None }
+    fn on_tick(&mut self) -> Result<(), ::nybl::error::NyblError> {
+        self.ticks += 1;
+        if self.ticks == self.fail_on {
+            Err(::nybl::error::NyblError::fatal("host stop", self.line))
+        } else {
+            Ok(())
+        }
+    }
+}
+/// Call `entry` with the tick hook armed to fail on its `fail_on`-th tick.
+fn hooked_call(entry: &str, max_steps: u64, fail_on: u64, line: u32) -> ::nybl::error::NyblError {
+    let limits = ::nybl::NyblLimits { max_steps, ..::nybl::NyblLimits::standard() };
+    let mut host = HookTickHost { ticks: 0, fail_on: u64::MAX, line };
+    let mut instance = NyblInstance::load(&mut host, &limits).unwrap();
+    host.ticks = 0;
+    host.fail_on = fail_on;
+    instance.call(entry, &[], &mut host).unwrap_err()
+}
+fn error_owner(error: &::nybl::error::NyblError) -> Option<String> {
+    error.source_context.as_ref().map(|context| context.module_path.clone())
+}
+fn main() {
+    for entry in ["run", "run_module"] {
+        // The built-in step error trips on tick 201; the hook fails on the
+        // same tick.
+        let builtin = hooked_call(entry, 200, u64::MAX, 0);
+        assert!(builtin.message.contains("too many steps"), "{entry}: {builtin:?}");
+        let hooked = hooked_call(entry, 1_000_000, 201, 0);
+        assert_eq!(hooked.message, "host stop");
+        assert!(matches!(hooked.line, Some(line) if line > 0), "{entry}: {hooked:?}");
+        assert_eq!(hooked.line, builtin.line, "{entry}");
+        assert_eq!(hooked.column, None);
+        assert_eq!(error_owner(&hooked), error_owner(&builtin), "{entry}");
+        let explicit = hooked_call(entry, 1_000_000, 201, 77);
+        assert_eq!(explicit.line, Some(77), "{entry}");
+    }
+    println!("ok");
+}
+"#,
+    );
+    let run = run_generated_source("sandbox_tick_hook_line", rust_src);
+    assert_eq!(
+        run.status,
+        Some(0),
+        "generated program failed: {}",
+        run.stderr
+    );
+    assert_eq!(run.stdout, "ok");
 }

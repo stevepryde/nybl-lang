@@ -49,7 +49,7 @@ impl NyblHost for Host {
 /// `stack_bound.rs`).
 fn on_documented_stack(test: impl FnOnce() + Send + 'static) {
     let size = if cfg!(debug_assertions) {
-        128 * 1024 * 1024
+        24 * 1024 * 1024
     } else {
         10 * 1024 * 1024
     };

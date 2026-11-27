@@ -79,7 +79,7 @@ fn main() -> ExitCode {
 /// on Windows).
 fn on_script_stack(run: impl FnOnce() -> ExitCode + Send + 'static) -> ExitCode {
     let size = if cfg!(debug_assertions) {
-        128 * 1024 * 1024
+        24 * 1024 * 1024
     } else {
         10 * 1024 * 1024
     };

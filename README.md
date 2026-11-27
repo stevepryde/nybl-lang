@@ -153,7 +153,9 @@ assert_eq!(value.inspect(), "1");
 ```
 
 See [Stateful instances](https://nybl-lang.com/docs/embedding/instances/)
-for the walker, VM, and sandboxed AOT APIs.
+for the walker, VM, and sandboxed AOT APIs. When host functions let instances
+call each other, load them with `load_in` into one `nybl::InstanceGroup` so a
+single set of limits bounds the whole chain (walker and VM).
 
 Custom sandboxed host — Nybl can only reach the fns you expose:
 
