@@ -33,7 +33,7 @@ When you want to wire the transpiler into your own build pipeline (a `build.rs`,
 
 ```toml
 [dependencies]
-nybl-compile = "0.5"
+nybl-compile = "0.6"
 ```
 
 ```rust

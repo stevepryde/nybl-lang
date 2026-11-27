@@ -3,7 +3,22 @@
 All notable changes to Nybl are documented here. Versions apply to the
 publishable workspace crates unless a section says otherwise.
 
-## Unreleased
+## 0.6.0
+
+`0.6.0` adds `InstanceGroup` for sharing resource budgets across nested
+instances, shared `StructShape` values, 3D math intrinsics and `std.math`
+vector helpers, a much slimmer debug stack in the tree-walker, and tighter
+three-way parity and module diagnostic ownership across the walker, VM, and
+AOT compiler. It is a breaking release.
+
+### Language & Standard Library
+
+- Add numeric math methods `.asin()`, `.acos()`, `.atan()`, `.atan2(x)`,
+  `.hypot(y)`, and `.trunc()` (both `std` and `no_std`/`libm`).
+- Add `std.math` helpers `asin`, `acos`, `atan`, `atan2`, `hypot`, `lerp`,
+  `smoothstep`, `Vec2`/`vec2`, `Vec3`/`vec3`, and vector operations (`dot`,
+  `cross`, `length`, `length_sq`, `normalize`, `distance`, plus 2D/3D
+  variants and `lerp2`/`lerp3`).
 
 ### Embedding
 

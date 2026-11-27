@@ -736,17 +736,44 @@ mod tests {
 
         // atan2 across all four quadrants + axes: receiver is y, arg is x
         let q1 = expect_num(numeric_method(&Value::Int(1), "atan2", &[Value::Int(1)], 1));
-        let q2 = expect_num(numeric_method(&Value::Int(1), "atan2", &[Value::Int(-1)], 1));
-        let q3 = expect_num(numeric_method(&Value::Int(-1), "atan2", &[Value::Int(-1)], 1));
-        let q4 = expect_num(numeric_method(&Value::Int(-1), "atan2", &[Value::Int(1)], 1));
+        let q2 = expect_num(numeric_method(
+            &Value::Int(1),
+            "atan2",
+            &[Value::Int(-1)],
+            1,
+        ));
+        let q3 = expect_num(numeric_method(
+            &Value::Int(-1),
+            "atan2",
+            &[Value::Int(-1)],
+            1,
+        ));
+        let q4 = expect_num(numeric_method(
+            &Value::Int(-1),
+            "atan2",
+            &[Value::Int(1)],
+            1,
+        ));
         assert!((q1 - core::f64::consts::FRAC_PI_4).abs() < eps);
         assert!((q2 - 3.0 * core::f64::consts::FRAC_PI_4).abs() < eps);
         assert!((q3 + 3.0 * core::f64::consts::FRAC_PI_4).abs() < eps);
         assert!((q4 + core::f64::consts::FRAC_PI_4).abs() < eps);
 
         // hypot
-        assert!((expect_num(numeric_method(&Value::Int(3), "hypot", &[Value::Int(4)], 1)) - 5.0).abs() < eps);
-        assert!((expect_num(numeric_method(&Value::Number(-3.0), "hypot", &[Value::Number(-4.0)], 1)) - 5.0).abs() < eps);
+        assert!(
+            (expect_num(numeric_method(&Value::Int(3), "hypot", &[Value::Int(4)], 1)) - 5.0).abs()
+                < eps
+        );
+        assert!(
+            (expect_num(numeric_method(
+                &Value::Number(-3.0),
+                "hypot",
+                &[Value::Number(-4.0)],
+                1
+            )) - 5.0)
+                .abs()
+                < eps
+        );
         let large = expect_num(numeric_method(
             &Value::Number(1e200),
             "hypot",

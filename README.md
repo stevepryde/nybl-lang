@@ -102,7 +102,7 @@ print(PI)
 
 ## Quick start — CLI
 
-Building or installing Nybl 0.5 requires Rust 1.88 or newer.
+Building or installing Nybl 0.6 requires Rust 1.88 or newer.
 
 ```
 cargo install nybl-cli
@@ -120,9 +120,9 @@ cargo install nybl-cli
 
 ```toml
 [dependencies]
-nybl-lang = "0.5"
-nybl-vm   = "0.5"       # optional — drop in for 2–3× speed
-nybl-sys  = "0.5"       # ready-made filesystem / stdio / env / time host
+nybl-lang = "0.6"
+nybl-vm   = "0.6"       # optional — drop in for 2–3× speed
+nybl-sys  = "0.6"       # ready-made filesystem / stdio / env / time host
 ```
 
 ```rust
@@ -203,8 +203,8 @@ build therefore disables defaults and explicitly selects `no_std`:
 
 ```toml
 [dependencies]
-nybl-lang = { version = "0.5", default-features = false, features = ["no_std"] }
-nybl-vm   = { version = "0.5", default-features = false, features = ["no_std"] }
+nybl-lang = { version = "0.6", default-features = false, features = ["no_std"] }
+nybl-vm   = { version = "0.6", default-features = false, features = ["no_std"] }
 ```
 
 Memory accounting in the walker, VM, and generated sandbox runtime is carried

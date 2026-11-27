@@ -39,7 +39,7 @@ For a faster runtime (2–3× this crate's tree-walker, same semantics), add [`n
 
 ```toml
 [dependencies]
-nybl-lang = "0.5"
+nybl-lang = "0.6"
 ```
 
 ```rust
@@ -145,7 +145,7 @@ guide](https://nybl-lang.com/docs/embedding/#opaque-host-values-and-methods).
 A minimal std build — core language only, no bundled Nybl stdlib:
 
 ```toml
-nybl-lang = { version = "0.5", default-features = false, features = ["std"] }
+nybl-lang = { version = "0.6", default-features = false, features = ["std"] }
 ```
 
 For compatibility, omitting both `std` and `no_std` also retains std behavior;
@@ -165,7 +165,7 @@ their backing storage into its own account.
 
 ```toml
 [dependencies]
-nybl-lang = { version = "0.5", default-features = false, features = ["no_std", "nybl-std"] }
+nybl-lang = { version = "0.6", default-features = false, features = ["no_std", "nybl-std"] }
 ```
 
 Build for `wasm32-unknown-unknown` as usual. See [`nybl-vm`](https://crates.io/crates/nybl-vm) for the faster runtime if you need it.

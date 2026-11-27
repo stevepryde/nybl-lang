@@ -29,8 +29,8 @@ script needs to update one of its own variables transactionally.
 
 ```toml
 [dependencies]
-nybl-lang = "0.5"
-nybl-sys  = "0.5"
+nybl-lang = "0.6"
+nybl-sys  = "0.6"
 ```
 
 ```rust
